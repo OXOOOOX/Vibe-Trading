@@ -183,6 +183,8 @@ export function Agent() {
   const [searchParams, setSearchParams] = useSearchParams();
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const isComposingRef = useRef(false);
+  const lastCompositionEndRef = useRef(0);
   const sseSessionRef = useRef<string | null>(null);
   const prevSseStatusRef = useRef<string>("disconnected");
   const genRef = useRef(0);
@@ -1365,6 +1367,13 @@ export function Agent() {
               value={input}
               rows={1}
               onChange={(e) => setInput(e.target.value)}
+              onCompositionStart={() => {
+                isComposingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                isComposingRef.current = false;
+                lastCompositionEndRef.current = Date.now();
+              }}
               onInput={(e) => {
                 const el = e.target as HTMLTextAreaElement;
                 el.style.height = "auto";
@@ -1372,6 +1381,15 @@ export function Agent() {
               }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
+                  const nativeEvent = e.nativeEvent as KeyboardEvent & { isComposing?: boolean };
+                  const justFinishedComposing = Date.now() - lastCompositionEndRef.current < 80;
+                  if (isComposingRef.current || nativeEvent.isComposing || nativeEvent.keyCode === 229) {
+                    return;
+                  }
+                  if (justFinishedComposing) {
+                    e.preventDefault();
+                    return;
+                  }
                   e.preventDefault();
                   runPrompt(input.trim());
                 }
