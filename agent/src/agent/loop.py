@@ -39,6 +39,7 @@ from src.goal.context import (
 from src.providers.chat import ChatLLM, ProviderStreamError
 from src.tools.background_tools import get_background_manager
 from src.tools.redaction import redact_payload
+from src.tools.swarm_tool import extract_explicit_preset_name
 
 RUNS_DIR = Path(__file__).resolve().parents[2] / "runs"
 SESSIONS_DIR = Path(__file__).resolve().parents[2] / "sessions"
@@ -416,6 +417,17 @@ def _normalize_tool_run_dir(args: dict[str, Any], memory_run_dir: str | None) ->
     if not candidate.is_absolute():
         normalized["run_dir"] = str((Path(memory_run_dir) / candidate).resolve())
     return normalized
+
+
+def _inject_swarm_preset_hint(tool_calls: list, preset_hint: str | None) -> None:
+    """Restore an explicit user-named swarm preset omitted by the model."""
+    if not preset_hint:
+        return
+    for tool_call in tool_calls:
+        if tool_call.name != "run_swarm":
+            continue
+        if not tool_call.arguments.get("preset_name"):
+            tool_call.arguments["preset_name"] = preset_hint
 
 
 class AgentLoop:
@@ -809,6 +821,10 @@ class AgentLoop:
                     react_trace.append({"type": "answer", "content": final_content[:500]})
                     break
 
+                _inject_swarm_preset_hint(
+                    response.tool_calls,
+                    extract_explicit_preset_name(user_message),
+                )
                 assistant_message = context.format_assistant_tool_calls(
                     response.tool_calls,
                     content=response.content,

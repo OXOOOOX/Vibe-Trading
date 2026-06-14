@@ -28,6 +28,13 @@ def test_explicit_preset_name_accepts_spaces() -> None:
     assert swarm_tool._match_preset(prompt) == "investment_committee"
 
 
+def test_first_explicit_preset_in_original_prompt_wins() -> None:
+    prompt = "Use investment committee, not quant_strategy_desk, for this decision."
+
+    assert swarm_tool.extract_explicit_preset_name(prompt) == "investment_committee"
+    assert swarm_tool._match_preset(prompt) == "investment_committee"
+
+
 def test_explicit_preset_parameter_is_normalized() -> None:
     preset, error = swarm_tool._resolve_preset(
         "Continue and finish the report.",

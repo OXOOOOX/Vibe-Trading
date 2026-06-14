@@ -374,10 +374,9 @@ def _match_preset(prompt: str) -> str:
     Returns:
         Best matching preset name.
     """
-    normalized_prompt = re.sub(r"[\s-]+", "_", prompt.strip().lower())
-    for preset_name, _, _ in _PRESET_KEYWORDS:
-        if re.search(rf"(?<![a-z0-9]){re.escape(preset_name)}(?![a-z0-9])", normalized_prompt):
-            return preset_name
+    explicit_preset = extract_explicit_preset_name(prompt)
+    if explicit_preset:
+        return explicit_preset
 
     scores: dict[str, float] = {}
     for preset_name, keywords, boost in _PRESET_KEYWORDS:
@@ -415,12 +414,21 @@ def _normalize_preset_name(value: str) -> str | None:
     return normalized if normalized in _PRESET_NAMES else None
 
 
+def extract_explicit_preset_name(prompt: str) -> str | None:
+    """Return the first bundled preset explicitly named in user text."""
+    matches: list[tuple[int, str]] = []
+    for preset_name in _PRESET_NAMES:
+        pattern = re.escape(preset_name).replace(r"_", r"[\s_-]+")
+        match = re.search(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", prompt, re.IGNORECASE)
+        if match:
+            matches.append((match.start(), preset_name))
+    return min(matches)[1] if matches else None
+
+
 def _has_preset_signal(prompt: str) -> bool:
     """Return whether prompt contains an explicit preset name or routing keyword."""
-    normalized_prompt = re.sub(r"[\s-]+", "_", prompt.strip().lower())
-    for preset_name, _, _ in _PRESET_KEYWORDS:
-        if re.search(rf"(?<![a-z0-9]){re.escape(preset_name)}(?![a-z0-9])", normalized_prompt):
-            return True
+    if extract_explicit_preset_name(prompt):
+        return True
     for _, keywords, _ in _PRESET_KEYWORDS:
         for kw in keywords:
             if re.search(kw, prompt, re.IGNORECASE):
