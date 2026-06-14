@@ -60,7 +60,7 @@ agents:
       4. **Exchange Fund Flow Analysis** — Net inflow / outflow trend; stablecoin minting activity; assess whether fresh capital is entering or leaving
       5. **Activity and Adoption Trends** — Recent trends in active addresses / new addresses / on-chain transaction volume; assess whether there is organic growth support
       6. **On-Chain Composite Directional Signal** — Explicitly give a "{timeframe} bullish / bearish / neutral" on-chain signal with confidence level
-    tools: [bash, read_file, write_file, load_skill]
+    tools: [bash, read_file, write_file, load_skill, get_market_data]
     skills: [onchain-analysis, okx-market, stablecoin-flow]
     max_iterations: 50
     timeout_seconds: 1800
@@ -172,7 +172,7 @@ agents:
       4. **Fear & Greed Index vs. Historical Comparison** — Current index value, historical zone positioning, price performance statistics following similar past sentiment readings
       5. **Extreme Sentiment Warning** — Whether extreme greed or extreme fear signals are present; historical average returns following similar signals
       6. **Sentiment Directional Signal** — Provide {timeframe} timing guidance from a sentiment perspective; explicitly state whether the view is "momentum-following" or "contrarian"
-    tools: [bash, read_file, write_file, load_skill, read_url]
+    tools: [bash, read_file, write_file, load_skill, get_market_data, read_url]
     skills: [sentiment-analysis, okx-market, perp-funding-basis, liquidation-heatmap]
     max_iterations: 50
     timeout_seconds: 1800

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from backtest.loaders.registry import VALID_SOURCES
 from src.agent.progress import emit_progress
 from src.agent.tools import BaseTool
 from src.core.runner import Runner
@@ -38,9 +39,8 @@ def run_backtest(run_dir: str) -> str:
     if "source" not in config:
         return json.dumps({"status": "error", "error": "config.json missing 'source' field (tushare/okx/yfinance)"}, ensure_ascii=False)
 
-    valid_sources = {"tushare", "okx", "yfinance", "akshare", "mootdx", "ccxt", "futu", "auto"}
-    if config["source"] not in valid_sources:
-        return json.dumps({"status": "error", "error": f"source must be one of {valid_sources}, got: {config['source']}"}, ensure_ascii=False)
+    if config["source"] not in VALID_SOURCES:
+        return json.dumps({"status": "error", "error": f"source must be one of {VALID_SOURCES}, got: {config['source']}"}, ensure_ascii=False)
 
     signal_path = run_path / "code" / "signal_engine.py"
     if not signal_path.exists():

@@ -72,6 +72,15 @@ class TestBarsPerYear:
         # 365 days × 24 hours/day = 8760
         assert calc_bars_per_year("1H", "okx") == 365 * 24
 
+    def test_minute_mootdx(self) -> None:
+        # mootdx is A-share: 252 trading days × 240 minutes/day (regression —
+        # previously fell back to bars_per_day=1, mis-annualising intraday vol)
+        assert calc_bars_per_year("1m", "mootdx") == 252 * 240
+
+    def test_minute_futu(self) -> None:
+        # futu is equity (HK + A-share): same equity annualisation as akshare
+        assert calc_bars_per_year("1m", "futu") == 252 * 240
+
     def test_unknown_source(self) -> None:
         # Falls back to 252 trading days
         assert calc_bars_per_year("1D", "unknown") == 252

@@ -19,11 +19,28 @@ What this module does
   swallowed per-symbol so they do not poison the whole run.
 * Renders a compact markdown block the worker prompt can splice in.
 
-What this module **does not** do
---------------------------------
-* It does not match bare tickers (``NVDA`` without ``.US``) — too easy
-  to false-positive on common English words. Users supply suffixed
-  symbols already in every shipped preset.
+Bare US tickers
+---------------
+Suffixed symbols are matched verbatim. Bare all-caps tokens (``NVDA``
+without ``.US``) are *promoted* to ``<TOKEN>.US`` under guards, because
+auto-built swarm variables routinely carry the user's raw prompt and
+real prompts say "long or short on NVDA", not "NVDA.US" (#198):
+
+* only 2–5 uppercase letters on word boundaries (never lowercase,
+  never single letters — too collision-prone);
+* a stopword list drops common finance/English acronyms (``ETF``,
+  ``CEO``, ``GDP``, ``USD``, bare crypto symbols, …);
+* text already matched by a suffixed pattern is blanked first, so
+  ``BTC-USDT`` never leaks a bogus ``BTC.US``;
+* promotions sort *after* explicit symbols, so explicit symbols win
+  the ``DEFAULT_MAX_SYMBOLS`` cap;
+* the per-symbol fetch remains the final validator — a promoted token
+  that is not a real Yahoo ticker returns no data and is dropped.
+
+A residual risk stays by design: an all-caps non-ticker word that
+collides with a real listed product (e.g. ``MOAT``) grounds an
+irrelevant table. That costs prompt budget, not correctness — workers
+are told to cite only symbols they analyze.
 * It does not refresh data mid-run. The block is a snapshot taken once
   when the background run starts; long-running swarms will see stale data after
   many minutes, but that is still strictly better than training-data
@@ -62,21 +79,66 @@ _SYMBOL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b[A-Z]{2,6}-USDT\b"),
 )
 
+# Bare-ticker promotion: 2–5 uppercase letters. Single letters (A, F, T …)
+# collide with ordinary prose far too often to be worth grounding. The
+# lookarounds reject dotted compounds on either side (FOO.USDA promotes
+# neither FOO nor USDA) while still matching a sentence-ending "NVDA.".
+_BARE_US_TICKER_PATTERN = re.compile(r"(?<![\w.])[A-Z]{2,5}(?!\w)(?!\.\w)")
+
+# All-caps tokens that show up in finance prompts but must never be promoted
+# to a .US symbol — either not tickers at all, or colliding with unrelated
+# listed products (CEO and MSCI are both real Yahoo symbols).
+_BARE_TICKER_STOPWORDS = frozenset({
+    # geography / venues / index & data providers
+    "US", "USA", "UK", "EU", "HK", "CN", "JP", "NYSE", "AMEX", "SSE", "SZSE",
+    "HKEX", "SPX", "NDX", "DJI", "DJIA", "HSI", "CSI", "FTSE", "MSCI", "VIX",
+    # instruments / structures
+    "ETF", "ETN", "ADR", "IPO", "REIT", "BOND", "SWAP", "PERP",
+    # macro / institutions
+    "FED", "FOMC", "SEC", "IMF", "GDP", "CPI", "PPI", "PMI", "PCE", "OPEC",
+    "YOY", "QOQ", "MOM", "YTD", "EOD",
+    # metrics / indicators
+    "PE", "PB", "PS", "EPS", "ROE", "ROA", "ROI", "EBIT", "EV", "DCF",
+    "CAGR", "IRR", "NAV", "AUM", "ATH", "ATL", "RSI", "MACD", "EMA", "SMA",
+    "KDJ", "BOLL", "OHLC", "ADV", "PNL",
+    # currencies / crypto traded under other loaders
+    "USD", "EUR", "JPY", "GBP", "CNY", "CNH", "RMB", "KRW", "INR", "AUD",
+    "CAD", "CHF", "FX", "BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE",
+    "USDT", "USDC", "DEFI", "NFT", "DAO",
+    # trading verbs / order words
+    "BUY", "SELL", "HOLD", "LONG", "SHORT", "CALL", "PUT", "STOP", "LIMIT",
+    "TP", "SL", "DCA",
+    # tech / prose acronyms
+    "AI", "ML", "LLM", "API", "JSON", "CSV", "PDF", "URL", "HTML", "CEO",
+    "CFO", "CTO", "COO", "CIO", "VP", "OK", "FAQ", "ASAP", "AM", "PM",
+    "EST", "PST", "UTC", "GMT",
+})
+
 
 def extract_symbols_from_user_vars(user_vars: dict[str, str]) -> list[str]:
     """Return the deduplicated list of symbols mentioned anywhere in *user_vars*.
 
-    Order is preserved from first occurrence so the worker prompt is
-    deterministic when nothing else changes.
+    Explicit suffixed symbols come first (in first-occurrence order),
+    followed by guarded bare-ticker promotions (``NVDA`` → ``NVDA.US``),
+    so explicit symbols always win the grounding cap. See the module
+    docstring for the promotion guards.
     """
-    seen: dict[str, None] = {}  # ordered set
+    explicit: dict[str, None] = {}  # ordered set
+    promoted: dict[str, None] = {}
     for value in user_vars.values():
         if not isinstance(value, str):
             continue
+        remainder = value
         for pattern in _SYMBOL_PATTERNS:
-            for match in pattern.findall(value):
-                seen.setdefault(match, None)
-    return list(seen.keys())
+            for match in pattern.findall(remainder):
+                explicit.setdefault(match, None)
+            # Blank matched spans so the bare scan can't split a suffixed
+            # symbol into bogus fragments (BTC-USDT -> BTC.US).
+            remainder = pattern.sub(" ", remainder)
+        for token in _BARE_US_TICKER_PATTERN.findall(remainder):
+            if token not in _BARE_TICKER_STOPWORDS:
+                promoted.setdefault(f"{token}.US", None)
+    return list(explicit) + [s for s in promoted if s not in explicit]
 
 
 def max_grounding_symbols() -> int:

@@ -158,7 +158,7 @@ agents:
       7. **{goal} flow support** — do {goal} sectors align with cycle & prosperity?
 
       Prefer last 20 trading days; emphasize freshness.
-    tools: [bash, read_file, write_file, load_skill]
+    tools: [bash, read_file, write_file, load_skill, get_market_data]
     skills: [tushare, sentiment-analysis]
     max_iterations: 50
     timeout_seconds: 1800

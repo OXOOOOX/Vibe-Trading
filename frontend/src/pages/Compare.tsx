@@ -1,3 +1,4 @@
+import i18n from '@/i18n';
 import { useEffect, useRef, useState } from "react";
 import { GitCompare, ArrowRight } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -6,7 +7,6 @@ import { echarts, CHART_GROUP, connectCharts } from "@/lib/echarts";
 import { getChartTheme } from "@/lib/chart-theme";
 import { useDarkMode } from "@/hooks/useDarkMode";
 import { SkeletonChart, SkeletonMetrics } from "@/components/common/Skeleton";
-import { useI18n } from "@/lib/i18n";
 
 interface MetricDef {
   key: string;
@@ -52,21 +52,21 @@ function runLabel(r: RunListItem): string {
 }
 
 const METRICS: MetricDef[] = [
-  { key: "total_return",           label: "Total Return",         type: "pct", higherIsBetter: true },
-  { key: "annualized_return",      label: "Annualized Return",    type: "pct", higherIsBetter: true },
-  { key: "sharpe",                 label: "Sharpe Ratio",         type: "num", higherIsBetter: true },
-  { key: "calmar_ratio",           label: "Calmar Ratio",         type: "num", higherIsBetter: true },
-  { key: "sortino_ratio",          label: "Sortino Ratio",        type: "num", higherIsBetter: true },
-  { key: "max_drawdown",           label: "Max Drawdown",         type: "pct", higherIsBetter: false },
-  { key: "volatility",             label: "Volatility",           type: "pct", higherIsBetter: false },
-  { key: "win_rate",               label: "Win Rate",             type: "pct", higherIsBetter: true },
-  { key: "profit_factor",          label: "Profit Factor",        type: "num", higherIsBetter: true },
-  { key: "avg_win",                label: "Avg Win",              type: "pct", higherIsBetter: true },
-  { key: "avg_loss",               label: "Avg Loss",             type: "pct", higherIsBetter: false },
-  { key: "trade_count",            label: "Trades",               type: "int", higherIsBetter: true },
-  { key: "max_consecutive_losses", label: "Max Consec. Losses",   type: "int", higherIsBetter: false },
-  { key: "exposure_time",          label: "Exposure Time",        type: "pct", higherIsBetter: true },
-  { key: "avg_holding_period",     label: "Avg Holding Period",   type: "days", higherIsBetter: false },
+  { key: "total_return",           label: i18n.t("compare.totalReturn"),         type: "pct", higherIsBetter: true },
+  { key: "annualized_return",      label: i18n.t("compare.annualizedReturn"),    type: "pct", higherIsBetter: true },
+  { key: "sharpe",                 label: i18n.t("compare.sharpeRatio"),         type: "num", higherIsBetter: true },
+  { key: "calmar_ratio",           label: i18n.t("compare.calmarRatio"),         type: "num", higherIsBetter: true },
+  { key: "sortino_ratio",          label: i18n.t("compare.sortinoRatio"),        type: "num", higherIsBetter: true },
+  { key: "max_drawdown",           label: i18n.t("compare.maxDrawdown"),         type: "pct", higherIsBetter: false },
+  { key: "volatility",             label: i18n.t("compare.volatility"),           type: "pct", higherIsBetter: false },
+  { key: "win_rate",               label: i18n.t("compare.winRate"),             type: "pct", higherIsBetter: true },
+  { key: "profit_factor",          label: i18n.t("compare.profitFactor"),        type: "num", higherIsBetter: true },
+  { key: "avg_win",                label: i18n.t("compare.avgWin"),              type: "pct", higherIsBetter: true },
+  { key: "avg_loss",               label: i18n.t("compare.avgLoss"),             type: "pct", higherIsBetter: false },
+  { key: "trade_count",            label: i18n.t("compare.trades"),               type: "int", higherIsBetter: true },
+  { key: "max_consecutive_losses", label: i18n.t("compare.maxConsecLosses"),   type: "int", higherIsBetter: false },
+  { key: "exposure_time",          label: i18n.t("compare.exposureTime"),        type: "pct", higherIsBetter: true },
+  { key: "avg_holding_period",     label: i18n.t("compare.avgHoldingPeriod"),   type: "days", higherIsBetter: false },
 ];
 
 // Also accept backend aliases
@@ -198,7 +198,6 @@ function EquityChartOverlay({ leftCurve, rightCurve, leftLabel, rightLabel }: Eq
 }
 
 export function Compare() {
-  const { t } = useI18n();
   const [runs, setRuns] = useState<RunListItem[]>([]);
   const [leftId, setLeftId] = useState("");
   const [rightId, setRightId] = useState("");
@@ -253,23 +252,23 @@ export function Compare() {
   return (
     <div className="p-8 max-w-4xl space-y-6">
       <h1 className="text-xl font-bold flex items-center gap-2">
-        <GitCompare className="h-5 w-5" /> {t("strategyComparison")}
+        <GitCompare className="h-5 w-5" /> Strategy Comparison
       </h1>
 
       {/* Selectors */}
       <div className="flex gap-4 items-end">
         <div className="flex-1">
-          <label className="text-xs text-muted-foreground block mb-1">{t("baseline")}</label>
+          <label className="text-xs text-muted-foreground block mb-1">{i18n.t("compare.baseline")}</label>
           <select value={leftId} onChange={(e) => setLeftId(e.target.value)} className="w-full px-3 py-2 rounded-lg border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/30" title={leftRun?.prompt || leftId}>
-            <option value="">{t("select")}</option>
+            <option value="">{i18n.t("compare.select")}</option>
             {runs.map((r) => <option key={r.run_id} value={r.run_id}>{runLabel(r)} ({r.status})</option>)}
           </select>
         </div>
         <ArrowRight className="h-5 w-5 text-muted-foreground mb-2 shrink-0" />
         <div className="flex-1">
-          <label className="text-xs text-muted-foreground block mb-1">{t("compare")}</label>
+          <label className="text-xs text-muted-foreground block mb-1">{i18n.t("compare.compare")}</label>
           <select value={rightId} onChange={(e) => setRightId(e.target.value)} className="w-full px-3 py-2 rounded-lg border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/30" title={rightRun?.prompt || rightId}>
-            <option value="">{t("select")}</option>
+            <option value="">{i18n.t("compare.select")}</option>
             {runs.map((r) => <option key={r.run_id} value={r.run_id}>{runLabel(r)} ({r.status})</option>)}
           </select>
         </div>
@@ -279,7 +278,7 @@ export function Compare() {
       {loading && !hasData && (
         <div className="space-y-6">
           <div className="border rounded-xl p-4">
-            <h2 className="text-sm font-medium text-muted-foreground mb-2">{t("equityDrawdown")}</h2>
+            <h2 className="text-sm font-medium text-muted-foreground mb-2">{i18n.t("compare.equityDrawdown")}</h2>
             <SkeletonChart height={320} />
           </div>
           <div className="border rounded-xl overflow-hidden">
@@ -291,12 +290,12 @@ export function Compare() {
       {/* Equity curve overlay */}
       {(leftCurve.length > 0 || rightCurve.length > 0) && (
         <div className="border rounded-xl p-4">
-          <h2 className="text-sm font-medium text-muted-foreground mb-2">{t("equityDrawdown")}</h2>
+          <h2 className="text-sm font-medium text-muted-foreground mb-2">{i18n.t("compare.equityDrawdown")}</h2>
           <EquityChartOverlay
             leftCurve={leftCurve}
             rightCurve={rightCurve}
-            leftLabel={leftRun ? truncatePrompt(leftRun.prompt, 20) || t("baseline") : t("baseline")}
-            rightLabel={rightRun ? truncatePrompt(rightRun.prompt, 20) || t("compare") : t("compare")}
+            leftLabel={leftRun ? truncatePrompt(leftRun.prompt, 20) || "Baseline" : "Baseline"}
+            rightLabel={rightRun ? truncatePrompt(rightRun.prompt, 20) || "Compare" : "Compare"}
           />
         </div>
       )}
@@ -307,10 +306,10 @@ export function Compare() {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b bg-muted/40">
-                <th className="text-left px-4 py-2.5 text-muted-foreground font-medium">{t("metric")}</th>
-                <th className="text-right px-4 py-2.5 text-muted-foreground font-medium">{t("baseline")}</th>
-                <th className="text-right px-4 py-2.5 text-muted-foreground font-medium">{t("compare")}</th>
-                <th className="text-right px-4 py-2.5 text-muted-foreground font-medium">{t("delta")}</th>
+                <th className="text-left px-4 py-2.5 text-muted-foreground font-medium">{i18n.t("compare.metric")}</th>
+                <th className="text-right px-4 py-2.5 text-muted-foreground font-medium">{i18n.t("compare.baselineCol")}</th>
+                <th className="text-right px-4 py-2.5 text-muted-foreground font-medium">{i18n.t("compare.compareCol")}</th>
+                <th className="text-right px-4 py-2.5 text-muted-foreground font-medium">{i18n.t("compare.delta")}</th>
               </tr>
             </thead>
             <tbody>
@@ -334,7 +333,7 @@ export function Compare() {
       {!hasData && !loading && (
         <div className="text-center py-16 text-muted-foreground">
           <GitCompare className="h-12 w-12 mx-auto mb-3 opacity-20" />
-          <p className="text-sm">{t("compareEmpty")}</p>
+          <p className="text-sm">{i18n.t("compare.selectTwoRuns")}</p>
         </div>
       )}
     </div>

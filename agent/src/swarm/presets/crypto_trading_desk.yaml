@@ -38,7 +38,7 @@ agents:
       - Long/short ratio (retail contrarian indicator)
 
       Use load_skill for funding rate analysis patterns and OKX data interfaces.
-    tools: [bash, read_file, write_file, load_skill]
+    tools: [bash, read_file, write_file, load_skill, get_market_data]
     skills: [perp-funding-basis, okx-market, crypto-derivatives]
     max_iterations: 50
     timeout_seconds: 1800

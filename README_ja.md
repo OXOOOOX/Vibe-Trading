@@ -50,12 +50,21 @@
 
 ## 📰 ニュース
 
-- **2026-06-05** 🇮🇳 **Dhan + Shoonya connector（インド）——ブローカー計 10 社**: connector-first の取引レイヤーにインド市場向けの **Dhan** と **Shoonya**（NSE/BSE 株式 + F&O）を追加し、ブローカーは計 10 社になりました。どちらも**ペーパー + 読み取り専用**です——Longbridge と同様、API がランタイムのペーパー/live 判別子を公開しないため、`place_order` / `cancel_order` は最初の行で非ペーパー設定を硬く拒否します（ルール: ランタイムのペーパー/live ガードを持たないブローカーはペーパー + 読み取り専用に制限）（[#181](https://github.com/HKUDS/Vibe-Trading/pull/181)、[#174](https://github.com/HKUDS/Vibe-Trading/issues/174) をクローズ）。今回は **Gemini 2.5 / 3.x の思考モデル**も修正: ツール呼び出しごとの `thoughtSignature` が OpenAI 互換パスを往復するようになり、マルチターンの function calling が `INVALID_ARGUMENT` で失敗しなくなりました（[#176](https://github.com/HKUDS/Vibe-Trading/pull/176)、[#170](https://github.com/HKUDS/Vibe-Trading/issues/170) をクローズ、@mvanhorn さん & @jliu6789 さんに感謝）。**452 個すべての Alpha Zoo ファクター**に中国語 docstring（中文名称/说明/用途）が追加され（[#180](https://github.com/HKUDS/Vibe-Trading/pull/180)、@LeeCQiang さんに感謝）、**フロントエンドのテストスイート（vitest 197 件）**とバックエンドの認証 / パストラバーサル / CORS セキュリティテストが CI に加わりました（[#175](https://github.com/HKUDS/Vibe-Trading/pull/175)、@sambazhu さんに感謝）。
-- **2026-06-04** 🗃️ **全 7 データソース対応のオプトインローカルキャッシュ**: 新しい `VIBE_TRADING_DATA_CACHE` スイッチにより、各バックテスト loader——tushare、okx、ccxt、akshare、mootdx、yfinance、futu——が確定済みの過去 bar を `~/.vibe-trading/cache`（ユーザーホーム、リポジトリには決して書き込まない）にキャッシュし、繰り返しおよび長期 / クロスマーケットのバックテストがネットワークを省略してプロバイダーのレート制限を回避できます。デフォルトはオフ。バッチ / 接続型 loader（yfinance、futu）はキャッシュが全ヒットすると一括ダウンロード / FutuOpenD 接続を完全にスキップし、staleness ガードは当日で終わる範囲（最後の bar がまだ形成中）を決してキャッシュせず、キャッシュされたフレームは新規取得とバイト単位で一致します（[#177](https://github.com/HKUDS/Vibe-Trading/pull/177)、@mvanhorn さんに感謝）。AI / 自動化支援 PR 向けのコントリビューターガイドも追加され、安全なローカルチェックと高リスクな broker/MCP/認証情報の領域を整理しています（[#173](https://github.com/HKUDS/Vibe-Trading/pull/173)）。
-- **2026-06-03** 🧹 **コミュニティトリアージ + トレース相関**: ツール呼び出しのトレースエントリに発信元の `call_id` が付与され、run トレースの再生時に `tool_result` を対応する `tool_call` に突き合わせられます——引数プレビューはトレースファイルを小さく保つため切り詰めたままです（[#168](https://github.com/HKUDS/Vibe-Trading/pull/168)、@zwrong さんに感謝）。ソースコードのコメントは、外部コントリビューターが見つけられない内部専用のドキュメントパスを指さなくなりました（[#166](https://github.com/HKUDS/Vibe-Trading/issues/166)、@jaleelpersonal さんに感謝）。また、インストール時の `langchain-community` の依存解決の警告は失敗ではなく残存パッケージによる無害な通知であることを明確化し（[#167](https://github.com/HKUDS/Vibe-Trading/issues/167)）、Gemini 2.5/3.0 の関数呼び出しにおける `thoughtSignature` の往復処理を、完全な修正計画付きの `help wanted` タスクとして整理しました（[#170](https://github.com/HKUDS/Vibe-Trading/issues/170)、@jliu6789 さんに感謝）。
+- **2026-06-14** 📊 **ラン単位のトークン使用量 + Run Detail チャートの遅延読み込み**: 各 agent ランは、プロバイダ報告のトークン使用量をラン単位の `llm_usage.json` として永続化するようになりました——プロバイダ/モデル、累計合計、イテレーションごとの件数——`/runs/{id}` に追加的に提供されるため、ランが終わってライブストリームが消えた後もトークンコストを監査できます（プロバイダ報告値のみ；prompt/内容のキャプチャや価格推定はなし）（[#223](https://github.com/HKUDS/Vibe-Trading/pull/223)、@LemonCANDY42 さんに感謝）。Run Detail ページは、もはや全シンボルのローソク足を最初に読み込みません: 既定の `/runs/{id}` レスポンスは変更なしのまま、UI はまずランのサマリーを描画し、オプトインの `?chart_payload=summary` / `?chart_symbol=` モードで各シンボルのチャートをオンデマンドに読み込みます。シンボルごとの読み込み状態と「全件読み込み + 進捗」コントロール付きです（[#225](https://github.com/HKUDS/Vibe-Trading/pull/225)、@LemonCANDY42 さんに感謝）。2 つの loader 修正で締めくくり: yfinance の排他的な `end` 境界が、要求範囲の最終取引日を取りこぼさなくなりました——ダウンロード呼び出しは `end + 1 日` を渡し、キャッシュキーは元の範囲を保持します（[#226](https://github.com/HKUDS/Vibe-Trading/pull/226)、@gyx09212214-prog さんに感謝）——そして不正な `CCXT_TIMEOUT_MS` / `OKX_TIMEOUT_S` 値は、import 時に例外を投げて起動を妨げる代わりに、警告して既定値にフォールバックするようになりました（[#227](https://github.com/HKUDS/Vibe-Trading/pull/227)、@gyx09212214-prog さんに感謝）。
+- **2026-06-13** ↩️ **CLI からセッションを ID で再開**: インタラクティブ CLI が終了時に session-id を表示し、コピペ可能な `vibe-trading resume <session-id>` のヒントも添えるようになりました——終了したランの trace を探すのに、`agent/sessions/` 配下のどのフォルダがタイムスタンプ的に最新かを当てる必要はもうありません。新しい `vibe-trading resume <session-id>` サブコマンドはその正確なセッションを再び開き、直近のターンを loop に再生します；存在しない id は空のセッションを黙って始めるのではなく即座にエラーで終了します（[#218](https://github.com/HKUDS/Vibe-Trading/pull/218)、@zwrong さんに感謝）。
+- **2026-06-12** 🩺 **プロバイダ信頼性の全面強化——DeepSeek ハング、Kimi 接続、ストリーミング死活**：一連のプロバイダ報告——DeepSeek 実行が「Agent is working…」で停止（[#208](https://github.com/HKUDS/Vibe-Trading/issues/208)、@XYWOX さんに感謝）、`reached max iterations` がモデルの空応答を覆い隠す（[#203](https://github.com/HKUDS/Vibe-Trading/issues/203)、@mojianliang さんに感謝）、停止後に UI が復帰しない（[#195](https://github.com/HKUDS/Vibe-Trading/issues/195)、@mafia23 さんに感謝）、Kimi がクライアントを拒否（[#204](https://github.com/HKUDS/Vibe-Trading/issues/204)、@liao497 さんに感謝）——の根因は一つでした：すべての OpenAI 互換プロバイダが単一の shim を共有し、DeepSeek/Kimi/Gemini 固有の挙動をグローバルに適用し、ストリーム失敗を黙って握りつぶしていました。プロバイダ固有の挙動は明示的な**ケイパビリティ層**に移行——reasoning の捕捉/再送、Gemini thought signature、Kimi の `User-Agent`、OpenRouter の reasoning body はそれぞれ自分のプロバイダにのみ適用され、相互汚染しません。reasoning のみのストリームはリアルタイムの**「Reasoning…」**インジケータを表示；ストリーム失敗は文脈付きの `provider_stream_error` を送出し、一時的な切断は 1 回だけ自動リトライ（決定的な 4xx は即時失敗）、遅い非ストリーミング呼び出しへの静かなフォールバックは廃止；モデルの空応答は `empty_model_response` として正しく診断；SSE ハートビートが再接続リプレイを壊さなくなり；スタックした読み取り専用ツールはタイムアウトします。新コマンド **`vibe-trading provider doctor`** は秘匿化済みの provider/モデル/パッケージ/プロキシのスナップショットを出力し、環境起因のハングをワンコマンドで切り分け。DeepSeek は `pip install "vibe-trading-ai[deepseek]"` で公式ネイティブアダプタを選択でき、kimi-k2.x の `temperature=1` 要件は自動適用——Kimi 経路は実 API でエンドツーエンド検証済みです（`kimi-k2.6` のツール呼び出し + 厳格なマルチターン reasoning 再送）。
 <details>
 <summary>過去のニュース</summary>
 
+- **2026-06-11** 🐝 **swarm worker が loader 層経由で市場データを取得するように**: NVDA の投資委員会ランで一連のギャップが露呈しました——worker が場当たり的な yfinance スクリプトを書き、欠損した最新バー（出来高はあるが OHLC が空）を信じ、`NaN` が非厳密 JSON に漏れ、コンテキストを失った継続プロンプトが誤った preset にルーティングされていました（[#198](https://github.com/HKUDS/Vibe-Trading/issues/198)、卓越した診断と 2 つの修正 PR を寄せてくれた @BillDin さんに感謝）。swarm worker は MCP と同じ正規化 loader レジストリに裏打ちされたローカル `get_market_data` ツールを獲得——厳密 JSON、非有限浮動小数は `null` として直列化——**すべての市場データ系 preset**（13 preset、21 worker）に配線され、プロンプトポリシーが OHLCV 作業をツール優先に誘導します（[#199](https://github.com/HKUDS/Vibe-Trading/pull/199)）。`run_swarm` は明示的な `preset_name` を受け取り、曖昧な継続フラグメントは `equity_research_team` へ静かにフォールバックせず拒否されます（[#200](https://github.com/HKUDS/Vibe-Trading/pull/200)）。グラウンディングも賢くなりました: swarm プロンプト内の裸の米国ティッカー（例 `NVDA`）は `NVDA.US` に昇格され（ストップワードでガード）、worker は最初から権威ある事前取得価格を手にします。このツールはメイン agent レジストリにも加わり——現在 **48 ツール**です。さらに: **Docker のデータがアップデートを跨いで保持されるように**——永続メモリ、セッション検索インデックス、ユーザー作成スキル、shadow account、broker 設定は名前付きボリュームに置かれ、`docker compose up --build` でも消えません（[#197](https://github.com/HKUDS/Vibe-Trading/issues/197)、@FlyerJ さんに感謝）。
+- **2026-06-10** 🐳 **Docker からホスト側 Ollama に標準で到達可能に**: コンテナ内の `localhost` はコンテナ自身を指すため、既定の `OLLAMA_BASE_URL=http://localhost:11434` では Docker + Ollama 構成の LLM プリフライトが必ず失敗していました。`docker-compose.yml` は既定で `http://host.docker.internal:11434` を指すようになり（`OLLAMA_BASE_URL` のエクスポートで上書き可）、`host-gateway` の `extra_hosts` マッピングも追加され、Docker Desktop だけでなく Linux でも同じファイルがそのまま動きます（[#196](https://github.com/HKUDS/Vibe-Trading/pull/196)、@ShahNewazKhan さんに感謝）。
+- **2026-06-09** 🔑 **別マシンから Web UI を開いたときのエラーをより明確に**: `API_AUTH_KEY` 未設定のまま非ループバッククライアント（別のマシン、VM ホスト、LAN 上のスマートフォン）からチャットにアクセスすると、メッセージ送信・セッション一覧・live ステータスなどすべての機微なエンドポイントが `403` を返していましたが、チャットには汎用的な「Failed to send message, please retry.」しか表示されませんでした。送信パスが本当の理由——*「Remote API access requires an API key. Add it in Settings, or run the backend on localhost for local-only use.」*——を表示するようになり、README の Web UI セットアップも localhost と LAN の違いと 3 つの対処法（同じマシンで `localhost` を使う／`API_AUTH_KEY` を設定して Settings に一度入力する／Docker Desktop のホストゲートウェイには `VIBE_TRADING_TRUST_DOCKER_LOOPBACK=1`）を明記しました（[#191](https://github.com/HKUDS/Vibe-Trading/issues/191)、@mafia23 さんに感謝）。
+- **2026-06-08** 🔧 **Gemini 3.x マルチターンのツール呼び出し修正**: Gemini 3.x の思考モデル修正が完成しました。6/05 のラウンドトリップ（[#176](https://github.com/HKUDS/Vibe-Trading/pull/176)）は in-memory 履歴のみを対象にしていましたが、実際の agent loop は履歴を OpenAI 形式の dict で再生し、LangChain がリクエスト構築前にツール呼び出しごとの `thought_signature` を捨てていたため、マルチターンのツール呼び出しが依然 `missing thought_signature` で 400 になっていました。これが `invoke` と `stream` が共有する唯一のチョークポイント `_convert_input` で再付与されるようになりました（並列呼び出し——N 個のうち最初の 1 つだけ署名される——も対象）（[#184](https://github.com/HKUDS/Vibe-Trading/pull/184)、@ngoanpv さんに感謝）。
+- **2026-06-07** 🐝 **チャットのタイムラインにライブ swarm ステータス**: agent がマルチエージェント swarm（投資委員会、クオンツデスク、リスク委員会……）を起動すると、チャットに各 worker の状態——待機 / 実行中 / 完了 / 失敗 / ブロック / リトライ——をリアルタイムにストリーミングするインライン**ステータスカード**が表示されるようになりました。独立した swarm ダッシュボードと同じエージェント単位の可視性です。ランタイムイベントは既存の `/swarm/runs` API を変えずにセッション SSE ストリームへブリッジされ、再接続や履歴再生時には完了済みカードが最終的な `run_swarm` 結果から復元されます（[#188](https://github.com/HKUDS/Vibe-Trading/pull/188)、@BillDin さんに感謝）。preset ルーティングも精密に: 明示的に指定された preset（例 `investment_committee`、アンダースコアの有無を問わず）がキーワードスコアより優先され、裸の `IV` デリバティブキーワードが「g**iv**en」のような普通の単語に誤マッチしなくなりました（[#189](https://github.com/HKUDS/Vibe-Trading/pull/189)、@BillDin さんに感謝）。
+- **2026-06-06** ⚖️ **Alpha 比較 —— CLI / Web UI / REST / agent の全面対応**: 新しい `alpha compare` は、手で選んだ Alpha Zoo ファクターのショートリストを同じ universe・期間で総当たり比較し、IC 平均/標準偏差・IR・IC>0 比率・サンプル数で順位付けして、各ファクターのトップとの差を示します。zoo 全体の bench と違い、**指定したファクターだけ**を評価します（新しい `run_bench(only=…)` のサブセットフィルタ）。3 つを比較しても zoo の 191 個すべてを走らせません。1 つの共有コアがすべての面を支えます: `vibe-trading alpha compare <id1> <id2> … --sort ir`（CLI）、Alpha Zoo Web UI の **Compare ビュー**（カタログでファクターをチェック → ワンクリック比較 + ストリーミング順位表）、`POST /alpha/compare` + SSE（REST）、読み取り専用の `alpha_compare` agent ツール（**47 ツール**に）。
+- **2026-06-05** 🇮🇳 **Dhan + Shoonya connector（インド）——ブローカー計 10 社**: connector-first の取引レイヤーにインド市場向けの **Dhan** と **Shoonya**（NSE/BSE 株式 + F&O）を追加し、ブローカーは計 10 社になりました。どちらも**ペーパー + 読み取り専用**です——Longbridge と同様、API がランタイムのペーパー/live 判別子を公開しないため、`place_order` / `cancel_order` は最初の行で非ペーパー設定を硬く拒否します（ルール: ランタイムのペーパー/live ガードを持たないブローカーはペーパー + 読み取り専用に制限）（[#181](https://github.com/HKUDS/Vibe-Trading/pull/181)、[#174](https://github.com/HKUDS/Vibe-Trading/issues/174) をクローズ）。今回は **Gemini 2.5 / 3.x の思考モデル**も修正: ツール呼び出しごとの `thoughtSignature` が OpenAI 互換パスを往復するようになり、マルチターンの function calling が `INVALID_ARGUMENT` で失敗しなくなりました（[#176](https://github.com/HKUDS/Vibe-Trading/pull/176)、[#170](https://github.com/HKUDS/Vibe-Trading/issues/170) をクローズ、@mvanhorn さん & @jliu6789 さんに感謝）。**452 個すべての Alpha Zoo ファクター**に中国語 docstring（中文名称/说明/用途）が追加され（[#180](https://github.com/HKUDS/Vibe-Trading/pull/180)、@LeeCQiang さんに感謝）、**フロントエンドのテストスイート（vitest 197 件）**とバックエンドの認証 / パストラバーサル / CORS セキュリティテストが CI に加わりました（[#175](https://github.com/HKUDS/Vibe-Trading/pull/175)、@sambazhu さんに感謝）。
+- **2026-06-04** 🗃️ **全 7 データソース対応のオプトインローカルキャッシュ**: 新しい `VIBE_TRADING_DATA_CACHE` スイッチにより、各バックテスト loader——tushare、okx、ccxt、akshare、mootdx、yfinance、futu——が確定済みの過去 bar を `~/.vibe-trading/cache`（ユーザーホーム、リポジトリには決して書き込まない）にキャッシュし、繰り返しおよび長期 / クロスマーケットのバックテストがネットワークを省略してプロバイダーのレート制限を回避できます。デフォルトはオフ。バッチ / 接続型 loader（yfinance、futu）はキャッシュが全ヒットすると一括ダウンロード / FutuOpenD 接続を完全にスキップし、staleness ガードは当日で終わる範囲（最後の bar がまだ形成中）を決してキャッシュせず、キャッシュされたフレームは新規取得とバイト単位で一致します（[#177](https://github.com/HKUDS/Vibe-Trading/pull/177)、@mvanhorn さんに感謝）。AI / 自動化支援 PR 向けのコントリビューターガイドも追加され、安全なローカルチェックと高リスクな broker/MCP/認証情報の領域を整理しています（[#173](https://github.com/HKUDS/Vibe-Trading/pull/173)）。
+- **2026-06-03** 🧹 **コミュニティトリアージ + トレース相関**: ツール呼び出しのトレースエントリに発信元の `call_id` が付与され、run トレースの再生時に `tool_result` を対応する `tool_call` に突き合わせられます——引数プレビューはトレースファイルを小さく保つため切り詰めたままです（[#168](https://github.com/HKUDS/Vibe-Trading/pull/168)、@zwrong さんに感謝）。ソースコードのコメントは、外部コントリビューターが見つけられない内部専用のドキュメントパスを指さなくなりました（[#166](https://github.com/HKUDS/Vibe-Trading/issues/166)、@jaleelpersonal さんに感謝）。また、インストール時の `langchain-community` の依存解決の警告は失敗ではなく残存パッケージによる無害な通知であることを明確化し（[#167](https://github.com/HKUDS/Vibe-Trading/issues/167)）、Gemini 2.5/3.0 の関数呼び出しにおける `thoughtSignature` の往復処理を、完全な修正計画付きの `help wanted` タスクとして整理しました（[#170](https://github.com/HKUDS/Vibe-Trading/issues/170)、@jliu6789 さんに感謝）。
 - **2026-06-02** 🔌 **6 つの新しいブローカー connector（Tiger / Longbridge / Alpaca / OKX / Binance / Futu）**: connector-first の取引レイヤーに、IBKR（ローカル）と Robinhood（MCP）に加えて直接 SDK トランスポートが加わりました。各 connector は読み取り専用の account / positions / orders / quote / history に加え、ペーパー口座での発注を公開します——これらのブローカーのペーパー口座で戦略を検証できます。Tiger / Alpaca / OKX / Binance / Futu の 5 つは、Robinhood と同じ安全モデルの背後で、有界かつ mandate でゲートされた発注にも対応します: ユーザーがコミットした mandate（銘柄ユニバース／注文サイズ／エクスポージャー／レバレッジ／日次上限）、ファイルレベルの kill switch、fail-closed の発注前ゲート、完全な監査台帳。Longbridge はペーパー + 読み取り専用のみです（API がランタイムでのペーパー/live 判別子を公開しないため）。すべてのペーパー/live の区別はブローカー単位の構造的ガードです。新しい `trading_place_order` / `trading_cancel_order` ツールを追加し、mandate ユニバースに香港株と A 株のアセットクラスを追加しました。実験的 / 自己責任でご利用ください。
 - **2026-06-01** 🚀 **v0.1.9 リリース**（`pip install -U vibe-trading-ai`）: 0.1.8 以降のすべてをまとめました。Connector-first ブローカー profile（IBKR ローカル読み取り専用 TWS / IB Gateway + OAuth・コミット済み mandate・order guard・audit ledger・instant halt の背後にある Robinhood Agentic Trading）。CLI / REST / MCP / Web を貫く Research Goal ランタイム。swarm 強化——live reconcile + MCP keepalive、operator 設定の worker MCP ツール、厳格 alpha-bench ランダムコントロール、失敗/stale run を再実行する新 `retry_run`（現在 **36 MCP tools**）。`agent/cli/` パッケージ refactor + 刷新したターミナル UI、`mootdx` トークン不要の A 株 loader、backtest / agent loop / session の堅牢性 pass。`--version` は常にインストール済みパッケージと一致し、0.1.8 のドリフトを修正（[#156](https://github.com/HKUDS/Vibe-Trading/issues/156)）。
 - **2026-05-31** 🔌 **Connector-first ブローカーアーキテクチャ（IBKR + Robinhood）**: 取引アクセスは、個別のブローカー入口や live 入口ではなく、選択可能な connector profile から始まるようになりました。`vibe-trading connector list/use/check/account/positions/orders/quote/history` と MCP の `trading_*` ツールは同じ選択済み profile を共有し、paper/live は connector 配下の属性として扱われます。IBKR はローカル読み取り専用 TWS / IB Gateway profile ですぐ使え、公式 IBKR リモート MCP は安定した read tool 名が公開されるまで OAuth `mcp.read` probe として seed されています。Robinhood Agentic Trading は引き続き、OAuth、コミット済み mandate、order guard、audit ledger、instant halt の背後にある bounded live MCP connector です。
@@ -262,6 +271,50 @@ vibe-trading run -p "Analyze my trading behavior, extract my shadow strategy, an
 </details>
 
 <details>
+<summary><b>カスタムデータソース</b> <sub>独自の過去 OHLCV loader を登録</sub></summary>
+
+loader を同梱していない市場やベンダーが必要ですか？独自の過去バー loader を追加し、
+`source="<name>"` で選択できます。以下の手順はパッケージのソースを編集するため、
+clone から実行してください（`pip install -e .`）。
+
+1. **loader を書く** —— `agent/backtest/loaders/<name>_loader.py` を作成し、
+   `DataLoaderProtocol` を満たすクラス（duck-typed、基底クラス不要）を定義して
+   `@register` を付けます：
+
+   ```python
+   import pandas as pd
+   from backtest.loaders.registry import register
+
+   @register
+   class DataLoader:
+       name = "mysource"            # the value you pass as source=
+       markets = {"us_equity"}      # a_share/us_equity/hk_equity/crypto/futures/fund/macro/forex
+       requires_auth = False
+
+       def is_available(self) -> bool:
+           return True              # token present? network reachable?
+
+       def fetch(self, codes, start_date, end_date, *, interval="1D", fields=None):
+           # return {symbol: DataFrame indexed by trade_date,
+           #         columns: open, high, low, close, volume}
+           ...
+   ```
+
+2. **モジュールを登録** して `@register` を発火させる —— `agent/backtest/loaders/registry.py`
+   の `_loader_modules` に `"backtest.loaders.<name>_loader"` を追加します。
+3. **名前を許可** して設定バリデーションを通す —— `agent/backtest/runner.py` の
+   `_VALID_SOURCES` に `"mysource"` を追加します。
+4. *（任意）* `registry.py` のある市場の `FALLBACK_CHAINS` に組み込むと、
+   `source="auto"` からも到達できます。
+5. **使う** —— バックテスト設定で `source="mysource"`、または CLI / agent 経由で。
+
+> **リアルタイムの ticks / 板情報（depth）は loader の対象外です** —— loader 層は
+> point-in-time の過去バーのみを扱います。リアルタイム市場データは broker connector
+> を通します：暗号資産は `okx` / `binance` / `ccxt`、株式は `futu` / `tiger`。
+
+</details>
+
+<details>
 <summary><b>Preset Trading Teams</b> <sub>29 swarm presets</sub></summary>
 
 - 🏢 すぐ使える 29 の agent teams
@@ -429,6 +482,9 @@ cd frontend && npm install && npm run dev
 cd frontend && npm run build && cd ..
 vibe-trading serve --port 8899     # FastAPI serves dist/ as static files
 ```
+
+> [!NOTE]
+> `vibe-trading serve` は `0.0.0.0` にバインドしますが、デフォルトではループバックのみを信頼します。**同じマシン**で UI を開く場合（`http://localhost:8899`）は設定不要で動作します。**別のマシン・VM ホスト・LAN 上のスマートフォン**からアクセスすると、機微なエンドポイントは `403` を返し、チャットに “Remote API access requires an API key” と表示されます。`agent/.env` に強力な `API_AUTH_KEY` を設定して再起動し、**Settings** で同じキーを入力してください。（Docker Desktop のホストゲートウェイの場合: デフォルトの `127.0.0.1` ポートバインドのまま `VIBE_TRADING_TRUST_DOCKER_LOOPBACK=1` を設定。）
 
 </details>
 

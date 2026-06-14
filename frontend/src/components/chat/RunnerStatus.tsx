@@ -1,3 +1,4 @@
+import i18n from '@/i18n';
 import { memo, useCallback, useEffect, useState } from "react";
 import {
   Activity,
@@ -19,7 +20,6 @@ import {
   type LiveMandateLimits,
   type LiveAuthorizeResponse,
 } from "@/lib/api";
-import { useI18n } from "@/lib/i18n";
 
 interface Props {
   /** Shared `GET /live/status` snapshot, polled once by the parent (Agent.tsx).
@@ -89,7 +89,6 @@ function BrokerRow({
   halted: boolean;
   onRefresh: () => void;
 }) {
-  const { language } = useI18n();
   const [busy, setBusy] = useState(false);
   const [authorizeHint, setAuthorizeHint] = useState<LiveAuthorizeResponse | null>(null);
   const [authorizeFailed, setAuthorizeFailed] = useState(false);
@@ -146,12 +145,12 @@ function BrokerRow({
           {authorized ? (
             <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
               <ShieldCheck className="h-2.5 w-2.5" />
-              {language === "zh-CN" ? "已授权" : "Authorized"}
+              Authorized
             </span>
           ) : (
             <span className="inline-flex items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
               <CircleSlash className="h-2.5 w-2.5" />
-              {language === "zh-CN" ? "未连接" : "Not connected"}
+              Not connected
             </span>
           )}
         </div>
@@ -164,7 +163,7 @@ function BrokerRow({
         <div className="grid gap-1.5 rounded-md border border-dashed border-primary/30 bg-primary/5 p-2">
           <div className="flex items-center gap-1.5 text-[11px] font-medium text-primary">
             <PlugZap className="h-3 w-3 shrink-0" />
-            {language === "zh-CN" ? "连接此配置以启用交易连接器运行时" : "Connect this profile to enable connector runtime"}
+            Connect this profile to enable connector runtime
           </div>
           <p className="text-[10px] leading-relaxed text-muted-foreground">
             {authorizeInstruction}
@@ -181,16 +180,16 @@ function BrokerRow({
             <div className="rounded-md border bg-background/60 p-2">
               <div className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                 <CircleDot className={["h-2.5 w-2.5", runnerAlive ? "text-emerald-500" : "text-muted-foreground"].join(" ")} />
-                {language === "zh-CN" ? "运行器" : "Runner"}
+                Runner
               </div>
               <div className={["mt-0.5 text-xs font-semibold", runnerAlive ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"].join(" ")}>
-                {runnerAlive ? (language === "zh-CN" ? "运行中" : "Running") : (language === "zh-CN" ? "已停止" : "Stopped")}
+                {runnerAlive ? "Running" : "Stopped"}
               </div>
             </div>
             <div className="rounded-md border bg-background/60 p-2">
               <div className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                 <Activity className="h-2.5 w-2.5" />
-                {language === "zh-CN" ? "最近心跳" : "Last tick"}
+                Last tick
               </div>
               <div className="mt-0.5 text-xs font-medium text-foreground">
                 {formatRelative(broker.runner?.last_tick)}
@@ -203,7 +202,7 @@ function BrokerRow({
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                   <ShieldCheck className="h-2.5 w-2.5" />
-                  {language === "zh-CN" ? "当前交易授权范围" : "Active mandate"}
+                  Active mandate
                 </div>
                 {mandate.expires_at && (
                   <span
@@ -228,7 +227,7 @@ function BrokerRow({
             </div>
           ) : (
             <div className="rounded-md border border-dashed bg-background/40 p-2 text-[10px] text-muted-foreground">
-              {language === "zh-CN" ? "当前没有生效的交易授权范围。请先让研究助手提出方案并确认，再启动交易连接器运行时。" : "No active mandate. Ask the agent to propose one, then commit it before starting the connector runtime."}
+              No active mandate. Ask the agent to propose one, then commit it before starting the connector runtime.
             </div>
           )}
 
@@ -236,11 +235,11 @@ function BrokerRow({
             {halted ? (
               <span className="inline-flex items-center gap-1 text-[10px] font-medium text-destructive">
                 <OctagonX className="h-3 w-3" />
-                {language === "zh-CN" ? "已停止，运行器控制不可用" : "Halted — runner controls disabled"}
+                Halted — runner controls disabled
               </span>
             ) : (
               <span className="text-[10px] text-muted-foreground">
-                {runnerAlive ? (language === "zh-CN" ? "正在授权范围内运行" : "Runtime active inside mandate") : (language === "zh-CN" ? "空闲" : "Idle")}
+                {runnerAlive ? "Runtime active inside mandate" : "Idle"}
               </span>
             )}
             <button
@@ -253,10 +252,10 @@ function BrokerRow({
                   ? "border-destructive/40 text-destructive hover:bg-destructive/10"
                   : "border-primary/40 text-primary hover:bg-primary/10",
               ].join(" ")}
-              title={runnerAlive ? (language === "zh-CN" ? "停止持续运行器" : "Stop the persistent runner") : (language === "zh-CN" ? "启动持续运行器" : "Start the persistent runner")}
+              title={runnerAlive ? "Stop the persistent runner" : "Start the persistent runner"}
             >
               {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Power className="h-3 w-3" />}
-              {runnerAlive ? (language === "zh-CN" ? "停止运行器" : "Stop runner") : (language === "zh-CN" ? "启动运行器" : "Start runner")}
+              {runnerAlive ? "Stop runner" : "Start runner"}
             </button>
           </div>
         </>
@@ -277,7 +276,6 @@ function BrokerRow({
  * `api.stopLiveRunner`), never chat messages. Collapses to a compact toggle.
  */
 export const RunnerStatus = memo(function RunnerStatus({ status, unavailable, halted, onRefresh }: Props) {
-  const { language } = useI18n();
   const [open, setOpen] = useState(false);
 
   if (unavailable) return null;
@@ -293,26 +291,24 @@ export const RunnerStatus = memo(function RunnerStatus({ status, unavailable, ha
         type="button"
         onClick={() => setOpen((v) => !v)}
         className="inline-flex max-w-full items-center gap-1.5 justify-self-start rounded-lg bg-primary/10 px-2.5 py-1 text-left text-xs font-medium text-primary transition-colors hover:bg-primary/15"
-        aria-label={language === "zh-CN" ? "交易连接器运行时状态" : "Connector runtime status"}
+        aria-label="Connector runtime status"
         aria-expanded={open}
       >
         <Activity className="h-3 w-3 shrink-0" />
-        <span className="shrink-0">{language === "zh-CN" ? "交易连接器运行时" : "Connector runtime"}</span>
+        <span className="shrink-0">{i18n.t("runnerStatus.connectorRuntime")}</span>
         <span className="truncate text-muted-foreground">
-          {authorizedCount > 0
-            ? (language === "zh-CN" ? `已连接 ${authorizedCount} 个` : `${authorizedCount} connected`)
-            : (language === "zh-CN" ? "暂无连接器连接" : "no connector connected")}
+          {authorizedCount > 0 ? `${authorizedCount} connected` : "no connector connected"}
         </span>
         {anyRunning && !isHalted && (
           <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
             <CircleDot className="h-2.5 w-2.5" />
-            {language === "zh-CN" ? "运行中" : "running"}
+            running
           </span>
         )}
         {isHalted && (
           <span className="inline-flex items-center gap-1 rounded-full bg-destructive/10 px-1.5 py-0.5 text-[10px] font-medium text-destructive">
             <OctagonX className="h-2.5 w-2.5" />
-            {language === "zh-CN" ? "已停止" : "halted"}
+            halted
           </span>
         )}
         <ChevronDown className={["h-3 w-3 shrink-0 transition-transform", open ? "rotate-180" : ""].join(" ")} aria-hidden="true" />

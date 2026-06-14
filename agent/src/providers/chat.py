@@ -5,6 +5,7 @@ ChatLLM is designed specifically for the AgentLoop ReAct cycle.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -68,6 +69,55 @@ class LLMResponse:
         return len(self.tool_calls) > 0
 
 
+class ProviderStreamError(RuntimeError):
+    """Raised when provider streaming fails before a complete response."""
+
+    def __init__(self, *, provider: str, model: str, original: Exception) -> None:
+        """Initialize a provider-contextual stream error.
+
+        Args:
+            provider: Effective provider name.
+            model: Effective model name.
+            original: Original exception from the stream path.
+        """
+        self.provider = provider
+        self.model = model
+        self.original = original
+        self.status_code: Optional[int] = getattr(original, "status_code", None)
+        safe_message = _redact_provider_error(str(original))
+        super().__init__(
+            f"provider_stream_error provider={provider} model={model}: "
+            f"{type(original).__name__}: {safe_message}"
+        )
+
+    @property
+    def retryable(self) -> bool:
+        """Whether a single retry could plausibly succeed.
+
+        Returns:
+            False for deterministic client errors (4xx other than 408/429),
+            True for everything else — timeouts, rate limits, 5xx, and
+            transport errors that carry no HTTP status.
+        """
+        if self.status_code is None:
+            return True
+        if self.status_code in (408, 429):
+            return True
+        return not 400 <= self.status_code < 500
+
+
+def _redact_provider_error(message: str) -> str:
+    """Redact configured secret/proxy values from provider errors."""
+    redacted = message
+    sensitive_markers = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASS", "PROXY")
+    for key, value in os.environ.items():
+        if not value or len(value) < 8:
+            continue
+        if any(marker in key.upper() for marker in sensitive_markers):
+            redacted = redacted.replace(value, "[redacted]")
+    return redacted
+
+
 class ChatLLM:
     """LLM chat client with function calling support.
 
@@ -107,17 +157,20 @@ class ChatLLM:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         on_text_chunk: Optional[Any] = None,
+        on_reasoning_chunk: Optional[Any] = None,
         timeout: Optional[int] = None,
     ) -> LLMResponse:
         """Stream the LLM and optionally forward text deltas (e.g. thinking).
 
-        Iterates AIMessageChunk; each text delta invokes ``on_text_chunk``.
-        Aggregates chunks into one response; on failure falls back to ``chat()``.
+        Iterates AIMessageChunk; text deltas invoke ``on_text_chunk`` and
+        reasoning-only deltas invoke ``on_reasoning_chunk``. Aggregates chunks
+        into one response. Stream failures are explicit provider errors.
 
         Args:
             messages: Messages in OpenAI format.
             tools: Tool definitions for function calling.
             on_text_chunk: Optional callback ``(delta: str) -> None``.
+            on_reasoning_chunk: Optional callback ``(delta: str) -> None``.
             timeout: Optional per-call timeout in seconds.
 
         Returns:
@@ -130,12 +183,17 @@ class ChatLLM:
             for chunk in llm.stream(messages, config=config):
                 if chunk.content and on_text_chunk:
                     on_text_chunk(chunk.content)
+                reasoning = getattr(chunk, "additional_kwargs", {}).get("reasoning_content")
+                if reasoning and not chunk.content and on_reasoning_chunk:
+                    on_reasoning_chunk(reasoning)
                 accumulated = chunk if accumulated is None else accumulated + chunk
             if accumulated is None:
                 return LLMResponse(content="", tool_calls=[], finish_reason="stop")
             return self._parse_response(accumulated)
-        except Exception:
-            return self.chat(messages, tools=tools, timeout=timeout)
+        except Exception as exc:
+            provider = os.getenv("LANGCHAIN_PROVIDER", "openai").strip().lower() or "openai"
+            model = self.model_name or os.getenv("LANGCHAIN_MODEL_NAME", "").strip() or "(unset)"
+            raise ProviderStreamError(provider=provider, model=model, original=exc) from exc
 
     @staticmethod
     def _tool_call_thought_signature_maps(ai_message: Any) -> tuple[dict[str, str], dict[int, str]]:

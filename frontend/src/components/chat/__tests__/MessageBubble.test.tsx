@@ -75,7 +75,7 @@ describe("MessageBubble", () => {
       const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
 
       render(<MessageBubble msg={makeMsg({ type: "answer", content: "Report content" })} />);
-      await userEvent.setup().click(screen.getByTitle("生成 PDF"));
+      await userEvent.setup().click(screen.getByTitle("Generate PDF"));
 
       expect(api.generatePdf).toHaveBeenCalledWith("Vibe-Trading Research Report", "Report content");
       expect(createObjectURL).toHaveBeenCalledWith(pdf);
@@ -93,7 +93,7 @@ describe("MessageBubble", () => {
         type: "answer",
         content: "结论\n免责声明：不构成投资建议。\n如有需要，我可以继续分析。",
       })} />);
-      await userEvent.setup().click(screen.getByTitle("生成 PDF"));
+      await userEvent.setup().click(screen.getByTitle("Generate PDF"));
 
       expect(api.generatePdf).toHaveBeenCalledWith(
         "Vibe-Trading Research Report",

@@ -1,0 +1,143 @@
+"""ChatLLM streaming liveness and error semantics."""
+
+from __future__ import annotations
+
+import os
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+
+from src.providers.chat import ChatLLM, ProviderStreamError
+
+
+class _FakeChunk:
+    def __init__(
+        self,
+        *,
+        content: str = "",
+        reasoning: str = "",
+        finish_reason: str = "stop",
+    ) -> None:
+        self.content = content
+        self.tool_calls: list[dict[str, Any]] = []
+        self.additional_kwargs = {"reasoning_content": reasoning} if reasoning else {}
+        self.response_metadata = {"finish_reason": finish_reason}
+        self.usage_metadata = None
+
+    def __add__(self, other: "_FakeChunk") -> "_FakeChunk":
+        merged = _FakeChunk(
+            content=f"{self.content}{other.content}",
+            reasoning=(
+                f"{self.additional_kwargs.get('reasoning_content', '')}"
+                f"{other.additional_kwargs.get('reasoning_content', '')}"
+            ),
+            finish_reason=other.response_metadata.get("finish_reason", "stop"),
+        )
+        return merged
+
+
+class _FakeStreamingLLM:
+    def __init__(self, chunks: list[_FakeChunk] | None = None, exc: Exception | None = None) -> None:
+        self.chunks = chunks or []
+        self.exc = exc
+        self.invoke_called = False
+
+    def bind_tools(self, tools: list[dict[str, Any]]) -> "_FakeStreamingLLM":
+        return self
+
+    def stream(self, messages: list[dict[str, Any]], config: dict[str, Any] | None = None):
+        if self.exc is not None:
+            raise self.exc
+        yield from self.chunks
+
+    def invoke(self, messages: list[dict[str, Any]], config: dict[str, Any] | None = None):
+        self.invoke_called = True
+        return _FakeChunk(content="fallback")
+
+
+def _client(fake_llm: _FakeStreamingLLM) -> ChatLLM:
+    client = ChatLLM.__new__(ChatLLM)
+    client.model_name = "deepseek-v4-pro"
+    client._llm = fake_llm
+    return client
+
+
+def test_reasoning_only_chunks_emit_progress_without_final_answer_text() -> None:
+    fake = _FakeStreamingLLM([
+        _FakeChunk(reasoning="thinking "),
+        _FakeChunk(reasoning="more"),
+        _FakeChunk(content="final"),
+    ])
+    text_chunks: list[str] = []
+    reasoning_chunks: list[str] = []
+
+    response = _client(fake).stream_chat(
+        [{"role": "user", "content": "hi"}],
+        on_text_chunk=text_chunks.append,
+        on_reasoning_chunk=reasoning_chunks.append,
+    )
+
+    assert text_chunks == ["final"]
+    assert reasoning_chunks == ["thinking ", "more"]
+    assert response.content == "final"
+    assert response.reasoning_content == "thinking more"
+
+
+def test_stream_failure_raises_provider_error_without_silent_fallback() -> None:
+    fake = _FakeStreamingLLM(exc=RuntimeError("stream exploded"))
+
+    with patch.dict(
+        os.environ,
+        {"LANGCHAIN_PROVIDER": "deepseek", "LANGCHAIN_MODEL_NAME": "deepseek-v4-pro"},
+        clear=True,
+    ):
+        with pytest.raises(ProviderStreamError) as excinfo:
+            _client(fake).stream_chat([{"role": "user", "content": "hi"}])
+
+    assert "provider=deepseek" in str(excinfo.value)
+    assert "model=deepseek-v4-pro" in str(excinfo.value)
+    assert fake.invoke_called is False
+
+
+def test_stream_error_redacts_configured_secret_values() -> None:
+    fake = _FakeStreamingLLM(exc=RuntimeError("bad key sk-live-secret-123456"))
+
+    with patch.dict(
+        os.environ,
+        {
+            "LANGCHAIN_PROVIDER": "deepseek",
+            "LANGCHAIN_MODEL_NAME": "deepseek-v4-pro",
+            "DEEPSEEK_API_KEY": "sk-live-secret-123456",
+        },
+        clear=True,
+    ):
+        with pytest.raises(ProviderStreamError) as excinfo:
+            _client(fake).stream_chat([{"role": "user", "content": "hi"}])
+
+    assert "sk-live-secret-123456" not in str(excinfo.value)
+    assert "[redacted]" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (None, True),   # transport error, no HTTP status — plausibly transient
+        (400, False),   # deterministic client error
+        (401, False),
+        (404, False),
+        (408, True),    # request timeout — transient
+        (429, True),    # rate limit — transient
+        (500, True),
+        (503, True),
+    ],
+)
+def test_provider_stream_error_retryable_classification(
+    status_code: int | None, expected: bool
+) -> None:
+    original = Exception("boom")
+    if status_code is not None:
+        original.status_code = status_code  # type: ignore[attr-defined]
+    err = ProviderStreamError(provider="kimi", model="kimi-k2.6", original=original)
+    assert err.status_code == status_code
+    assert err.retryable is expected

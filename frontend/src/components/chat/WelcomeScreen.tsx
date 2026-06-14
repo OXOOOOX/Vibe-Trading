@@ -1,6 +1,5 @@
+import { useTranslation } from "react-i18next";
 ﻿import { Bot, TrendingUp, Globe, Sparkles, Users, UserCircle2, NotebookPen, Landmark } from "lucide-react";
-
-import { useI18n } from "@/lib/i18n";
 
 interface Example {
   title: string;
@@ -175,52 +174,7 @@ interface Props {
 }
 
 export function WelcomeScreen({ onExample }: Props) {
-  const { language } = useI18n();
-  const categoryLabels: Record<string, string> = {
-    "Multi-Market Backtest": "多市场回测",
-    "Research & Analysis": "研究与分析",
-    "Swarm Teams": "多智能体团队",
-    "Document & Web Research": "文档与网络研究",
-    "Trade Journal": "交易日志",
-    "Trading Connectors": "交易连接器",
-    "Shadow Account": "影子账户",
-  };
-  const capabilityLabels: Record<string, string> = {
-    "Finance Skills Library": "金融技能库",
-    "Swarm Agent Teams": "多智能体研究团队",
-    "Auto-Discovered Tools": "自动发现工具",
-    "3 Markets: A-Share · Crypto · HK/US": "三大市场：A 股 · 加密资产 · 港美股",
-    "Trading Connector Profiles": "交易连接器配置",
-    "Minute to Daily Timeframes": "分钟级至日线周期",
-    "4 Portfolio Optimizers": "4 类投资组合优化器",
-    "15+ Risk Metrics": "15+ 风险指标",
-    "Options & Derivatives": "期权与衍生品",
-    "PDF & Web Research": "PDF 与网络研究",
-    "Factor Analysis & ML": "因子分析与机器学习",
-    "Trade Journal Analyzer": "交易日志分析",
-    "Shadow Account Backtest": "影子账户回测",
-    "Persistent Memory": "持久化记忆",
-    "Session Search": "会话搜索",
-  };
-  const exampleLabels: Record<string, { title: string; desc: string }> = {
-    "Cross-Market Portfolio": { title: "跨市场投资组合", desc: "使用风险平价优化器配置 A 股、加密资产和美股" },
-    "BTC 5-Min MACD Strategy": { title: "BTC 五分钟 MACD 策略", desc: "使用 OKX 实时数据进行分钟级加密资产回测" },
-    "US Tech Max Diversification": { title: "美股科技股最大分散化", desc: "通过 yfinance 对大型科技股组合进行优化" },
-    "Multi-Factor Alpha Model": { title: "多因子 Alpha 模型", desc: "在 300 只股票上进行 IC 加权因子合成" },
-    "Options Greeks Analysis": { title: "期权希腊值分析", desc: "使用 Black-Scholes 模型计算 Delta、Gamma、Theta 与 Vega" },
-    "Investment Committee Review": { title: "投资委员会评审", desc: "多智能体辩论：多空观点、风险审查与投资经理决策" },
-    "Quant Strategy Desk": { title: "量化策略研究团队", desc: "筛选、因子研究、回测与风险审计的完整流程" },
-    "Analyze an Earnings Report PDF": { title: "分析财报 PDF", desc: "上传 PDF 并针对财务数据进行提问" },
-    "Web Research: Macro Outlook": { title: "网络研究：宏观展望", desc: "读取实时网络来源并开展宏观分析" },
-    "Analyze My Broker Export": { title: "分析我的券商交易流水", desc: "解析同花顺、东财、富途或通用 CSV，统计持仓天数、胜率、盈亏比与时段分布" },
-    "Diagnose My Behavior Biases": { title: "诊断我的交易行为偏差", desc: "分析处置效应、过度交易、追涨和锚定，并提供量化证据" },
-    "Check Selected Connector": { title: "检查当前交易连接器", desc: "列出连接器配置，并验证当前选中的连接器" },
-    "Analyze Connector Portfolio": { title: "分析连接器账户组合", desc: "读取当前连接器的账户摘要与持仓" },
-    "Quote & Trend": { title: "行情与趋势", desc: "通过当前连接器获取报价和近期日线数据" },
-    "Train My Shadow from Journal": { title: "根据交易日志训练影子账户", desc: "从券商 CSV 提取交易规则，并保存影子策略配置" },
-    "How Much Am I Leaving on the Table?": { title: "我错过了多少收益？", desc: "回测影子策略，并归因其与实际收益之间的差异" },
-    "Generate Shadow Report": { title: "生成影子账户报告", desc: "生成包含权益曲线、分市场夏普率和归因瀑布图的 HTML/PDF 报告" },
-  };
+  const { t } = useTranslation();
   return (
     <div className="flex flex-col items-center justify-center min-h-[60vh] space-y-8 text-center">
       {/* Header */}
@@ -229,12 +183,12 @@ export function WelcomeScreen({ onExample }: Props) {
           <Bot className="h-8 w-8 text-white" />
         </div>
         <div>
-          <h2 className="text-2xl font-bold tracking-tight">Vibe-Trading</h2>
+          <h2 className="text-2xl font-bold tracking-tight">{t('welcome.title')}</h2>
           <p className="text-xs text-muted-foreground mt-1 max-w-sm mx-auto leading-relaxed">
-            {language === "zh-CN" ? "与你的专业金融智能体团队一起开展交易研究" : "vibe trading with your professional financial agent team"}
+            vibe trading with your professional financial agent team
           </p>
           <p className="text-sm text-muted-foreground mt-2 max-w-md leading-relaxed mx-auto">
-            {language === "zh-CN" ? "描述你的交易策略，开始一项新的研究。" : "Describe a trading strategy to get started."}
+            Describe a trading strategy to get started.
           </p>
         </div>
       </div>
@@ -246,20 +200,20 @@ export function WelcomeScreen({ onExample }: Props) {
             key={chip}
             className="px-2.5 py-1 text-xs rounded-full border border-border/60 text-muted-foreground bg-muted/30"
           >
-            {language === "zh-CN" ? capabilityLabels[chip] ?? chip : chip}
+            {chip}
           </span>
         ))}
       </div>
 
       {/* Example categories grid */}
       <div className="w-full max-w-2xl text-left space-y-4">
-        <p className="text-xs text-muted-foreground px-1">{language === "zh-CN" ? "试试这些示例：" : "Try an example:"}</p>
+        <p className="text-xs text-muted-foreground px-1">{t('welcome.tryExample')}</p>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           {CATEGORIES.map((cat) => (
             <div key={cat.label} className="space-y-2">
               <div className={`flex items-center gap-1.5 text-xs font-medium px-1 ${cat.color.split(" ").filter(c => c.startsWith("text-")).join(" ")}`}>
                 {cat.icon}
-                <span>{language === "zh-CN" ? categoryLabels[cat.label] ?? cat.label : cat.label}</span>
+                <span>{cat.label}</span>
               </div>
               <div className="space-y-1.5">
                 {cat.examples.map((ex) => (
@@ -269,10 +223,10 @@ export function WelcomeScreen({ onExample }: Props) {
                     className={`block w-full text-left px-3 py-2.5 rounded-xl border transition-colors ${cat.color}`}
                   >
                     <span className="text-sm font-medium text-foreground leading-snug">
-                      {language === "zh-CN" ? exampleLabels[ex.title]?.title ?? ex.title : ex.title}
+                      {ex.title}
                     </span>
                     <span className="block text-xs text-muted-foreground mt-0.5 leading-snug">
-                      {language === "zh-CN" ? exampleLabels[ex.title]?.desc ?? ex.desc : ex.desc}
+                      {ex.desc}
                     </span>
                   </button>
                 ))}

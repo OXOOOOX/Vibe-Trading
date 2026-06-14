@@ -1,3 +1,4 @@
+import i18n from '@/i18n';
 import { memo, useState, useCallback } from "react";
 import { User, XCircle, RefreshCw, Copy, Check, FileDown, Loader2 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -40,7 +41,7 @@ function CopyButton({ text }: { text: string }) {
     <button
       onClick={handleCopy}
       className="p-1.5 rounded-md bg-muted/80 hover:bg-muted text-muted-foreground hover:text-foreground"
-      title={copied ? "Copied" : "Copy"}
+      title={copied ? i18n.t("messageBubble.copied") : i18n.t("messageBubble.copy")}
     >
       {copied ? <Check className="h-3.5 w-3.5 text-success" /> : <Copy className="h-3.5 w-3.5" />}
     </button>
@@ -93,9 +94,9 @@ function PdfButton({ text }: { text: string }) {
     } catch (error) {
       if (error instanceof ApiError && error.status === 501) {
         printFallback();
-        toast.info("PDF 渲染器不可用，已打开系统 PDF 保存窗口");
+        toast.info(i18n.t("messageBubble.pdfRendererUnavailable"));
       } else {
-        toast.error(error instanceof Error ? error.message : "PDF generation failed");
+        toast.error(error instanceof Error ? error.message : i18n.t("messageBubble.pdfGenerationFailed"));
       }
     } finally {
       setLoading(false);
@@ -106,7 +107,7 @@ function PdfButton({ text }: { text: string }) {
       onClick={handlePdf}
       disabled={loading}
       className="p-1.5 rounded-md bg-muted/80 hover:bg-muted text-muted-foreground hover:text-foreground disabled:opacity-50"
-      title="生成 PDF"
+      title={i18n.t("messageBubble.generatePdf")}
     >
       {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FileDown className="h-3.5 w-3.5" />}
     </button>
@@ -116,12 +117,12 @@ function PdfButton({ text }: { text: string }) {
 function getRetryHint(content: string): string {
   const lower = content.toLowerCase();
   if (lower.includes("timeout") || lower.includes("timed out")) {
-    return "Execution timed out. Try simplifying the strategy or reducing the number of assets.";
+    return i18n.t("messageBubble.timeoutHint");
   }
   if (lower.includes("api") || lower.includes("rate limit") || lower.includes("429") || lower.includes("500") || lower.includes("502") || lower.includes("503")) {
-    return "API call failed. Please retry later.";
+    return i18n.t("messageBubble.apiFailedHint");
   }
-  return "Execution failed. Click to retry.";
+  return i18n.t("messageBubble.executionFailedHint");
 }
 
 interface Props {

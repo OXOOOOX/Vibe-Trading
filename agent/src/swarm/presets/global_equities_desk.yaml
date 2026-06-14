@@ -40,7 +40,7 @@ agents:
 
       Use load_skill for tushare data patterns, fundamental screening, and Northbound flow analysis.
       Use factor_analysis tool for quantitative factor scoring.
-    tools: [bash, read_file, write_file, load_skill, factor_analysis]
+    tools: [bash, read_file, write_file, load_skill, get_market_data, factor_analysis]
     skills: [tushare, fundamental-filter, hk-connect-flow, technical-basic, multi-factor, sector-rotation]
     max_iterations: 50
     timeout_seconds: 1800
@@ -88,7 +88,7 @@ agents:
       - Cross-listing: ADR delisting risk (HFCAA status), VIE structure risk
 
       Use load_skill for yfinance data, SEC filing analysis, earnings revision patterns, ETF flow analysis, and cross-listing dynamics.
-    tools: [bash, read_file, write_file, load_skill, read_url]
+    tools: [bash, read_file, write_file, load_skill, get_market_data, read_url]
     skills: [yfinance, edgar-sec-filings, earnings-revision, us-etf-flow, adr-hshare, hk-connect-flow, technical-basic]
     max_iterations: 50
     timeout_seconds: 1800
@@ -126,7 +126,7 @@ agents:
       - For each: ticker (BTC-USDT format), direction, timeframe, key risk
 
       Use load_skill for OKX market data, funding rate analysis, and stablecoin flow indicators.
-    tools: [bash, read_file, write_file, load_skill]
+    tools: [bash, read_file, write_file, load_skill, get_market_data]
     skills: [okx-market, perp-funding-basis, stablecoin-flow, onchain-analysis, crypto-derivatives]
     max_iterations: 50
     timeout_seconds: 1800

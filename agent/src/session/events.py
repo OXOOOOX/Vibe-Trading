@@ -29,7 +29,7 @@ class SSEEvent:
         timestamp: Event timestamp.
     """
 
-    event_id: str = field(default_factory=lambda: uuid.uuid4().hex[:16])
+    event_id: Optional[str] = field(default_factory=lambda: uuid.uuid4().hex[:16])
     event_type: str = "message"
     data: Dict[str, Any] = field(default_factory=dict)
     session_id: str = ""
@@ -42,13 +42,15 @@ class SSEEvent:
             Text that conforms to the SSE specification.
         """
         payload = json.dumps(self.data, ensure_ascii=False)
-        lines = [
-            f"id: {self.event_id}",
+        lines = []
+        if self.event_id:
+            lines.append(f"id: {self.event_id}")
+        lines.extend([
             f"event: {self.event_type}",
             f"data: {payload}",
             "",
             "",
-        ]
+        ])
         return "\n".join(lines)
 
 
@@ -181,6 +183,8 @@ class EventBus:
                     result.append(event)
                 elif event.event_id == last_event_id:
                     found = True
+            if not found and replay_all:
+                return list(buffer)
             return result
 
     async def subscribe(
@@ -225,6 +229,7 @@ class EventBus:
                     yield event
                 except asyncio.TimeoutError:
                     yield SSEEvent(
+                        event_id=None,
                         event_type="heartbeat",
                         data={"ts": time.time()},
                         session_id=session_id,

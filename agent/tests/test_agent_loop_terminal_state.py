@@ -11,12 +11,14 @@ exits without hitting any real API.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Callable
 
 import pytest
 
 from src.agent.loop import AgentLoop
+from src.providers.chat import ProviderStreamError
 
 
 class _StubLLMResponse:
@@ -41,8 +43,28 @@ class _StubLLMNoFinal:
         messages: list[dict[str, Any]],
         tools: list[Any] | None = None,
         on_text_chunk: Callable[[str], None] | None = None,
+        on_reasoning_chunk: Callable[[str], None] | None = None,
     ) -> _StubLLMResponse:
         return _StubLLMResponse()
+
+    def chat(self, messages: list[dict[str, Any]], **_: Any) -> _StubLLMResponse:
+        return _StubLLMResponse()
+
+
+class _StubLLMWithUsage:
+    model_name = "stub-model"
+
+    def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any] | None = None,
+        on_text_chunk: Callable[[str], None] | None = None,
+        on_reasoning_chunk: Callable[[str], None] | None = None,
+    ) -> _StubLLMResponse:
+        response = _StubLLMResponse()
+        response.content = "done"
+        response.usage_metadata = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        return response
 
     def chat(self, messages: list[dict[str, Any]], **_: Any) -> _StubLLMResponse:
         return _StubLLMResponse()
@@ -63,6 +85,7 @@ class _StubLLMCancelMidStream:
         messages: list[dict[str, Any]],
         tools: list[Any] | None = None,
         on_text_chunk: Callable[[str], None] | None = None,
+        on_reasoning_chunk: Callable[[str], None] | None = None,
     ) -> _StubLLMResponse:
         # Set _cancelled on the bound agent so the next loop iteration check
         # picks it up.  We still need a valid response so the current
@@ -93,18 +116,17 @@ def _build_agent(llm: Any, max_iter: int = 3, tmp_run_dir: Path | None = None) -
     return agent
 
 
-def test_failed_terminal_returns_reason_iterations_and_max_iterations(
+def test_empty_model_response_returns_specific_reason(
     tmp_path: Path,
 ) -> None:
-    """When the loop exits without a final answer or metrics.csv, the
-    returned dict must carry `reason`, `iterations`, and `max_iterations`
-    so SessionService can render an actionable error message."""
+    """Empty no-tool provider output is distinct from exhausting iterations."""
     agent = _build_agent(_StubLLMNoFinal(), max_iter=3, tmp_run_dir=tmp_path / "run")
 
     result = agent.run(user_message="anything")
 
     assert result["status"] == "failed"
-    assert result["reason"] == "reached max iterations (3) without final answer"
+    assert result["reason"].startswith("empty_model_response")
+    assert "iteration 1" in result["reason"]
     assert result["iterations"] >= 1
     assert result["max_iterations"] == 3
 
@@ -136,8 +158,32 @@ def test_session_service_renders_meaningful_error_from_result(tmp_path: Path) ->
     ui_error = result.get("reason", "unknown")
 
     assert ui_error != "unknown"
-    assert "max iterations" in ui_error
-    assert "2" in ui_error
+    assert "empty_model_response" in ui_error
+    assert "iteration 1" in ui_error
+
+
+def test_usage_metadata_is_persisted_to_run_artifact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provider usage should remain auditable after the live SSE event is gone."""
+    monkeypatch.setenv("LANGCHAIN_PROVIDER", "pytest-provider")
+    agent = _build_agent(_StubLLMWithUsage(), max_iter=2, tmp_run_dir=tmp_path / "run")
+
+    result = agent.run(user_message="anything")
+
+    assert result["status"] == "success"
+    usage_path = tmp_path / "run" / "llm_usage.json"
+    payload = json.loads(usage_path.read_text(encoding="utf-8"))
+    assert payload["provider"] == "pytest-provider"
+    assert payload["model"] == "stub-model"
+    assert payload["totals"] == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "calls": 1,
+    }
+    assert payload["per_iteration"] == [
+        {"iter": 1, "input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+    ]
+    assert payload["updated_at"].endswith("Z")
 
 
 class _StubLLMAlwaysToolCalls:
@@ -151,6 +197,7 @@ class _StubLLMAlwaysToolCalls:
         messages: list[dict[str, Any]],
         tools: list[Any] | None = None,
         on_text_chunk: Callable[[str], None] | None = None,
+        on_reasoning_chunk: Callable[[str], None] | None = None,
     ) -> _StubLLMResponse:
         resp = _StubLLMResponse()
         if tools is not None:
@@ -166,6 +213,71 @@ class _StubLLMAlwaysToolCalls:
 
     def chat(self, messages: list[dict[str, Any]], **_: Any) -> _StubLLMResponse:
         return _StubLLMResponse()
+
+
+class _StubLLMIgnoresForcedTextOnly:
+    """LLM stub that keeps returning tool calls even when tools=None."""
+
+    def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any] | None = None,
+        on_text_chunk: Callable[[str], None] | None = None,
+        on_reasoning_chunk: Callable[[str], None] | None = None,
+    ) -> _StubLLMResponse:
+        resp = _StubLLMResponse()
+        resp.has_tool_calls = True
+        resp.tool_calls = [
+            type("TC", (), {"id": "tc_1", "name": "compact", "arguments": {}})()
+        ]
+        return resp
+
+    def chat(self, messages: list[dict[str, Any]], **_: Any) -> _StubLLMResponse:
+        return _StubLLMResponse()
+
+
+class _StubLLMStreamFailure:
+    def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any] | None = None,
+        on_text_chunk: Callable[[str], None] | None = None,
+        on_reasoning_chunk: Callable[[str], None] | None = None,
+    ) -> _StubLLMResponse:
+        raise ProviderStreamError(
+            provider="deepseek",
+            model="deepseek-v4-pro",
+            original=RuntimeError("stream exploded"),
+        )
+
+    def chat(self, messages: list[dict[str, Any]], **_: Any) -> _StubLLMResponse:
+        return _StubLLMResponse()
+
+
+def test_provider_stream_error_returns_structured_failure(tmp_path: Path) -> None:
+    """Provider stream failures should stay diagnosable at the session boundary."""
+    agent = _build_agent(_StubLLMStreamFailure(), max_iter=3, tmp_run_dir=tmp_path / "run")
+
+    result = agent.run(user_message="anything")
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "provider_stream_error"
+    assert "provider_stream_error" in result["reason"]
+    assert result["iterations"] == 1
+    assert result["max_iterations"] == 3
+
+
+def test_true_max_iterations_still_returns_max_iteration_reason(tmp_path: Path) -> None:
+    """A provider that ignores the forced text-only last turn is still max-iter."""
+    agent = _build_agent(
+        _StubLLMIgnoresForcedTextOnly(), max_iter=1, tmp_run_dir=tmp_path / "run"
+    )
+
+    result = agent.run(user_message="do something")
+
+    assert result["status"] == "failed"
+    assert result["reason"] == "reached max iterations (1) without final answer"
+    assert result["iterations"] == 1
 
 
 def test_force_text_only_on_last_iteration(tmp_path: Path) -> None:

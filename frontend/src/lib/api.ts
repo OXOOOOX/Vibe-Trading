@@ -85,7 +85,13 @@ export const api = {
   uploadFile,
   generatePdf,
   listRuns: () => request<RunListItem[]>("/runs"),
-  getRun: (id: string) => request<RunData>(`/runs/${id}`),
+  getRun: (id: string, params: RunDetailParams = {}) => {
+    const q = new URLSearchParams();
+    if (params.chart_payload) q.set("chart_payload", params.chart_payload);
+    if (params.chart_symbol) q.set("chart_symbol", params.chart_symbol);
+    const qs = q.toString();
+    return request<RunData>(`/runs/${id}${qs ? `?${qs}` : ""}`);
+  },
   getRunCode: (id: string) => request<Record<string, string>>(`/runs/${id}/code`),
   getRunPine: (id: string) => request<PineScriptResult>(`/runs/${id}/pine`),
   listSessions: () => request<SessionItem[]>("/sessions"),
@@ -168,6 +174,13 @@ export const api = {
     }),
   alphaBenchStreamUrl: (jobId: string) =>
     withAuthQuery(`${BASE}/alpha/bench/${encodeURIComponent(jobId)}/stream`),
+  createAlphaCompare: (body: AlphaCompareRequest) =>
+    request<{ status: string; job_id: string }>("/alpha/compare", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  alphaCompareStreamUrl: (jobId: string) =>
+    withAuthQuery(`${BASE}/alpha/compare/${encodeURIComponent(jobId)}/stream`),
 
   // Connector runtime channel — privileged surface actions (NOT agent tools).
   // commit is the ONLY action that writes a mandate; halt trips the kill switch.
@@ -290,6 +303,11 @@ export interface RunListItem {
   end_date?: string;
 }
 
+export interface RunDetailParams {
+  chart_payload?: "summary";
+  chart_symbol?: string;
+}
+
 export interface PriceBar {
   time: string;
   timestamp?: string;
@@ -378,6 +396,7 @@ export interface RunData {
   run_card?: RunCard;
   validation?: ValidationData;
 
+  chart_symbols?: string[];
   price_series?: Record<string, PriceBar[]>;
   indicator_series?: Record<string, Record<string, IndicatorPoint[]>>;
   trade_markers?: TradeMarker[];
@@ -688,6 +707,43 @@ export interface AlphaBenchResult {
   top5_by_ir: AlphaBenchTopRow[];
   dead_examples: AlphaBenchTopRow[];
   by_theme: Record<string, { alive: number; reversed: number; dead: number }>;
+}
+
+export interface AlphaCompareRequest {
+  alpha_ids: string[];
+  universe: string;
+  period: string;
+  /** One of: ir | ic_mean | ic_positive_ratio | ic_count (default ir). */
+  sort?: string;
+}
+
+export interface AlphaCompareRow {
+  rank: number;
+  id: string;
+  zoo: string;
+  ic_mean: number;
+  ic_std: number;
+  ir: number;
+  ic_positive_ratio: number;
+  ic_count: number;
+  /** `delta_<sort>_vs_best` — gap to the top-ranked alpha on the active metric. */
+  [deltaKey: string]: number | string;
+}
+
+export interface AlphaCompareSkip {
+  id: string;
+  reason: string;
+}
+
+export interface AlphaCompareResult {
+  universe: string;
+  period: string;
+  sort: string;
+  n_compared: number;
+  n_skipped: number;
+  winner: string;
+  ranking: AlphaCompareRow[];
+  skipped: AlphaCompareSkip[];
 }
 
 // --- Connector runtime channel types ---

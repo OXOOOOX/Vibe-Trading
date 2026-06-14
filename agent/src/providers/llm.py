@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Sequence
+from importlib import import_module
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
+
+from pydantic import PrivateAttr
+
+from src.providers.capabilities import get_provider_capabilities, provider_env_names
 
 try:
     from dotenv import load_dotenv
@@ -32,6 +39,22 @@ if ChatOpenAI is not None:
         outbound path re-injects it so strict providers (kimi-k2.6) accept
         multi-turn continuations.
         """
+
+        _vibe_provider: Optional[str] = PrivateAttr(default=None)
+
+        def __init__(self, *args: Any, vibe_provider: str | None = None, **kwargs: Any) -> None:
+            """Initialize while retaining the resolved provider name."""
+            super().__init__(*args, **kwargs)
+            self._vibe_provider = vibe_provider
+
+        def _capabilities(self):
+            model = (
+                getattr(self, "model_name", None)
+                or getattr(self, "model", None)
+                or getattr(self, "model_name_", None)
+                or ""
+            )
+            return get_provider_capabilities(self._vibe_provider, str(model))
 
         @staticmethod
         def _extract_tool_call_thought_signature(tool_call: Any) -> Optional[str]:
@@ -77,14 +100,56 @@ if ChatOpenAI is not None:
                 signatures.append(entry)
             return signatures
 
-        @classmethod
-        def _capture(cls, src: Any, msg: Any) -> None:
+        def _capture(self, src: Any, msg: Any) -> None:
             if not isinstance(src, dict):
                 return
-            if value := src.get("reasoning_content") or src.get("reasoning"):
+            caps = self._capabilities()
+            if caps.capture_reasoning and (value := src.get("reasoning_content") or src.get("reasoning")):
                 msg.additional_kwargs["reasoning_content"] = value
-            if signatures := cls._collect_tool_call_thought_signatures(src.get("tool_calls")):
+            if caps.gemini_thought_signatures and (
+                signatures := self._collect_tool_call_thought_signatures(src.get("tool_calls"))
+            ):
                 msg.additional_kwargs["tool_call_thought_signatures"] = signatures
+
+        def _convert_input(self, input: Any) -> Any:  # type: ignore[override]
+            """Re-attach Gemini thought signatures dropped by dict->message conversion.
+
+            The AgentLoop replays history as OpenAI-format dicts, stamping the
+            signature into ``tool_calls[i].extra_content.google.thought_signature``
+            (loop.py ``_attach_tool_call_thought_signatures``). LangChain's
+            ``_convert_dict_to_message`` discards ``extra_content`` entirely, so by
+            the time ``_get_request_payload`` runs the signature is gone and Gemini
+            rejects the next turn with a ``missing thought_signature`` 400.
+
+            ``_convert_input`` is the single chokepoint both ``invoke`` and
+            ``stream`` call once at entry, while ``input`` is still raw dicts. Here
+            we lift the signatures back onto the converted ``AIMessage`` in the
+            same ``additional_kwargs["tool_call_thought_signatures"]`` shape the
+            in-memory (#176) path produces, so the existing ``_signature_maps`` /
+            ``_inject_tool_call_thought_signatures`` machinery handles both paths
+            identically. The ``isinstance(raw, dict)`` guard makes it a no-op when
+            re-invoked on already-converted ``BaseMessage`` objects (idempotent).
+            """
+            prompt_value = super()._convert_input(input)
+            if not self._capabilities().gemini_thought_signatures:
+                return prompt_value
+            if isinstance(input, Sequence) and not isinstance(input, (str, bytes)):
+                messages = prompt_value.to_messages()
+                if len(messages) == len(input):
+                    for raw, msg in zip(input, messages):
+                        if (
+                            isinstance(raw, dict)
+                            and getattr(msg, "type", None) == "ai"
+                            and not getattr(msg, "additional_kwargs", {}).get(
+                                "tool_call_thought_signatures"
+                            )
+                        ):
+                            sigs = self._collect_tool_call_thought_signatures(
+                                raw.get("tool_calls")
+                            )
+                            if sigs:
+                                msg.additional_kwargs["tool_call_thought_signatures"] = sigs
+            return prompt_value
 
         @classmethod
         def _signature_maps(cls, message: Any) -> tuple[dict[str, str], dict[int, str]]:
@@ -151,6 +216,14 @@ if ChatOpenAI is not None:
                 if signature:
                     cls._set_tool_call_thought_signature(tool_call, signature)
 
+        @staticmethod
+        def _strip_tool_call_extra_content(outbound: Any) -> None:
+            if not isinstance(outbound, list):
+                return
+            for tool_call in outbound:
+                if isinstance(tool_call, dict):
+                    tool_call.pop("extra_content", None)
+
         def _create_chat_result(self, response, generation_info=None):  # type: ignore[override]
             result = super()._create_chat_result(response, generation_info)
             raw = response if isinstance(response, dict) else response.model_dump()
@@ -190,14 +263,21 @@ if ChatOpenAI is not None:
             """
             payload = super()._get_request_payload(input_, stop=stop, **kwargs)
             messages = super()._convert_input(input_).to_messages()
+            caps = self._capabilities()
             for i, m in enumerate(payload["messages"]):
                 if m.get("role") != "assistant":
                     continue
                 source_message = messages[i]
-                if m.get("content") is None:
+                if caps.normalize_assistant_content and m.get("content") is None:
                     m["content"] = ""
-                m["reasoning_content"] = source_message.additional_kwargs.get("reasoning_content", "")
-                self._inject_tool_call_thought_signatures(m.get("tool_calls"), source_message)
+                if caps.send_reasoning_content:
+                    m["reasoning_content"] = source_message.additional_kwargs.get("reasoning_content", "")
+                else:
+                    m.pop("reasoning_content", None)
+                if caps.gemini_thought_signatures:
+                    self._inject_tool_call_thought_signatures(m.get("tool_calls"), source_message)
+                else:
+                    self._strip_tool_call_extra_content(m.get("tool_calls"))
             return payload
 else:
     ChatOpenAIWithReasoning = None  # type: ignore
@@ -266,6 +346,74 @@ def _redact_base_url_for_log(raw: str | None) -> str:
     return f"{parsed.scheme}://{host}"
 
 
+def _package_version(package: str) -> str:
+    """Return an installed package version or a stable missing label."""
+    try:
+        return version(package)
+    except PackageNotFoundError:
+        return "not_installed"
+
+
+def _redact_env_flag(name: str) -> str:
+    """Report whether an env var is set without exposing its value."""
+    value = os.getenv(name, "")
+    return "set" if value else "unset"
+
+
+def _redact_proxy_url(name: str, raw: str | None) -> str:
+    """Return a credential-free proxy URL label."""
+    if not raw:
+        return "unset"
+    if name.upper().endswith("NO_PROXY"):
+        return "set"
+    return _redact_base_url_for_log(raw)
+
+
+def _deepseek_adapter_mode() -> str:
+    """Return the configured DeepSeek adapter mode."""
+    mode = os.getenv("VIBE_TRADING_DEEPSEEK_ADAPTER", "auto").strip().lower()
+    aliases = {
+        "compat": "openai-compatible",
+        "compatible": "openai-compatible",
+        "openai": "openai-compatible",
+        "openai_compatible": "openai-compatible",
+    }
+    return aliases.get(mode, mode or "auto")
+
+
+def _build_native_deepseek(
+    *,
+    model: str,
+    temperature: float,
+    callbacks: Any = None,
+) -> Any | None:
+    """Build the optional native DeepSeek adapter when installed.
+
+    Returns:
+        A ChatDeepSeek instance, or ``None`` when the optional package is not
+        available.
+    """
+    try:
+        module = import_module("langchain_deepseek")
+        chat_deepseek = getattr(module, "ChatDeepSeek")
+    except Exception as exc:  # noqa: BLE001 - optional adapter fallback
+        logger.info("DeepSeek native adapter unavailable; using OpenAI-compatible path: %s", exc)
+        return None
+
+    key_env, base_env = provider_env_names("deepseek", model)
+    api_key = os.getenv(key_env or "", "") or os.getenv("OPENAI_API_KEY", "")
+    base_url = os.getenv(base_env, "") or os.getenv("OPENAI_BASE_URL", "") or os.getenv("OPENAI_API_BASE", "")
+    return chat_deepseek(
+        model=model,
+        temperature=temperature,
+        timeout=int(os.getenv("TIMEOUT_SECONDS", "120")),
+        max_retries=int(os.getenv("MAX_RETRIES", "2")),
+        callbacks=callbacks,
+        api_key=api_key or None,
+        base_url=base_url or None,
+    )
+
+
 def _load_env_file(path: Path) -> None:
     """Load a single .env file into os.environ (setdefault, no override)."""
     if load_dotenv is not None:
@@ -332,25 +480,7 @@ def _sync_provider_env() -> None:
         os.environ.pop("OPENAI_API_KEY", None)
         return
 
-    # (api_key_env, base_url_env)
-    _PROVIDER_MAP: dict[str, tuple[str | None, str]] = {
-        "openai":     ("OPENAI_API_KEY",     "OPENAI_BASE_URL"),
-        "openrouter": ("OPENROUTER_API_KEY",  "OPENROUTER_BASE_URL"),
-        "deepseek":   ("DEEPSEEK_API_KEY",    "DEEPSEEK_BASE_URL"),
-        "gemini":     ("GEMINI_API_KEY",      "GEMINI_BASE_URL"),
-        "groq":       ("GROQ_API_KEY",        "GROQ_BASE_URL"),
-        "dashscope":  ("DASHSCOPE_API_KEY",   "DASHSCOPE_BASE_URL"),
-        "qwen":       ("DASHSCOPE_API_KEY",   "DASHSCOPE_BASE_URL"),
-        "zhipu":      ("ZHIPU_API_KEY",       "ZHIPU_BASE_URL"),
-        "moonshot":   ("MOONSHOT_API_KEY",    "MOONSHOT_BASE_URL"),
-        "minimax":    ("MINIMAX_API_KEY",     "MINIMAX_BASE_URL"),
-        "mimo":       ("MIMO_API_KEY",        "MIMO_BASE_URL"),
-        "zai":        ("ZAI_API_KEY",         "ZAI_BASE_URL"),
-        "ollama":     (None,                  "OLLAMA_BASE_URL"),
-    }
-
-    spec = _PROVIDER_MAP.get(provider, _PROVIDER_MAP["openai"])
-    key_env, base_env = spec
+    key_env, base_env = provider_env_names(provider, os.getenv("LANGCHAIN_MODEL_NAME", ""))
 
     # Resolve API key: provider-specific env → OPENAI_API_KEY fallback
     if key_env is not None:
@@ -368,6 +498,69 @@ def _sync_provider_env() -> None:
     if base_url:
         os.environ["OPENAI_API_BASE"] = base_url
         os.environ.setdefault("OPENAI_BASE_URL", base_url)
+
+
+def provider_diagnostics() -> dict[str, Any]:
+    """Build a redacted provider diagnostic snapshot.
+
+    Returns:
+        Redacted provider/model/package/env/proxy/capability details.
+    """
+    _sync_provider_env()
+    provider = os.getenv("LANGCHAIN_PROVIDER", "openai").strip().lower()
+    model = os.getenv("LANGCHAIN_MODEL_NAME", "").strip()
+    caps = get_provider_capabilities(provider, model)
+    key_env, base_env = provider_env_names(provider, model)
+    base_url = os.getenv(base_env, "") or os.getenv("OPENAI_BASE_URL", "") or os.getenv("OPENAI_API_BASE", "")
+    proxy_names = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"]
+    package_names = ["langchain-openai", "langchain-core", "langchain", "openai", "langchain-deepseek"]
+    native_package_version = (
+        _package_version(caps.native_adapter_package)
+        if caps.native_adapter_package
+        else None
+    )
+    adapter_mode = _deepseek_adapter_mode() if caps.name == "deepseek" else "openai-compatible"
+    adapter_type = (
+        "native"
+        if caps.name == "deepseek"
+        and adapter_mode != "openai-compatible"
+        and native_package_version not in {None, "not_installed"}
+        else "openai-compatible"
+    )
+    return {
+        "provider": caps.name if provider in {"kimi", "openai_codex"} else provider,
+        "model": model,
+        "base_url": _redact_base_url_for_log(base_url),
+        "api_key": {key_env: _redact_env_flag(key_env)} if key_env else {},
+        "env": {
+            "LANGCHAIN_PROVIDER": _redact_env_flag("LANGCHAIN_PROVIDER"),
+            "LANGCHAIN_MODEL_NAME": _redact_env_flag("LANGCHAIN_MODEL_NAME"),
+            "OPENAI_API_KEY": _redact_env_flag("OPENAI_API_KEY"),
+            "OPENAI_BASE_URL": _redact_base_url_for_log(os.getenv("OPENAI_BASE_URL")),
+            "OPENAI_API_BASE": _redact_base_url_for_log(os.getenv("OPENAI_API_BASE")),
+        },
+        "proxy": {
+            name: _redact_proxy_url(name, os.getenv(name))
+            for name in proxy_names
+            if os.getenv(name)
+        },
+        "packages": {name: _package_version(name) for name in package_names},
+        "timeout_seconds": int(os.getenv("TIMEOUT_SECONDS", "120")),
+        "max_retries": int(os.getenv("MAX_RETRIES", "2")),
+        "reasoning_effort": os.getenv("LANGCHAIN_REASONING_EFFORT", "").strip().lower(),
+        "adapter": {
+            "type": adapter_type,
+            "mode": adapter_mode,
+            "native_package": caps.native_adapter_package,
+            "native_package_version": native_package_version,
+        },
+        "capabilities": {
+            "capture_reasoning": caps.capture_reasoning,
+            "send_reasoning_content": caps.send_reasoning_content,
+            "gemini_thought_signatures": caps.gemini_thought_signatures,
+            "openrouter_reasoning_body": caps.openrouter_reasoning_body,
+        },
+    }
 
 
 def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any:
@@ -389,6 +582,7 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         raise RuntimeError("LANGCHAIN_MODEL_NAME is not set")
     temperature = float(os.getenv("LANGCHAIN_TEMPERATURE", "0.0"))
     provider = os.getenv("LANGCHAIN_PROVIDER", "openai").lower()
+    caps = get_provider_capabilities(provider, name)
     if provider in {"openai-codex", "openai_codex"}:
         from src.providers.openai_codex import OpenAICodexLLM
 
@@ -400,20 +594,44 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
             reasoning_effort=effort or None,
         )
 
+    if provider == "deepseek":
+        adapter_mode = _deepseek_adapter_mode()
+        if adapter_mode != "openai-compatible":
+            native_llm = _build_native_deepseek(
+                model=name,
+                temperature=temperature,
+                callbacks=callbacks,
+            )
+            if native_llm is not None:
+                return native_llm
+            if adapter_mode == "native":
+                raise RuntimeError(
+                    "VIBE_TRADING_DEEPSEEK_ADAPTER=native requires langchain-deepseek"
+                )
+
     if ChatOpenAI is None:
         raise RuntimeError("langchain-openai is not installed")
     # MiniMax requires temperature in (0.0, 1.0] — clamp to 0.01 when the
     # default 0.0 is used to avoid an API validation error.
     if provider == "minimax" and temperature <= 0.0:
         temperature = 0.01
+    # Moonshot kimi-k2.x reasoning models reject any temperature other than 1
+    # ("invalid temperature: only 1 is allowed for this model").
+    if caps.name == "moonshot" and name.lower().startswith("kimi-k2") and temperature != 1.0:
+        logger.info("Forcing temperature=1.0 for %s (provider requirement)", name)
+        temperature = 1.0
     # Optional reasoning activation for relays requiring opt-in (e.g. OpenRouter).
     # Moonshot/DeepSeek official APIs emit reasoning by default and ignore this field.
     effort = os.getenv("LANGCHAIN_REASONING_EFFORT", "").strip().lower()
-    return ChatOpenAIWithReasoning(
-        model=name,
-        temperature=temperature,
-        timeout=int(os.getenv("TIMEOUT_SECONDS", "120")),
-        max_retries=int(os.getenv("MAX_RETRIES", "2")),
-        callbacks=callbacks,
-        extra_body={"reasoning": {"effort": effort}} if effort else None,
-    )
+    kwargs: dict[str, Any] = {
+        "model": name,
+        "temperature": temperature,
+        "timeout": int(os.getenv("TIMEOUT_SECONDS", "120")),
+        "max_retries": int(os.getenv("MAX_RETRIES", "2")),
+        "callbacks": callbacks,
+        "extra_body": {"reasoning": {"effort": effort}} if effort and caps.openrouter_reasoning_body else None,
+        "vibe_provider": provider,
+    }
+    if caps.default_headers:
+        kwargs["default_headers"] = dict(caps.default_headers)
+    return ChatOpenAIWithReasoning(**kwargs)

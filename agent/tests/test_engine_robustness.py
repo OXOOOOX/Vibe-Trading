@@ -355,6 +355,32 @@ class TestBacktestConfigSchema:
                 source="bloomberg",
             )
 
+    def test_mootdx_and_futu_sources_accepted(self) -> None:
+        """mootdx and futu are registered loaders, so config validation must
+        accept them. Regression: ``_VALID_SOURCES`` drifted and rejected both
+        even though the agent-facing backtest tool already allowed them."""
+        for src in ("mootdx", "futu"):
+            c = BacktestConfigSchema(
+                codes=["000001.SZ"],
+                start_date="2025-01-01",
+                end_date="2025-06-01",
+                source=src,
+            )
+            assert c.source == src
+
+    def test_valid_sources_covers_all_registered_loaders(self) -> None:
+        """Every registered loader name must be an accepted config source, so a
+        new loader can never be silently rejected by the config schema."""
+        from backtest.loaders.registry import (
+            LOADER_REGISTRY,
+            VALID_SOURCES,
+            _ensure_registered,
+        )
+
+        _ensure_registered()
+        missing = set(LOADER_REGISTRY) - VALID_SOURCES
+        assert not missing, f"loaders missing from VALID_SOURCES: {missing}"
+
     def test_extra_fields_allowed(self) -> None:
         """Config may contain engine-specific fields not in the schema."""
         c = BacktestConfigSchema(

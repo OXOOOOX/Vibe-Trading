@@ -584,6 +584,75 @@ class TestChatOpenAIWithReasoningOutboundPayload:
         assistant_msg = next(m for m in payload["messages"] if m["role"] == "assistant")
         assert assistant_msg["tool_calls"][0]["extra_content"]["google"]["thought_signature"] == "sig-a"
 
+    def _payload_via_runtime(self, instance: Any, dict_history: list) -> dict:
+        """Mirror ``invoke``: convert the raw OpenAI-format input first (where
+        ``_convert_input`` re-attaches signatures), then build the request payload
+        from the converted messages — exactly the runtime order."""
+        converted = instance._convert_input(dict_history).to_messages()
+        return instance._get_request_payload(converted)
+
+    def test_reattaches_thought_signature_from_raw_dict_input(self) -> None:
+        """Regression: the AgentLoop replays history as OpenAI-format dicts (not
+        AIMessage objects). LangChain's ``_convert_dict_to_message`` discards the
+        ``extra_content`` Gemini signature, so the #176 in-memory machinery alone
+        leaves the outbound payload unsigned and Gemini 400s on the next turn.
+        ``_convert_input`` must lift the signature back onto the converted message.
+        """
+        from src.agent.context import ContextBuilder
+        from src.agent.loop import _attach_tool_call_thought_signatures
+        from src.providers.chat import ToolCallRequest
+
+        instance = self._instance(model="gemini-3-pro-preview")
+        tool_calls = [
+            ToolCallRequest(id="c1", name="load_skill",
+                            arguments={"name": "momentum"}, thought_signature="sig-a"),
+        ]
+        assistant = ContextBuilder.format_assistant_tool_calls(tool_calls)
+        _attach_tool_call_thought_signatures(assistant, tool_calls)
+        history = [
+            {"role": "user", "content": "load momentum"},
+            assistant,
+            {"role": "tool", "tool_call_id": "c1", "content": "loaded"},
+        ]
+
+        payload = self._payload_via_runtime(instance, history)
+
+        assistant_msg = next(m for m in payload["messages"] if m["role"] == "assistant")
+        assert assistant_msg["tool_calls"][0]["extra_content"]["google"]["thought_signature"] == "sig-a"
+
+    def test_parallel_dict_input_keeps_first_signature_only(self) -> None:
+        """Gemini signs only the first of N parallel calls. The natural state
+        (first signed, rest genuinely absent) must round-trip unchanged through
+        the dict path — Gemini accepts the single signature for the whole block,
+        so we must neither drop the first nor fabricate the others.
+        """
+        from src.agent.context import ContextBuilder
+        from src.agent.loop import _attach_tool_call_thought_signatures
+        from src.providers.chat import ToolCallRequest
+
+        instance = self._instance(model="gemini-3-pro-preview")
+        tool_calls = [
+            ToolCallRequest(id="c1", name="load_skill", arguments={"name": "a"}, thought_signature="sig-a"),
+            ToolCallRequest(id="c2", name="load_skill", arguments={"name": "b"}, thought_signature=None),
+            ToolCallRequest(id="c3", name="load_skill", arguments={"name": "c"}, thought_signature=None),
+        ]
+        assistant = ContextBuilder.format_assistant_tool_calls(tool_calls)
+        _attach_tool_call_thought_signatures(assistant, tool_calls)
+        history = [
+            {"role": "user", "content": "load a, b, c"},
+            assistant,
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "tool", "tool_call_id": "c2", "content": "ok"},
+            {"role": "tool", "tool_call_id": "c3", "content": "ok"},
+        ]
+
+        payload = self._payload_via_runtime(instance, history)
+
+        tcs = next(m for m in payload["messages"] if m["role"] == "assistant")["tool_calls"]
+        assert tcs[0]["extra_content"]["google"]["thought_signature"] == "sig-a"
+        assert "extra_content" not in tcs[1]
+        assert "extra_content" not in tcs[2]
+
     def test_injects_empty_reasoning_content_when_absent(self) -> None:
         """kimi-k2.6 requires reasoning_content on every assistant turn."""
         from langchain_core.messages import AIMessage, HumanMessage
@@ -599,6 +668,39 @@ class TestChatOpenAIWithReasoningOutboundPayload:
         assistant_msg = next(m for m in payload["messages"] if m["role"] == "assistant")
         assert assistant_msg["reasoning_content"] == ""
 
+    def test_openai_does_not_inject_empty_reasoning_content(self) -> None:
+        """Strict Kimi continuation fields must not leak into OpenAI payloads."""
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        instance = self._instance(model="gpt-4")
+        history = [
+            HumanMessage(content="hi"),
+            AIMessage(content="plain assistant reply"),
+        ]
+
+        payload = instance._get_request_payload(history)
+
+        assistant_msg = next(m for m in payload["messages"] if m["role"] == "assistant")
+        assert "reasoning_content" not in assistant_msg
+
+    def test_deepseek_does_not_replay_reasoning_content_outbound(self) -> None:
+        """DeepSeek reasoning traces are inbound progress, not next-turn payload."""
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        instance = self._instance(model="deepseek-v4-pro")
+        history = [
+            HumanMessage(content="hi"),
+            AIMessage(
+                content="",
+                additional_kwargs={"reasoning_content": "internal reasoning"},
+            ),
+        ]
+
+        payload = instance._get_request_payload(history)
+
+        assistant_msg = next(m for m in payload["messages"] if m["role"] == "assistant")
+        assert "reasoning_content" not in assistant_msg
+
     def test_user_and_system_messages_untouched(self) -> None:
         """Only assistant messages get the reasoning_content injection."""
         from langchain_core.messages import HumanMessage, SystemMessage
@@ -613,3 +715,29 @@ class TestChatOpenAIWithReasoningOutboundPayload:
 
         for m in payload["messages"]:
             assert "reasoning_content" not in m
+
+    def test_non_gemini_does_not_inject_tool_call_thought_signature(self) -> None:
+        """Gemini thought signatures must be Gemini-only payload mutations."""
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        instance = self._instance(model="gpt-4")
+        history = [
+            HumanMessage(content="hi"),
+            AIMessage(
+                content="",
+                additional_kwargs={
+                    "tool_call_thought_signatures": [
+                        {"id": "c1", "index": 0, "thought_signature": "sig-a"},
+                    ],
+                    "tool_calls": [
+                        {"id": "c1", "type": "function",
+                         "function": {"name": "t", "arguments": "{}"}},
+                    ],
+                },
+            ),
+        ]
+
+        payload = instance._get_request_payload(history)
+
+        assistant_msg = next(m for m in payload["messages"] if m["role"] == "assistant")
+        assert "extra_content" not in assistant_msg["tool_calls"][0]

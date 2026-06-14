@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Security, UploadFile, status
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
@@ -114,6 +114,7 @@ class RunResponse(BaseModel):
     metrics: Optional[BacktestMetrics] = Field(None, description="Backtest metrics")
     artifacts: List[Artifact] = Field(default_factory=list, description="Run artifacts")
     run_card: Optional[Dict[str, Any]] = Field(None, description="Trust Layer run card payload")
+    llm_usage: Optional[Dict[str, Any]] = Field(None, description="Provider-reported AgentLoop usage summary")
 
     equity_curve: Optional[List[Dict[str, Any]]] = Field(None, description="Equity preview")
     trade_log: Optional[List[Dict[str, Any]]] = Field(None, description="Trade preview")
@@ -1032,7 +1033,15 @@ def _load_csv_to_dict(path: Path, limit: Optional[int] = None) -> List[Dict[str,
 
 
 
-def _build_response_from_run_dir(run_dir: Path, elapsed: float, *, include_analysis: bool = False) -> RunResponse:
+def _build_response_from_run_dir(
+    run_dir: Path,
+    elapsed: float,
+    *,
+    include_analysis: bool = False,
+    chart_symbol: Optional[str] = None,
+    chart_payload: str = "full",
+    chart_symbols_out: Optional[List[str]] = None,
+) -> RunResponse:
     """Build a run response from a persisted run directory."""
     run_id = run_dir.name
 
@@ -1122,6 +1131,13 @@ def _build_response_from_run_dir(run_dir: Path, elapsed: float, *, include_analy
         except (json.JSONDecodeError, OSError):
             pass
 
+    llm_usage_path = run_dir / "llm_usage.json"
+    if llm_usage_path.exists():
+        try:
+            response.llm_usage = json.loads(llm_usage_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+
     trades_path = run_dir / "artifacts" / "trades.csv"
     if trades_path.exists():
         response.artifacts_trades_csv = _load_csv_to_dict(trades_path)
@@ -1150,7 +1166,14 @@ def _build_response_from_run_dir(run_dir: Path, elapsed: float, *, include_analy
         response.trade_log = response.artifacts_trades_csv[:500]
 
     if include_analysis:
-        analysis = build_run_analysis(run_dir)
+        analysis = build_run_analysis(
+            run_dir,
+        symbols=[chart_symbol] if chart_symbol else None,
+        include_payload=chart_payload != "summary" or bool(chart_symbol),
+        include_symbol_list=chart_symbols_out is not None,
+    )
+        if chart_symbols_out is not None:
+            chart_symbols_out.extend(analysis.get("chart_symbols") or [])
         response.run_stage = analysis.get("run_stage")
         response.run_context = analysis.get("run_context")
         response.price_series = analysis.get("price_series")
@@ -1159,6 +1182,11 @@ def _build_response_from_run_dir(run_dir: Path, elapsed: float, *, include_analy
         response.run_logs = analysis.get("run_logs")
 
     return response
+
+
+def _run_response_payload(response: RunResponse) -> Dict[str, Any]:
+    """Return a JSON-ready payload for opt-in run response variants."""
+    return response.model_dump(mode="json")
 
 
 # ============================================================================
@@ -1233,9 +1261,22 @@ async def get_run_pine(run_id: str):
 
 
 @app.get("/runs/{run_id}", response_model=RunResponse, dependencies=[Depends(require_auth)])
-async def get_run_result(run_id: str):
-    """Fetch full details for a historical run by ``run_id``."""
+async def get_run_result(
+    run_id: str,
+    chart_symbol: Optional[str] = Query(None, description="Opt in to chart payloads for a single symbol"),
+    chart_payload: Optional[str] = Query(
+        None,
+        description="Optional chart payload mode. Use 'summary' to omit chart rows and trade markers.",
+    ),
+):
+    """Fetch details for a historical run by ``run_id``.
+
+    The default response stays unchanged for existing consumers. Chart-heavy
+    optimizations are opt-in via query parameters.
+    """
     _validate_path_param(run_id, "run_id")
+    if chart_payload not in (None, "summary"):
+        raise HTTPException(status_code=400, detail="invalid chart_payload")
     run_dir = RUNS_DIR / run_id
 
     if not run_dir.exists():
@@ -1244,7 +1285,21 @@ async def get_run_result(run_id: str):
             detail=f"Run {run_id} not found"
         )
 
-    response = _build_response_from_run_dir(run_dir, elapsed=0.0, include_analysis=True)
+    wants_chart_meta = bool(chart_payload or chart_symbol)
+    chart_symbols: List[str] = []
+    response = _build_response_from_run_dir(
+        run_dir,
+        elapsed=0.0,
+        include_analysis=True,
+        chart_symbol=chart_symbol,
+        chart_payload=chart_payload or "full",
+        chart_symbols_out=chart_symbols if wants_chart_meta else None,
+    )
+
+    if wants_chart_meta:
+        payload = _run_response_payload(response)
+        payload["chart_symbols"] = chart_symbols
+        return JSONResponse(payload)
 
     return response
 

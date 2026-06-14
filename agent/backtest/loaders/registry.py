@@ -24,6 +24,25 @@ LOADER_REGISTRY: dict[str, Type[Any]] = {}
 
 _registered = False
 
+# Canonical set of accepted data-source names: every registered loader plus the
+# ``"auto"`` cross-market selector. Single source of truth shared by the backtest
+# config schema (``backtest.runner.BacktestConfigSchema``) and the agent-facing
+# backtest tool (``src.tools.backtest_tool``) so the two can never drift apart.
+# Keep in sync with ``_loader_modules`` below — the regression test
+# ``test_valid_sources_covers_all_registered_loaders`` enforces full coverage.
+VALID_SOURCES: set[str] = {
+    "tushare",
+    "okx",
+    "yfinance",
+    "akshare",
+    "baostock",
+    "tencent",
+    "mootdx",
+    "ccxt",
+    "futu",
+    "auto",
+}
+
 
 def register(cls: Type[Any]) -> Type[Any]:
     """Class decorator: register a loader into the global registry.
@@ -51,6 +70,8 @@ def _ensure_registered() -> None:
         "backtest.loaders.okx",
         "backtest.loaders.yfinance_loader",
         "backtest.loaders.akshare_loader",
+        "backtest.loaders.baostock_loader",
+        "backtest.loaders.tencent_loader",
         "backtest.loaders.mootdx_loader",
         "backtest.loaders.ccxt_loader",
         "backtest.loaders.futu",
@@ -68,7 +89,7 @@ def _ensure_registered() -> None:
 # ---------------------------------------------------------------------------
 
 FALLBACK_CHAINS: dict[str, list[str]] = {
-    "a_share":   ["tushare", "mootdx", "akshare"],
+    "a_share":   ["tushare", "mootdx", "baostock", "tencent", "akshare"],
     "us_equity": ["yfinance", "akshare"],
     "hk_equity": ["yfinance", "futu", "akshare"],
     "crypto":    ["okx", "ccxt", "yfinance"],

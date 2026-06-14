@@ -1,10 +1,11 @@
+import { useTranslation } from 'react-i18next';
 import { useEffect, useRef, useState, useMemo, useCallback, type FormEvent } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Send, Loader2, ArrowDown, Square, Download, Plus, Paperclip, X, Users, Target, ChevronDown, Pencil, Check, Play, OctagonX, Activity, Ban, CheckCircle2, Landmark } from "lucide-react";
 import { toast } from "sonner";
 import { useAgentStore } from "@/stores/agent";
 import { useSSE } from "@/hooks/useSSE";
-import { ApiError, api, type GoalSnapshot, type MandateProposal, type MandateCommitted, type LiveAction, type LiveHalted, type LiveStatus } from "@/lib/api";
+import { ApiError, AUTH_REQUIRED_MESSAGE, api, isAuthRequiredError, type GoalSnapshot, type MandateProposal, type MandateCommitted, type LiveAction, type LiveHalted, type LiveStatus } from "@/lib/api";
 import { isReportWorthyRun } from "@/lib/runReports";
 import type { AgentMessage, ToolCallEntry } from "@/types/agent";
 import { AgentAvatar } from "@/components/chat/AgentAvatar";
@@ -15,7 +16,12 @@ import { ConversationTimeline } from "@/components/chat/ConversationTimeline";
 import { ToolProgressIndicator } from "@/components/chat/ToolProgressIndicator";
 import { MandateProposalCard } from "@/components/chat/MandateProposalCard";
 import { RunnerStatus } from "@/components/chat/RunnerStatus";
-import { useI18n } from "@/lib/i18n";
+import { SwarmStatusCard } from "@/components/chat/SwarmStatusCard";
+import {
+  applySwarmEvent,
+  buildSwarmStatusFromStarted,
+  buildSwarmStatusFromToolResultPreview,
+} from "@/lib/swarmStatus";
 
 /* ---------- Message grouping ---------- */
 type MsgGroup =
@@ -39,6 +45,9 @@ function groupMessages(msgs: AgentMessage[]): MsgGroup[] {
 }
 
 const act = () => useAgentStore.getState();
+
+// i18n hook for Agent component — used inside the component below
+// (declared at module scope for helper usage is fine since t() reads from i18n singleton)
 
 /** Poll cadence for the shared `GET /live/status` snapshot. */
 const LIVE_STATUS_POLL_INTERVAL_MS = 15_000;
@@ -201,7 +210,7 @@ function goalContinuePrompt(snapshot: GoalSnapshot): string {
 
 /* ---------- Component ---------- */
 export function Agent() {
-  const { language } = useI18n();
+  const { t } = useTranslation();
   const [input, setInput] = useState("");
   const [searchParams, setSearchParams] = useSearchParams();
   const listRef = useRef<HTMLDivElement>(null);
@@ -245,6 +254,7 @@ export function Agent() {
    * could be active out-of-band (CLI/another session), not only off in-session SSE
    * items (audit M2: always-available global halt — SPEC Consent §4). */
   const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
+  const [reasoningActive, setReasoningActive] = useState(false);
   /* The status endpoint is not wired on every backend; a 404/501 hides the panel
    * and removes status from the kill-switch visibility condition. */
   const [liveStatusUnavailable, setLiveStatusUnavailable] = useState(false);
@@ -300,8 +310,8 @@ export function Agent() {
   useEffect(() => {
     onStatusChange((s) => {
       act().setSseStatus(s);
-      if (s === "reconnecting" && prevSseStatusRef.current === "connected") toast.warning("Connection lost, reconnecting…");
-      else if (s === "connected" && prevSseStatusRef.current === "reconnecting") toast.success("Connection restored");
+      if (s === "reconnecting" && prevSseStatusRef.current === "connected") toast.warning(t('agent.connectionLostReconnect'));
+      else if (s === "connected" && prevSseStatusRef.current === "reconnecting") toast.success(t('agent.connectionRestored'));
       prevSseStatusRef.current = s;
     });
   }, [onStatusChange]);
@@ -330,7 +340,7 @@ export function Agent() {
         setGoalDetailsOpen(false);
         setGoalEditActive(false);
       } else {
-        toast.error(error instanceof Error ? error.message : "Failed to load goal.");
+        toast.error(error instanceof Error ? error.message : t('agent.failedToLoadGoal'));
       }
     }
   }, []);
@@ -405,11 +415,30 @@ export function Agent() {
     const touch = () => { lastEventRef.current = Date.now(); };
 
     connect(api.sseUrl(sid, { replay: "active" }), {
-      text_delta: (d) => { touch(); act().appendDelta(String(d.delta || "")); scrollToBottom(); },
+      text_delta: (d) => {
+        touch();
+        setReasoningActive(false);
+        act().appendDelta(String(d.delta || ""));
+        scrollToBottom();
+      },
+      reasoning_delta: () => {
+        touch();
+        setReasoningActive(true);
+        if (act().status !== "streaming") act().setStatus("streaming");
+        scrollToBottom();
+      },
+      stream_reset: () => {
+        touch();
+        setReasoningActive(false);
+        act().clearStreaming();
+        if (act().status !== "streaming") act().setStatus("streaming");
+        scrollToBottom();
+      },
       thinking_done: () => { touch(); /* don't flush — keep streaming text visible */ },
 
       tool_call: (d) => {
         touch();
+        setReasoningActive(false);
         const toolName = String(d.tool || "");
         // Only update toolCalls tracker (no message creation during streaming)
         act().addToolCall({
@@ -433,6 +462,12 @@ export function Agent() {
           elapsed_s: undefined,
           progress: undefined,
         });
+        if (toolName === "run_swarm") {
+          const fallback = buildSwarmStatusFromToolResultPreview(String(d.preview || ""));
+          if (fallback && !act().messages.some((m) => m.type === "swarm_status" && m.swarmRunId === fallback.runId)) {
+            act().upsertSwarmStatus(fallback);
+          }
+        }
       },
 
       tool_heartbeat: (d) => {
@@ -488,6 +523,7 @@ export function Agent() {
 
       "attempt.completed": async (d) => {
         touch();
+        setReasoningActive(false);
         const s = act();
         // Build ThinkingTimeline summary from accumulated toolCalls
         const completedTools = s.toolCalls;
@@ -507,14 +543,7 @@ export function Agent() {
         const runDir = String(d.run_dir || "");
         const runId = runDir ? runDir.split(/[/\\]/).pop() : undefined;
         const summary = String(d.summary || "");
-        if (summary) {
-          s.addMessage({
-            id: String(d.message_id || ""),
-            type: "answer",
-            content: summary,
-            timestamp: Date.now(),
-          });
-        }
+        if (summary) s.addMessage({ id: "", type: "answer", content: summary, timestamp: Date.now() });
 
         // Detect Shadow Account id if render_shadow_report fired successfully this turn
         const shadowCall = completedTools.find(
@@ -559,6 +588,7 @@ export function Agent() {
 
       "attempt.failed": (d) => {
         touch();
+        setReasoningActive(false);
         act().clearStreaming();
         act().addMessage({ id: "", type: "error", content: String(d.error || "Execution failed"), timestamp: Date.now() });
         act().setStatus("idle");
@@ -571,6 +601,24 @@ export function Agent() {
       "goal.created": () => {
         touch();
         loadGoalSnapshot(sid);
+      },
+
+      "swarm.started": (d) => {
+        touch();
+        const status = buildSwarmStatusFromStarted(d);
+        if (!status) return;
+        act().upsertSwarmStatus(status);
+        scrollToBottom();
+      },
+
+      "swarm.event": (d) => {
+        touch();
+        if (act().status !== "streaming") act().setStatus("streaming");
+        const runId = String(d.run_id || "");
+        const event = d.event;
+        if (!runId || !event) return;
+        act().updateSwarmStatus(runId, (current) => applySwarmEvent(current, event));
+        scrollToBottom();
       },
 
       "goal.evidence": () => {
@@ -621,7 +669,7 @@ export function Agent() {
         // the RunnerStatus panel re-polls so its per-broker rows show "halted".
         setLiveHalted(halted);
         setLiveStatusRefresh((n) => n + 1);
-        toast.warning("Connector runtime halted — runner stopped, resting orders cancelled");
+        toast.warning(t('agent.connectorHalted'));
       },
 
       "live.resumed": (d) => {
@@ -631,7 +679,7 @@ export function Agent() {
         void d;
         setLiveHalted(null);
         setLiveStatusRefresh((n) => n + 1);
-        toast.success("Connector runtime resumed");
+        toast.success(t('agent.connectionRestored'));
       },
 
       "live.action": (d) => {
@@ -744,10 +792,18 @@ export function Agent() {
   /* Safety timeout: if streaming but no SSE event for sseTimeoutMsRef.current ms, reset to idle */
   useEffect(() => {
     if (status !== "streaming") return;
+    // Arm the clock at the start of every streaming turn. Without this, a turn
+    // whose very first event never arrives (e.g. the LLM provider hangs before
+    // emitting a single token) left lastEventRef at its 0 / stale value, so the
+    // guard below short-circuited and the UI hung on "Agent is working…"
+    // forever. touch() refreshes this on every real event; the no-op heartbeat
+    // deliberately does not, so a connection that only keep-alives still trips.
+    lastEventRef.current = Date.now();
     const timer = setInterval(() => {
       if (lastEventRef.current && Date.now() - lastEventRef.current > sseTimeoutMsRef.current && act().status === "streaming") {
+        setReasoningActive(false);
         act().setStatus("idle");
-        toast.warning("Execution timed out, automatically stopped");
+        toast.warning(t('agent.executionTimedOut'));
       }
     }, 10_000);
     return () => clearInterval(timer);
@@ -765,7 +821,7 @@ export function Agent() {
         setGoalSnapshot(snapshot);
         setGoalComposerActive(false);
         setGoalDetailsOpen(true);
-        toast.success("Research goal attached");
+        toast.success(t('agent.researchGoalAttached'));
         const kickoff = goalKickoffPrompt(prompt);
         act().addMessage({ id: "", type: "user", content: kickoff, timestamp: Date.now() });
         act().setStatus("streaming");
@@ -774,7 +830,7 @@ export function Agent() {
         await api.sendMessage(sid, kickoff);
       } catch (error) {
         act().setStatus("idle");
-        toast.error(error instanceof Error ? error.message : "Failed to start goal.");
+        toast.error(error instanceof Error ? error.message : t('agent.failedToStartGoal'));
       }
       return;
     }
@@ -807,10 +863,11 @@ export function Agent() {
       }
       setupSSE(sid);
       await api.sendMessage(sid, finalPrompt);
-    } catch {
+    } catch (error) {
       act().setStatus("error");
-      toast.error("Failed to send message, please retry.");
-      act().addMessage({ id: "", type: "error", content: "Failed to send message, please retry.", timestamp: Date.now() });
+      const message = isAuthRequiredError(error) ? AUTH_REQUIRED_MESSAGE : t('agent.failedToSend');
+      toast.error(message);
+      act().addMessage({ id: "", type: "error", content: message, timestamp: Date.now() });
     }
   };
 
@@ -829,6 +886,7 @@ export function Agent() {
   const handleSubmit = (e: FormEvent) => { e.preventDefault(); runPrompt(input.trim()); };
 
   const handleCancel = async () => {
+    setReasoningActive(false);
     if (!sessionId) {
       act().setStatus("idle");
       return;
@@ -838,9 +896,9 @@ export function Agent() {
       act().setStatus("idle");
       act().clearStreaming();
       useAgentStore.setState({ toolCalls: [] });
-      toast.info("Cancel request sent");
+      toast.info(t('agent.cancelRequestSent'));
     } catch {
-      toast.error("Cancel failed");
+      toast.error(t('agent.cancelFailed'));
     }
   };
 
@@ -858,9 +916,9 @@ export function Agent() {
       // optimistically and re-poll the runtime panel so the runner shows stopped.
       setLiveHalted((cur) => cur ?? { broker: null, by: "frontend", tripped_at: new Date().toISOString() });
       setLiveStatusRefresh((n) => n + 1);
-      toast.success("Connector runtime halted");
+      toast.success(t('agent.connectorHalted'));
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to halt connector runtime.");
+      toast.error(error instanceof Error ? error.message : t('agent.failedToHaltConnector'));
     } finally {
       setHalting(false);
     }
@@ -877,9 +935,9 @@ export function Agent() {
       });
       setGoalSnapshot(null);
       setGoalDetailsOpen(false);
-      toast.success("Research goal cancelled");
+      toast.success(t('agent.researchGoalCancelled'));
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to cancel goal.");
+      toast.error(error instanceof Error ? error.message : t('agent.failedToCancelGoal'));
     }
   }, [goalSnapshot, sessionId]);
 
@@ -900,9 +958,9 @@ export function Agent() {
       });
       setGoalSnapshot(response.snapshot);
       setGoalEditActive(false);
-      toast.success("Research goal updated");
+      toast.success(t('agent.researchGoalUpdated'));
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to update goal.");
+      toast.error(error instanceof Error ? error.message : t('agent.failedToUpdateGoal'));
     }
   }, [goalEditValue, goalSnapshot, sessionId]);
 
@@ -916,10 +974,11 @@ export function Agent() {
     try {
       setupSSE(sessionId);
       await api.sendMessage(sessionId, prompt);
-    } catch {
+    } catch (error) {
       act().setStatus("error");
-      toast.error("Failed to continue goal, please retry.");
-      act().addMessage({ id: "", type: "error", content: "Failed to continue goal, please retry.", timestamp: Date.now() });
+      const message = isAuthRequiredError(error) ? AUTH_REQUIRED_MESSAGE : t('agent.failedToContinue');
+      toast.error(message);
+      act().addMessage({ id: "", type: "error", content: message, timestamp: Date.now() });
     }
   }, [forceScrollToBottom, goalSnapshot, sessionId, setupSSE, status]);
 
@@ -953,6 +1012,8 @@ export function Agent() {
         lines.push(`## Error (${time})`, ``, msg.content, ``);
       } else if (msg.type === "tool_call") {
         lines.push(`> Tool call: ${msg.tool || "unknown"}`, ``);
+      } else if (msg.type === "swarm_status") {
+        lines.push(`> Swarm status: ${msg.swarmStatus?.preset || "swarm"} ${msg.swarmStatus?.status || ""}`, ``);
       } else if (msg.type === "run_complete") {
         lines.push(`> Backtest complete: ${msg.runId || ""}`, ``);
       }
@@ -977,11 +1038,11 @@ export function Agent() {
     ];
     const lowered = file.name.toLowerCase();
     if (blockedExts.some((ext) => lowered.endsWith(ext))) {
-      toast.error("Executables and archives are not allowed");
+      toast.error(t('agent.executablesNotAllowed'));
       return;
     }
     if (file.size > 50 * 1024 * 1024) {
-      toast.error("File size exceeds 50 MB limit");
+      toast.error(t('agent.fileSizeExceeds'));
       return;
     }
     setUploading(true);
@@ -989,9 +1050,9 @@ export function Agent() {
     try {
       const result = await api.uploadFile(file);
       setAttachment({ filename: result.filename, filePath: result.file_path });
-      toast.success(`Uploaded: ${result.filename}`);
+      toast.success(t('agent.uploaded', { filename: result.filename }));
     } catch (err) {
-      toast.error(`Upload failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+      toast.error(t('agent.uploadFailed', { error: err instanceof Error ? err.message : 'Unknown error' }));
     } finally {
       setUploading(false);
     }
@@ -1093,6 +1154,13 @@ export function Agent() {
               );
             }
             const msgIdx = messages.indexOf(g.msg);
+            if (g.msg.type === "swarm_status" && g.msg.swarmStatus) {
+              return (
+                <div key={row.key} data-msg-idx={msgIdx}>
+                  <SwarmStatusCard status={g.msg.swarmStatus} />
+                </div>
+              );
+            }
             return (
               <div key={row.key} data-msg-idx={msgIdx}>
                 <MessageBubble msg={g.msg} onRetry={g.msg.type === "error" ? handleRetry : undefined} />
@@ -1101,21 +1169,27 @@ export function Agent() {
           })}
 
           {/* Pre-stream placeholder: visible after Send, before first SSE event */}
-          {status === "streaming" && !streamingText && toolCalls.length === 0 && (
+          {status === "streaming" && !reasoningActive && !streamingText && toolCalls.length === 0 && !messages.some((m) => m.type === "swarm_status" && m.swarmStatus?.status === "running") && (
             <div className="flex gap-3">
               <AgentAvatar />
               <div className="flex-1 min-w-0 flex items-center gap-2 text-xs text-muted-foreground pt-1">
                 <Loader2 className="h-3 w-3 animate-spin text-primary shrink-0" />
-                <span>{language === "zh-CN" ? "研究助手正在工作…" : "Agent is working…"}</span>
+                <span>{t('agent.agentWorking')}</span>
               </div>
             </div>
           )}
 
           {/* Live streaming area: text + tool status */}
-          {(streamingText || (status === "streaming" && toolCalls.length > 0)) && (
+          {(streamingText || reasoningActive || (status === "streaming" && toolCalls.length > 0)) && (
             <div className="flex gap-3">
               <AgentAvatar />
               <div className="flex-1 min-w-0 space-y-1.5">
+                {reasoningActive && !streamingText && (
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <Loader2 className="h-3 w-3 animate-spin text-primary shrink-0" />
+                    <span>{t('agent.reasoning')}</span>
+                  </div>
+                )}
                 {streamingText && (
                   <div className="prose prose-sm dark:prose-invert max-w-none leading-relaxed">
                     {streamingText}
@@ -1135,7 +1209,7 @@ export function Agent() {
               <div className="h-0.5 flex-1 rounded-full bg-primary/20 overflow-hidden">
                 <div className="h-full w-1/3 bg-primary rounded-full animate-[pulse-slide_2s_ease-in-out_infinite]" />
               </div>
-              <span className="text-[10px] text-muted-foreground shrink-0 tabular-nums">{language === "zh-CN" ? "运行中" : "running"}</span>
+              <span className="text-[10px] text-muted-foreground shrink-0 tabular-nums">{t('agent.running')}</span>
             </div>
           )}
 
@@ -1147,7 +1221,7 @@ export function Agent() {
             onClick={forceScrollToBottom}
             className="sticky bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-1 px-3 py-1.5 rounded-full bg-primary text-primary-foreground text-xs font-medium shadow-lg hover:opacity-90 transition-opacity z-10"
           >
-            <ArrowDown className="h-3 w-3" /> {language === "zh-CN" ? "新消息" : "New messages"}
+            <ArrowDown className="h-3 w-3" /> {t('agent.newMessages')}
           </button>
         )}
         <ConversationTimeline messages={messages} containerRef={listRef} />
@@ -1171,7 +1245,7 @@ export function Agent() {
             <div className="flex items-center gap-1">
               <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-primary/10 text-primary text-xs font-medium">
                 <Target className="h-3 w-3" />
-                {language === "zh-CN" ? "新建研究目标" : "New Research Goal"}
+                New Research Goal
                 <button type="button" onClick={() => setGoalComposerActive(false)} className="hover:text-destructive transition-colors">
                   <X className="h-3 w-3" />
                 </button>
@@ -1189,7 +1263,7 @@ export function Agent() {
                 aria-expanded={goalDetailsOpen}
               >
                 <Target className="h-3 w-3 shrink-0" />
-                <span className="shrink-0">Goal</span>
+                <span className="shrink-0">{t('agent.goal')}</span>
                 <span className="truncate text-muted-foreground">
                   {goalSnapshot.goal.ui_summary || goalSnapshot.goal.objective}
                 </span>
@@ -1365,7 +1439,7 @@ export function Agent() {
           {uploading && (
             <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <Loader2 className="h-3 w-3 animate-spin" />
-              {language === "zh-CN" ? "上传中..." : "Uploading..."}
+              Uploading...
             </div>
           )}
           {/* Persistent kill switch — distinct from the per-turn Stop button
@@ -1375,7 +1449,7 @@ export function Agent() {
               {liveIsHalted ? (
                 <span className="inline-flex items-center gap-1.5 rounded-lg bg-destructive/10 px-2.5 py-1 text-xs font-medium text-destructive">
                   <OctagonX className="h-3 w-3" />
-                  {language === "zh-CN" ? "交易连接器运行时已停止" : "Connector runtime halted"}
+                  Connector runtime halted
                 </span>
               ) : (
                 <button
@@ -1383,10 +1457,10 @@ export function Agent() {
                   onClick={handleHaltLive}
                   disabled={halting}
                   className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/5 px-2.5 py-1 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-40"
-                  title={language === "zh-CN" ? "立即停止交易连接器运行时活动" : "Instantly halt connector runtime activity"}
+                  title="Instantly halt connector runtime activity"
                 >
                   {halting ? <Loader2 className="h-3 w-3 animate-spin" /> : <OctagonX className="h-3 w-3" />}
-                  {language === "zh-CN" ? "停止交易连接器运行时" : "Halt connector runtime"}
+                  Halt connector runtime
                 </button>
               )}
             </div>
@@ -1399,7 +1473,7 @@ export function Agent() {
                 onClick={() => setShowUploadMenu(prev => !prev)}
                 disabled={status === "streaming" || uploading}
                 className="w-9 h-9 rounded-full border flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted transition-colors disabled:opacity-40 shrink-0"
-                title={language === "zh-CN" ? "更多选项" : "More options"}
+                title="More options"
               >
                 <Plus className="h-4 w-4" />
               </button>
@@ -1411,7 +1485,7 @@ export function Agent() {
                     className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
                   >
                     <Paperclip className="h-4 w-4" />
-                    {language === "zh-CN" ? "上传文档" : "Upload PDF document"}
+                    Upload PDF document
                   </button>
                   <div className="border-t my-1" />
                   <button
@@ -1425,20 +1499,20 @@ export function Agent() {
                     className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
                   >
                     <Target className="h-4 w-4" />
-                    {language === "zh-CN" ? "研究目标" : "Research Goal"}
+                    Research Goal
                   </button>
                   <button
                     type="button"
                     onClick={() => {
                       setShowUploadMenu(false);
                       setGoalComposerActive(false);
-                      setSwarmPreset({ name: "auto", title: language === "zh-CN" ? "多智能体团队" : "Agent Swarm" });
+                      setSwarmPreset({ name: "auto", title: "Agent Swarm" });
                       inputRef.current?.focus();
                     }}
                     className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
                   >
                     <Users className="h-4 w-4" />
-                    {language === "zh-CN" ? "多智能体团队" : "Agent Swarm"}
+                    Agent Swarm
                   </button>
                   <div className="border-t my-1" />
                   <button
@@ -1450,7 +1524,7 @@ export function Agent() {
                     className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
                   >
                     <Landmark className="h-4 w-4" />
-                    {language === "zh-CN" ? "检查交易连接器" : "Check Trading Connector"}
+                    Check Trading Connector
                   </button>
                   <button
                     type="button"
@@ -1461,7 +1535,7 @@ export function Agent() {
                     className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
                   >
                     <Landmark className="h-4 w-4" />
-                    {language === "zh-CN" ? "分析连接器账户组合" : "Analyze Connector Portfolio"}
+                    Analyze Connector Portfolio
                   </button>
                 </div>
               )}
@@ -1507,8 +1581,8 @@ export function Agent() {
               }}
               placeholder={
                 goalComposerActive
-                  ? (language === "zh-CN" ? "描述要附加到当前会话的研究目标" : "Describe the research goal to attach to this session")
-                  : (language === "zh-CN" ? "例如：创建 000001.SZ 双均线交叉策略，并回测 2024 年表现" : "e.g. Create a dual MA crossover strategy for 000001.SZ, backtest 2024")
+                  ? "Describe the research goal to attach to this session"
+                  : "e.g. Create a dual MA crossover strategy for 000001.SZ, backtest 2024"
               }
               className="flex-1 px-4 py-2.5 rounded-xl border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow resize-none max-h-32 overflow-y-auto"
               disabled={status === "streaming"}
@@ -1518,7 +1592,7 @@ export function Agent() {
                 type="button"
                 onClick={handleExport}
                 className="px-3 py-2.5 rounded-xl border text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-                title={language === "zh-CN" ? "导出对话" : "Export chat"}
+                title={t('agent.exportChat')}
               >
                 <Download className="h-4 w-4" />
               </button>
@@ -1528,7 +1602,7 @@ export function Agent() {
                 type="button"
                 onClick={handleCancel}
                 className="px-4 py-2.5 rounded-xl bg-destructive text-destructive-foreground text-sm font-medium hover:opacity-90 transition-opacity"
-                title={language === "zh-CN" ? "停止生成" : "Stop generation"}
+                title={t('agent.stopGeneration')}
               >
                 <Square className="h-4 w-4" />
               </button>
