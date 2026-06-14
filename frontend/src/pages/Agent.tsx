@@ -15,6 +15,7 @@ import { ConversationTimeline } from "@/components/chat/ConversationTimeline";
 import { ToolProgressIndicator } from "@/components/chat/ToolProgressIndicator";
 import { MandateProposalCard } from "@/components/chat/MandateProposalCard";
 import { RunnerStatus } from "@/components/chat/RunnerStatus";
+import { useI18n } from "@/lib/i18n";
 
 /* ---------- Message grouping ---------- */
 type MsgGroup =
@@ -200,6 +201,7 @@ function goalContinuePrompt(snapshot: GoalSnapshot): string {
 
 /* ---------- Component ---------- */
 export function Agent() {
+  const { language } = useI18n();
   const [input, setInput] = useState("");
   const [searchParams, setSearchParams] = useSearchParams();
   const listRef = useRef<HTMLDivElement>(null);
@@ -505,7 +507,14 @@ export function Agent() {
         const runDir = String(d.run_dir || "");
         const runId = runDir ? runDir.split(/[/\\]/).pop() : undefined;
         const summary = String(d.summary || "");
-        if (summary) s.addMessage({ id: "", type: "answer", content: summary, timestamp: Date.now() });
+        if (summary) {
+          s.addMessage({
+            id: String(d.message_id || ""),
+            type: "answer",
+            content: summary,
+            timestamp: Date.now(),
+          });
+        }
 
         // Detect Shadow Account id if render_shadow_report fired successfully this turn
         const shadowCall = completedTools.find(
@@ -1097,7 +1106,7 @@ export function Agent() {
               <AgentAvatar />
               <div className="flex-1 min-w-0 flex items-center gap-2 text-xs text-muted-foreground pt-1">
                 <Loader2 className="h-3 w-3 animate-spin text-primary shrink-0" />
-                <span>Agent is working…</span>
+                <span>{language === "zh-CN" ? "研究助手正在工作…" : "Agent is working…"}</span>
               </div>
             </div>
           )}
@@ -1126,7 +1135,7 @@ export function Agent() {
               <div className="h-0.5 flex-1 rounded-full bg-primary/20 overflow-hidden">
                 <div className="h-full w-1/3 bg-primary rounded-full animate-[pulse-slide_2s_ease-in-out_infinite]" />
               </div>
-              <span className="text-[10px] text-muted-foreground shrink-0 tabular-nums">running</span>
+              <span className="text-[10px] text-muted-foreground shrink-0 tabular-nums">{language === "zh-CN" ? "运行中" : "running"}</span>
             </div>
           )}
 
@@ -1138,7 +1147,7 @@ export function Agent() {
             onClick={forceScrollToBottom}
             className="sticky bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-1 px-3 py-1.5 rounded-full bg-primary text-primary-foreground text-xs font-medium shadow-lg hover:opacity-90 transition-opacity z-10"
           >
-            <ArrowDown className="h-3 w-3" /> New messages
+            <ArrowDown className="h-3 w-3" /> {language === "zh-CN" ? "新消息" : "New messages"}
           </button>
         )}
         <ConversationTimeline messages={messages} containerRef={listRef} />
@@ -1162,7 +1171,7 @@ export function Agent() {
             <div className="flex items-center gap-1">
               <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-primary/10 text-primary text-xs font-medium">
                 <Target className="h-3 w-3" />
-                New Research Goal
+                {language === "zh-CN" ? "新建研究目标" : "New Research Goal"}
                 <button type="button" onClick={() => setGoalComposerActive(false)} className="hover:text-destructive transition-colors">
                   <X className="h-3 w-3" />
                 </button>
@@ -1356,7 +1365,7 @@ export function Agent() {
           {uploading && (
             <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <Loader2 className="h-3 w-3 animate-spin" />
-              Uploading...
+              {language === "zh-CN" ? "上传中..." : "Uploading..."}
             </div>
           )}
           {/* Persistent kill switch — distinct from the per-turn Stop button
@@ -1366,7 +1375,7 @@ export function Agent() {
               {liveIsHalted ? (
                 <span className="inline-flex items-center gap-1.5 rounded-lg bg-destructive/10 px-2.5 py-1 text-xs font-medium text-destructive">
                   <OctagonX className="h-3 w-3" />
-                  Connector runtime halted
+                  {language === "zh-CN" ? "交易连接器运行时已停止" : "Connector runtime halted"}
                 </span>
               ) : (
                 <button
@@ -1374,10 +1383,10 @@ export function Agent() {
                   onClick={handleHaltLive}
                   disabled={halting}
                   className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/5 px-2.5 py-1 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-40"
-                  title="Instantly halt connector runtime activity"
+                  title={language === "zh-CN" ? "立即停止交易连接器运行时活动" : "Instantly halt connector runtime activity"}
                 >
                   {halting ? <Loader2 className="h-3 w-3 animate-spin" /> : <OctagonX className="h-3 w-3" />}
-                  Halt connector runtime
+                  {language === "zh-CN" ? "停止交易连接器运行时" : "Halt connector runtime"}
                 </button>
               )}
             </div>
@@ -1390,7 +1399,7 @@ export function Agent() {
                 onClick={() => setShowUploadMenu(prev => !prev)}
                 disabled={status === "streaming" || uploading}
                 className="w-9 h-9 rounded-full border flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted transition-colors disabled:opacity-40 shrink-0"
-                title="More options"
+                title={language === "zh-CN" ? "更多选项" : "More options"}
               >
                 <Plus className="h-4 w-4" />
               </button>
@@ -1402,7 +1411,7 @@ export function Agent() {
                     className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
                   >
                     <Paperclip className="h-4 w-4" />
-                    Upload PDF document
+                    {language === "zh-CN" ? "上传文档" : "Upload PDF document"}
                   </button>
                   <div className="border-t my-1" />
                   <button
@@ -1416,20 +1425,20 @@ export function Agent() {
                     className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
                   >
                     <Target className="h-4 w-4" />
-                    Research Goal
+                    {language === "zh-CN" ? "研究目标" : "Research Goal"}
                   </button>
                   <button
                     type="button"
                     onClick={() => {
                       setShowUploadMenu(false);
                       setGoalComposerActive(false);
-                      setSwarmPreset({ name: "auto", title: "Agent Swarm" });
+                      setSwarmPreset({ name: "auto", title: language === "zh-CN" ? "多智能体团队" : "Agent Swarm" });
                       inputRef.current?.focus();
                     }}
                     className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
                   >
                     <Users className="h-4 w-4" />
-                    Agent Swarm
+                    {language === "zh-CN" ? "多智能体团队" : "Agent Swarm"}
                   </button>
                   <div className="border-t my-1" />
                   <button
@@ -1441,7 +1450,7 @@ export function Agent() {
                     className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
                   >
                     <Landmark className="h-4 w-4" />
-                    Check Trading Connector
+                    {language === "zh-CN" ? "检查交易连接器" : "Check Trading Connector"}
                   </button>
                   <button
                     type="button"
@@ -1452,7 +1461,7 @@ export function Agent() {
                     className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
                   >
                     <Landmark className="h-4 w-4" />
-                    Analyze Connector Portfolio
+                    {language === "zh-CN" ? "分析连接器账户组合" : "Analyze Connector Portfolio"}
                   </button>
                 </div>
               )}
@@ -1498,8 +1507,8 @@ export function Agent() {
               }}
               placeholder={
                 goalComposerActive
-                  ? "Describe the research goal to attach to this session"
-                  : "e.g. Create a dual MA crossover strategy for 000001.SZ, backtest 2024"
+                  ? (language === "zh-CN" ? "描述要附加到当前会话的研究目标" : "Describe the research goal to attach to this session")
+                  : (language === "zh-CN" ? "例如：创建 000001.SZ 双均线交叉策略，并回测 2024 年表现" : "e.g. Create a dual MA crossover strategy for 000001.SZ, backtest 2024")
               }
               className="flex-1 px-4 py-2.5 rounded-xl border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow resize-none max-h-32 overflow-y-auto"
               disabled={status === "streaming"}
@@ -1509,7 +1518,7 @@ export function Agent() {
                 type="button"
                 onClick={handleExport}
                 className="px-3 py-2.5 rounded-xl border text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-                title="Export chat"
+                title={language === "zh-CN" ? "导出对话" : "Export chat"}
               >
                 <Download className="h-4 w-4" />
               </button>
@@ -1519,7 +1528,7 @@ export function Agent() {
                 type="button"
                 onClick={handleCancel}
                 className="px-4 py-2.5 rounded-xl bg-destructive text-destructive-foreground text-sm font-medium hover:opacity-90 transition-opacity"
-                title="Stop generation"
+                title={language === "zh-CN" ? "停止生成" : "Stop generation"}
               >
                 <Square className="h-4 w-4" />
               </button>

@@ -2,6 +2,7 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MessageBubble } from "../MessageBubble";
 import type { AgentMessage } from "@/types/agent";
+import { api } from "@/lib/api";
 
 // Mock react-markdown (heavy dependency, renders raw content in tests)
 vi.mock("react-markdown", () => ({
@@ -44,6 +45,60 @@ describe("MessageBubble", () => {
     it("renders markdown content", () => {
       render(<MessageBubble msg={makeMsg({ type: "answer", content: "Here is the **analysis**" })} />);
       expect(screen.getByTestId("markdown")).toHaveTextContent("Here is the **analysis**");
+    });
+
+    it("keeps follow-up prompts after a disclaimer visible in chat", () => {
+      const content = [
+        "研究结论",
+        "",
+        "> ⚠ 免责声明：以上为研究分析，不构成投资建议。市场有风险，投资需谨慎。",
+        "有什么需要我进一步深挖的吗？比如：技术面分析？",
+      ].join("\n");
+
+      render(<MessageBubble msg={makeMsg({ type: "answer", content })} />);
+
+      expect(screen.getByTestId("markdown")).toHaveTextContent("免责声明");
+      expect(screen.getByTestId("markdown")).toHaveTextContent("有什么需要");
+      expect(screen.getByTestId("markdown")).toHaveTextContent("技术面分析");
+    });
+
+    it("keeps normal follow-up wording when no disclaimer is present", () => {
+      render(<MessageBubble msg={makeMsg({ type: "answer", content: "有什么需要重点验证？" })} />);
+      expect(screen.getByTestId("markdown")).toHaveTextContent("有什么需要重点验证？");
+    });
+
+    it("generates a PDF from the answer", async () => {
+      const pdf = new Blob(["pdf"], { type: "application/pdf" });
+      vi.spyOn(api, "generatePdf").mockResolvedValue(pdf);
+      const createObjectURL = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:report");
+      const revokeObjectURL = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+      const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+      render(<MessageBubble msg={makeMsg({ type: "answer", content: "Report content" })} />);
+      await userEvent.setup().click(screen.getByTitle("生成 PDF"));
+
+      expect(api.generatePdf).toHaveBeenCalledWith("Vibe-Trading Research Report", "Report content");
+      expect(createObjectURL).toHaveBeenCalledWith(pdf);
+      expect(click).toHaveBeenCalled();
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:report");
+    });
+
+    it("generates a PDF without the post-disclaimer follow-up", async () => {
+      vi.spyOn(api, "generatePdf").mockResolvedValue(new Blob(["pdf"], { type: "application/pdf" }));
+      vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:report");
+      vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+      vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+      render(<MessageBubble msg={makeMsg({
+        type: "answer",
+        content: "结论\n免责声明：不构成投资建议。\n如有需要，我可以继续分析。",
+      })} />);
+      await userEvent.setup().click(screen.getByTitle("生成 PDF"));
+
+      expect(api.generatePdf).toHaveBeenCalledWith(
+        "Vibe-Trading Research Report",
+        "结论\n免责声明：不构成投资建议。",
+      );
     });
   });
 

@@ -57,7 +57,10 @@ export const useAgentStore = create<AgentState>((set) => ({
   sessionLoading: false,
 
   addMessage: (msg) =>
-    set((s) => ({ messages: [...s.messages, { ...msg, id: msg.id || nextId() } as AgentMessage] })),
+    set((s) => {
+      if (msg.id && s.messages.some((existing) => existing.id === msg.id)) return s;
+      return { messages: [...s.messages, { ...msg, id: msg.id || nextId() } as AgentMessage] };
+    }),
 
   appendDelta: (delta) =>
     set((s) => ({ streamingText: s.streamingText + delta })),
@@ -83,8 +86,15 @@ export const useAgentStore = create<AgentState>((set) => ({
     })),
 
   cacheSession: (sid, msgs) => {
+    const seen = new Set<string>();
+    const normalized = msgs.filter((msg) => {
+      if (!msg.id) return true;
+      if (seen.has(msg.id)) return false;
+      seen.add(msg.id);
+      return true;
+    });
     _sessionCache.delete(sid);
-    _sessionCache.set(sid, msgs);
+    _sessionCache.set(sid, normalized);
     if (_sessionCache.size > SESSION_CACHE_MAX) {
       const oldest = _sessionCache.keys().next().value;
       if (oldest) _sessionCache.delete(oldest);

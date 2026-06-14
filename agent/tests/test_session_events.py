@@ -27,3 +27,12 @@ def test_last_event_id_replay_still_returns_only_later_events() -> None:
     third = bus.emit("s1", "text_delta", {"delta": "done"})
 
     assert bus.replay("s1", last_event_id=first.event_id, replay_all=True) == [second, third]
+
+
+def test_active_run_replay_filters_out_previous_attempt_events() -> None:
+    bus = EventBus()
+    bus.emit("s1", "attempt.completed", {"attempt_id": "old", "summary": "old answer"})
+    current = bus.emit("s1", "attempt.started", {"attempt_id": "current"})
+    delta = bus.emit("s1", "text_delta", {"attempt_id": "current", "delta": "working"})
+
+    assert bus.replay("s1", replay_all=True, attempt_id="current") == [current, delta]

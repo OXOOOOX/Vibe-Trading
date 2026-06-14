@@ -152,6 +152,7 @@ class EventBus:
         last_event_id: Optional[str] = None,
         *,
         replay_all: bool = False,
+        attempt_id: Optional[str] = None,
     ) -> List[SSEEvent]:
         """Replay buffered session events for reconnect recovery.
 
@@ -168,7 +169,11 @@ class EventBus:
         with self._lock:
             buffer = self._buffers.get(session_id, [])
             if not last_event_id:
-                return list(buffer) if replay_all else []  # First connect: history loaded via REST by default.
+                if not replay_all:
+                    return []  # First connect: history loaded via REST by default.
+                if attempt_id:
+                    return [event for event in buffer if event.data.get("attempt_id") == attempt_id]
+                return list(buffer)
             found = False
             result: List[SSEEvent] = []
             for event in buffer:
@@ -184,6 +189,7 @@ class EventBus:
         last_event_id: Optional[str] = None,
         *,
         replay_all: bool = False,
+        attempt_id: Optional[str] = None,
     ) -> AsyncIterator[SSEEvent]:
         """Subscribe to a session event stream asynchronously.
 
@@ -204,7 +210,12 @@ class EventBus:
             self._subscribers[session_id].append(queue)
 
         try:
-            replay_events = self.replay(session_id, last_event_id, replay_all=replay_all)
+            replay_events = self.replay(
+                session_id,
+                last_event_id,
+                replay_all=replay_all,
+                attempt_id=attempt_id,
+            )
             for event in replay_events:
                 yield event
 

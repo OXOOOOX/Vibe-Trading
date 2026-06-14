@@ -41,6 +41,15 @@ describe("addMessage", () => {
     const msgs = useAgentStore.getState().messages;
     expect(msgs.map((m) => m.content)).toEqual(["first", "second"]);
   });
+
+  it("ignores a duplicate stable message id", () => {
+    const store = useAgentStore.getState();
+    store.addMessage({ id: "assistant-1", type: "answer", content: "first", timestamp: 1 });
+    store.addMessage({ id: "assistant-1", type: "answer", content: "duplicate", timestamp: 2 });
+
+    expect(useAgentStore.getState().messages).toHaveLength(1);
+    expect(useAgentStore.getState().messages[0].content).toBe("first");
+  });
 });
 
 describe("appendDelta / clearStreaming", () => {

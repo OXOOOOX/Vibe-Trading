@@ -183,7 +183,8 @@ class SessionService:
                 session.session_id,
                 "attempt.completed" if attempt.status == AttemptStatus.COMPLETED else "attempt.failed",
                 {"attempt_id": attempt.attempt_id, "status": attempt.status.value,
-                 "summary": attempt.summary, "error": attempt.error, "run_dir": attempt.run_dir},
+                 "summary": attempt.summary, "error": attempt.error, "run_dir": attempt.run_dir,
+                 "message_id": reply.message_id},
             )
 
         except Exception as exc:

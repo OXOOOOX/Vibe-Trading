@@ -66,6 +66,16 @@ async function uploadFile(file: File): Promise<UploadResult> {
   return res.json();
 }
 
+async function generatePdf(title: string, content: string): Promise<Blob> {
+  const res = await fetch(`${BASE}/reports/pdf`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ title, content }),
+  });
+  if (!res.ok) throw await errorFromResponse(res);
+  return res.blob();
+}
+
 function appendQueryParam(url: string, key: string, value: string): string {
   const sep = url.includes("?") ? "&" : "?";
   return `${url}${sep}${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
@@ -73,6 +83,7 @@ function appendQueryParam(url: string, key: string, value: string): string {
 
 export const api = {
   uploadFile,
+  generatePdf,
   listRuns: () => request<RunListItem[]>("/runs"),
   getRun: (id: string) => request<RunData>(`/runs/${id}`),
   getRunCode: (id: string) => request<Record<string, string>>(`/runs/${id}/code`),

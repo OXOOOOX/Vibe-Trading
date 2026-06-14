@@ -38,6 +38,7 @@ import {
 import { echarts } from "@/lib/echarts";
 import { getChartTheme } from "@/lib/chart-theme";
 import { useDarkMode } from "@/hooks/useDarkMode";
+import { useI18n } from "@/lib/i18n";
 
 /* ---------- Constants ---------- */
 
@@ -45,6 +46,7 @@ interface ZooCard {
   id: string;
   title: string;
   description: string;
+  descriptionZh: string;
   approxCount: number;
   accent: string;
 }
@@ -57,6 +59,7 @@ const ZOO_CARDS: ZooCard[] = [
     title: "Qlib 158",
     description:
       "Microsoft Qlib's full 158-feature library covering momentum, volatility, volume and rolling statistical signals.",
+    descriptionZh: "Microsoft Qlib 的完整 158 特征库，覆盖动量、波动率、成交量和滚动统计信号。",
     approxCount: 154,
     accent: "from-sky-500/20 to-sky-500/5",
   },
@@ -65,6 +68,7 @@ const ZOO_CARDS: ZooCard[] = [
     title: "Kakushadze 101 Formulaic Alphas",
     description:
       "The 101 formulaic alphas from Kakushadze (2015); short-horizon cross-sectional signals.",
+    descriptionZh: "Kakushadze（2015）提出的 101 个公式化 Alpha，主要用于短周期横截面选股。",
     approxCount: 101,
     accent: "from-emerald-500/20 to-emerald-500/5",
   },
@@ -73,6 +77,7 @@ const ZOO_CARDS: ZooCard[] = [
     title: "GTJA 191",
     description:
       "Guotai Junan Securities' 191 alphas; technical and microstructure signals tuned to China A-share markets.",
+    descriptionZh: "国泰君安 191 Alpha 因子，侧重适配中国 A 股市场的技术面与微观结构信号。",
     approxCount: 191,
     accent: "from-amber-500/20 to-amber-500/5",
   },
@@ -81,6 +86,7 @@ const ZOO_CARDS: ZooCard[] = [
     title: "Academic Anomalies",
     description:
       "Curated long-horizon anomalies from the academic literature (value, momentum, quality, low-vol, etc.).",
+    descriptionZh: "精选自学术研究的长期市场异象，包括价值、动量、质量和低波动等方向。",
     approxCount: 6,
     accent: "from-violet-500/20 to-violet-500/5",
   },
@@ -128,6 +134,7 @@ export function AlphaZoo() {
 /* ---------- Browse view ---------- */
 
 function BrowseView() {
+  const { language } = useI18n();
   const [alphas, setAlphas] = useState<AlphaSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [zooFilter, setZooFilter] = useState<string>("");
@@ -191,16 +198,17 @@ function BrowseView() {
       {/* Hero */}
       <div className="space-y-2">
         <div className="flex items-center gap-2 text-xs text-muted-foreground uppercase tracking-wide">
-          <Layers className="h-3.5 w-3.5" aria-hidden="true" /> Alpha Zoo
+          <Layers className="h-3.5 w-3.5" aria-hidden="true" /> {language === "zh-CN" ? "Alpha 因子库" : "Alpha Zoo"}
         </div>
         <h1 className="text-2xl md:text-3xl font-bold tracking-tight">
-          {total > 0 ? total : 452} pre-built quant alphas across 4 zoos
+          {language === "zh-CN"
+            ? `收录 ${total > 0 ? total : 452} 个预置量化 Alpha，覆盖 4 个因子库`
+            : `${total > 0 ? total : 452} pre-built quant alphas across 4 zoos`}
         </h1>
         <p className="text-sm text-muted-foreground max-w-2xl">
-          Browse formula-driven cross-sectional signals from Qlib, the
-          Kakushadze 101 set, GTJA 191, and the academic anomaly literature.
-          Click any alpha to read its formula and source code, or run a bench
-          to score the whole zoo on a universe and period.
+          {language === "zh-CN"
+            ? "浏览来自 Qlib、Kakushadze 101、国泰君安 191 以及学术市场异象研究的公式化横截面信号。点击任意 Alpha 可查看公式和源代码，也可以选择股票池与时间区间，对整个因子库运行基准测试。"
+            : "Browse formula-driven cross-sectional signals from Qlib, the Kakushadze 101 set, GTJA 191, and the academic anomaly literature. Click any alpha to read its formula and source code, or run a bench to score the whole zoo on a universe and period."}
         </p>
       </div>
 
@@ -228,7 +236,7 @@ function BrowseView() {
               </div>
               <h3 className="font-semibold text-sm leading-tight">{z.title}</h3>
               <p className="text-xs text-muted-foreground line-clamp-3">
-                {z.description}
+                {language === "zh-CN" ? z.descriptionZh : z.description}
               </p>
             </button>
           );
@@ -239,7 +247,7 @@ function BrowseView() {
       <div className="flex flex-col md:flex-row md:items-end gap-3 border rounded-xl p-4 bg-card">
         <div className="flex-1 min-w-0">
           <label htmlFor="alpha-search" className="text-xs text-muted-foreground block mb-1">
-            Search
+            {language === "zh-CN" ? "搜索" : "Search"}
           </label>
           <div className="relative">
             <Search
@@ -253,20 +261,20 @@ function BrowseView() {
                 setSearch(e.target.value);
                 setVisibleCount(PAGE_SIZE);
               }}
-              placeholder="Filter by id or nickname…"
+              placeholder={language === "zh-CN" ? "按 ID 或别名筛选…" : "Filter by id or nickname…"}
               className="w-full pl-9 pr-3 py-2 rounded-lg border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
             />
           </div>
         </div>
         <div className="md:w-40">
-          <label htmlFor="alpha-zoo-filter" className="text-xs text-muted-foreground block mb-1">Zoo</label>
+          <label htmlFor="alpha-zoo-filter" className="text-xs text-muted-foreground block mb-1">{language === "zh-CN" ? "因子库" : "Zoo"}</label>
           <select
             id="alpha-zoo-filter"
             value={zooFilter}
             onChange={(e) => setZooFilter(e.target.value)}
             className="w-full px-3 py-2 rounded-lg border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
           >
-            <option value="">All zoos</option>
+            <option value="">{language === "zh-CN" ? "全部因子库" : "All zoos"}</option>
             {ZOO_CARDS.map((z) => (
               <option key={z.id} value={z.id}>
                 {z.title}
@@ -276,7 +284,7 @@ function BrowseView() {
         </div>
         <div className="md:w-40">
           <label htmlFor="alpha-theme-filter" className="text-xs text-muted-foreground block mb-1">
-            Theme
+            {language === "zh-CN" ? "主题" : "Theme"}
           </label>
           <select
             id="alpha-theme-filter"
@@ -284,7 +292,7 @@ function BrowseView() {
             onChange={(e) => setThemeFilter(e.target.value)}
             className="w-full px-3 py-2 rounded-lg border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
           >
-            <option value="">All themes</option>
+            <option value="">{language === "zh-CN" ? "全部主题" : "All themes"}</option>
             {themeOptions.map((tname) => (
               <option key={tname} value={tname}>
                 {tname}
@@ -294,7 +302,7 @@ function BrowseView() {
         </div>
         <div className="md:w-44">
           <label htmlFor="alpha-universe-filter" className="text-xs text-muted-foreground block mb-1">
-            Universe
+            {language === "zh-CN" ? "标的范围" : "Universe"}
           </label>
           <select
             id="alpha-universe-filter"
@@ -302,7 +310,7 @@ function BrowseView() {
             onChange={(e) => setUniverseFilter(e.target.value)}
             className="w-full px-3 py-2 rounded-lg border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
           >
-            <option value="">All universes</option>
+            <option value="">{language === "zh-CN" ? "全部标的范围" : "All universes"}</option>
             {UNIVERSE_OPTIONS.map((u) => (
               <option key={u.value} value={u.value}>
                 {u.label}
@@ -314,7 +322,7 @@ function BrowseView() {
           to="/alpha-zoo/bench"
           className="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition"
         >
-          <Play className="h-3.5 w-3.5" aria-hidden="true" /> Run benchmark
+          <Play className="h-3.5 w-3.5" aria-hidden="true" /> {language === "zh-CN" ? "运行基准测试" : "Run benchmark"}
         </Link>
       </div>
 
@@ -330,16 +338,16 @@ function BrowseView() {
                   ID
                 </th>
                 <th className="text-left px-4 py-2.5 text-muted-foreground">
-                  Zoo
+                  {language === "zh-CN" ? "因子库" : "Zoo"}
                 </th>
                 <th className="text-left px-4 py-2.5 text-muted-foreground">
-                  Theme
+                  {language === "zh-CN" ? "主题" : "Theme"}
                 </th>
                 <th className="text-left px-4 py-2.5 text-muted-foreground hidden md:table-cell">
-                  Universe
+                  {language === "zh-CN" ? "标的范围" : "Universe"}
                 </th>
                 <th className="text-right px-4 py-2.5 text-muted-foreground" title="Predictive half-life: trading days before the signal's edge decays">
-                  Decay (days)
+                  {language === "zh-CN" ? "衰减周期（天）" : "Decay (days)"}
                 </th>
               </tr>
             </thead>
@@ -348,13 +356,13 @@ function BrowseView() {
                 <tr>
                   <td colSpan={5} className="px-4 py-8 text-center text-muted-foreground">
                     <Loader2 className="h-4 w-4 animate-spin inline mr-2" aria-hidden="true" />
-                    Loading alphas…
+                    {language === "zh-CN" ? "正在加载 Alpha…" : "Loading alphas…"}
                   </td>
                 </tr>
               ) : visible.length === 0 ? (
                 <tr>
                   <td colSpan={5} className="px-4 py-8 text-center text-muted-foreground">
-                    No alphas match the current filters.
+                    {language === "zh-CN" ? "没有符合当前筛选条件的 Alpha。" : "No alphas match the current filters."}
                   </td>
                 </tr>
               ) : (
@@ -395,14 +403,14 @@ function BrowseView() {
         {!loading && visible.length < filtered.length && (
           <div className="border-t p-3 flex items-center justify-between text-xs text-muted-foreground">
             <span>
-              Showing {visible.length} of {filtered.length}
+              {language === "zh-CN" ? `当前显示 ${visible.length} / ${filtered.length}` : `Showing ${visible.length} of ${filtered.length}`}
             </span>
             <button
               type="button"
               onClick={() => setVisibleCount((c) => c + PAGE_SIZE)}
               className="px-3 py-1 rounded-md border hover:bg-muted hover:text-foreground transition"
             >
-              Load more
+              {language === "zh-CN" ? "加载更多" : "Load more"}
             </button>
           </div>
         )}
