@@ -169,6 +169,54 @@ const CAPABILITY_CHIPS = [
   "Session Search",
 ];
 
+const CATEGORY_KEYS: Record<string, string> = {
+  "Multi-Market Backtest": "multiMarketBacktest",
+  "Research & Analysis": "researchAnalysis",
+  "Swarm Teams": "swarmTeams",
+  "Document & Web Research": "docWebResearch",
+  "Trade Journal": "tradeJournal",
+  "Trading Connectors": "tradingConnectors",
+  "Shadow Account": "shadowAccount",
+};
+
+const EXAMPLE_KEYS: Record<string, string> = {
+  "Cross-Market Portfolio": "crossMarketPortfolio",
+  "BTC 5-Min MACD Strategy": "btcMacd",
+  "US Tech Max Diversification": "usTechMaxDiv",
+  "Multi-Factor Alpha Model": "multiFactorAlpha",
+  "Options Greeks Analysis": "optionsGreeks",
+  "Investment Committee Review": "investmentCommittee",
+  "Quant Strategy Desk": "quantStrategyDesk",
+  "Analyze an Earnings Report PDF": "earningsReport",
+  "Web Research: Macro Outlook": "macroResearch",
+  "Analyze My Broker Export": "analyzeBrokerExport",
+  "Diagnose My Behavior Biases": "diagnoseBehavior",
+  "Check Selected Connector": "checkConnector",
+  "Analyze Connector Portfolio": "analyzePortfolio",
+  "Quote & Trend": "quoteTrend",
+  "Train My Shadow from Journal": "trainShadow",
+  "How Much Am I Leaving on the Table?": "shadowDelta",
+  "Generate Shadow Report": "shadowReport",
+};
+
+const CAPABILITY_KEYS: Record<string, string> = {
+  "Finance Skills Library": "financeSkills",
+  "Swarm Agent Teams": "swarmTeams",
+  "Auto-Discovered Tools": "autoTools",
+  "3 Markets: A-Share · Crypto · HK/US": "markets",
+  "Trading Connector Profiles": "connectors",
+  "Minute to Daily Timeframes": "timeframes",
+  "4 Portfolio Optimizers": "optimizers",
+  "15+ Risk Metrics": "riskMetrics",
+  "Options & Derivatives": "options",
+  "PDF & Web Research": "pdfWeb",
+  "Factor Analysis & ML": "factorML",
+  "Trade Journal Analyzer": "journalAnalyzer",
+  "Shadow Account Backtest": "shadowBacktest",
+  "Persistent Memory": "memory",
+  "Session Search": "sessionSearch",
+};
+
 interface Props {
   onExample: (s: string) => void;
 }
@@ -185,10 +233,10 @@ export function WelcomeScreen({ onExample }: Props) {
         <div>
           <h2 className="text-2xl font-bold tracking-tight">{t('welcome.title')}</h2>
           <p className="text-xs text-muted-foreground mt-1 max-w-sm mx-auto leading-relaxed">
-            vibe trading with your professional financial agent team
+            {t('welcome.subtitle')}
           </p>
           <p className="text-sm text-muted-foreground mt-2 max-w-md leading-relaxed mx-auto">
-            Describe a trading strategy to get started.
+            {t('welcome.describePrompt')}
           </p>
         </div>
       </div>
@@ -200,7 +248,7 @@ export function WelcomeScreen({ onExample }: Props) {
             key={chip}
             className="px-2.5 py-1 text-xs rounded-full border border-border/60 text-muted-foreground bg-muted/30"
           >
-            {chip}
+            {t(`welcome.capabilities.${CAPABILITY_KEYS[chip]}`)}
           </span>
         ))}
       </div>
@@ -213,7 +261,7 @@ export function WelcomeScreen({ onExample }: Props) {
             <div key={cat.label} className="space-y-2">
               <div className={`flex items-center gap-1.5 text-xs font-medium px-1 ${cat.color.split(" ").filter(c => c.startsWith("text-")).join(" ")}`}>
                 {cat.icon}
-                <span>{cat.label}</span>
+                <span>{t(`welcome.categories.${CATEGORY_KEYS[cat.label]}`)}</span>
               </div>
               <div className="space-y-1.5">
                 {cat.examples.map((ex) => (
@@ -223,10 +271,10 @@ export function WelcomeScreen({ onExample }: Props) {
                     className={`block w-full text-left px-3 py-2.5 rounded-xl border transition-colors ${cat.color}`}
                   >
                     <span className="text-sm font-medium text-foreground leading-snug">
-                      {ex.title}
+                      {t(`welcome.examples.${EXAMPLE_KEYS[ex.title]}`)}
                     </span>
                     <span className="block text-xs text-muted-foreground mt-0.5 leading-snug">
-                      {ex.desc}
+                      {t(`welcome.examples.${EXAMPLE_KEYS[ex.title]}Desc`)}
                     </span>
                   </button>
                 ))}

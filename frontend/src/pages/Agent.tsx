@@ -1245,7 +1245,7 @@ export function Agent() {
             <div className="flex items-center gap-1">
               <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-primary/10 text-primary text-xs font-medium">
                 <Target className="h-3 w-3" />
-                New Research Goal
+                {t('agent.newResearchGoal')}
                 <button type="button" onClick={() => setGoalComposerActive(false)} className="hover:text-destructive transition-colors">
                   <X className="h-3 w-3" />
                 </button>
@@ -1439,7 +1439,7 @@ export function Agent() {
           {uploading && (
             <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <Loader2 className="h-3 w-3 animate-spin" />
-              Uploading...
+              {t('agent.uploading')}
             </div>
           )}
           {/* Persistent kill switch — distinct from the per-turn Stop button
@@ -1449,7 +1449,7 @@ export function Agent() {
               {liveIsHalted ? (
                 <span className="inline-flex items-center gap-1.5 rounded-lg bg-destructive/10 px-2.5 py-1 text-xs font-medium text-destructive">
                   <OctagonX className="h-3 w-3" />
-                  Connector runtime halted
+                  {t('agent.connectorRuntimeHalted')}
                 </span>
               ) : (
                 <button
@@ -1457,10 +1457,10 @@ export function Agent() {
                   onClick={handleHaltLive}
                   disabled={halting}
                   className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/5 px-2.5 py-1 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-40"
-                  title="Instantly halt connector runtime activity"
+                  title={t('agent.haltConnectorRuntimeTitle')}
                 >
                   {halting ? <Loader2 className="h-3 w-3 animate-spin" /> : <OctagonX className="h-3 w-3" />}
-                  Halt connector runtime
+                  {t('agent.haltConnectorRuntime')}
                 </button>
               )}
             </div>
@@ -1473,7 +1473,7 @@ export function Agent() {
                 onClick={() => setShowUploadMenu(prev => !prev)}
                 disabled={status === "streaming" || uploading}
                 className="w-9 h-9 rounded-full border flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted transition-colors disabled:opacity-40 shrink-0"
-                title="More options"
+                title={t('agent.moreOptions')}
               >
                 <Plus className="h-4 w-4" />
               </button>
@@ -1485,7 +1485,7 @@ export function Agent() {
                     className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
                   >
                     <Paperclip className="h-4 w-4" />
-                    Upload PDF document
+                    {t('agent.uploadPdf')}
                   </button>
                   <div className="border-t my-1" />
                   <button
@@ -1499,7 +1499,7 @@ export function Agent() {
                     className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
                   >
                     <Target className="h-4 w-4" />
-                    Research Goal
+                    {t('agent.newResearchGoal')}
                   </button>
                   <button
                     type="button"
@@ -1512,7 +1512,7 @@ export function Agent() {
                     className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
                   >
                     <Users className="h-4 w-4" />
-                    Agent Swarm
+                    {t('agent.runSwarmTeam')}
                   </button>
                   <div className="border-t my-1" />
                   <button
@@ -1524,7 +1524,7 @@ export function Agent() {
                     className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
                   >
                     <Landmark className="h-4 w-4" />
-                    Check Trading Connector
+                    {t('agent.checkConnector')}
                   </button>
                   <button
                     type="button"
@@ -1535,7 +1535,7 @@ export function Agent() {
                     className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
                   >
                     <Landmark className="h-4 w-4" />
-                    Analyze Connector Portfolio
+                    {t('agent.analyzePortfolio')}
                   </button>
                 </div>
               )}
@@ -1581,8 +1581,8 @@ export function Agent() {
               }}
               placeholder={
                 goalComposerActive
-                  ? "Describe the research goal to attach to this session"
-                  : "e.g. Create a dual MA crossover strategy for 000001.SZ, backtest 2024"
+                  ? t('agent.describeGoal')
+                  : t('agent.placeholder')
               }
               className="flex-1 px-4 py-2.5 rounded-xl border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow resize-none max-h-32 overflow-y-auto"
               disabled={status === "streaming"}

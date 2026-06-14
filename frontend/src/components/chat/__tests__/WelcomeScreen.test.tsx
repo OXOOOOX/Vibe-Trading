@@ -1,6 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { WelcomeScreen } from "../WelcomeScreen";
+import i18n from "@/i18n";
 
 describe("WelcomeScreen", () => {
   const onExample = vi.fn();
@@ -40,5 +41,17 @@ describe("WelcomeScreen", () => {
     render(<WelcomeScreen onExample={onExample} />);
     expect(screen.getByText("Describe a trading strategy to get started.")).toBeInTheDocument();
     expect(screen.getByText("Try an example:")).toBeInTheDocument();
+  });
+
+  it("renders translated welcome content in Chinese", async () => {
+    await i18n.changeLanguage("zh-CN");
+    render(<WelcomeScreen onExample={onExample} />);
+
+    expect(screen.getByText("金融技能库")).toBeInTheDocument();
+    expect(screen.getByText("多市场回测")).toBeInTheDocument();
+    expect(screen.getByText("投资委员会评审")).toBeInTheDocument();
+    expect(screen.getByText("描述一个交易策略即可开始。")).toBeInTheDocument();
+
+    await i18n.changeLanguage("en");
   });
 });

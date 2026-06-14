@@ -145,12 +145,12 @@ function BrokerRow({
           {authorized ? (
             <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
               <ShieldCheck className="h-2.5 w-2.5" />
-              Authorized
+              {i18n.t("runnerStatus.authorized")}
             </span>
           ) : (
             <span className="inline-flex items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
               <CircleSlash className="h-2.5 w-2.5" />
-              Not connected
+              {i18n.t("runnerStatus.notConnected")}
             </span>
           )}
         </div>
@@ -163,7 +163,7 @@ function BrokerRow({
         <div className="grid gap-1.5 rounded-md border border-dashed border-primary/30 bg-primary/5 p-2">
           <div className="flex items-center gap-1.5 text-[11px] font-medium text-primary">
             <PlugZap className="h-3 w-3 shrink-0" />
-            Connect this profile to enable connector runtime
+            {i18n.t("runnerStatus.connectProfile")}
           </div>
           <p className="text-[10px] leading-relaxed text-muted-foreground">
             {authorizeInstruction}
@@ -180,16 +180,16 @@ function BrokerRow({
             <div className="rounded-md border bg-background/60 p-2">
               <div className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                 <CircleDot className={["h-2.5 w-2.5", runnerAlive ? "text-emerald-500" : "text-muted-foreground"].join(" ")} />
-                Runner
+                {i18n.t("runnerStatus.runner")}
               </div>
               <div className={["mt-0.5 text-xs font-semibold", runnerAlive ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"].join(" ")}>
-                {runnerAlive ? "Running" : "Stopped"}
+                {runnerAlive ? i18n.t("runnerStatus.runnerRunning") : i18n.t("runnerStatus.runnerStopped")}
               </div>
             </div>
             <div className="rounded-md border bg-background/60 p-2">
               <div className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                 <Activity className="h-2.5 w-2.5" />
-                Last tick
+                {i18n.t("runnerStatus.lastTick")}
               </div>
               <div className="mt-0.5 text-xs font-medium text-foreground">
                 {formatRelative(broker.runner?.last_tick)}
@@ -202,7 +202,7 @@ function BrokerRow({
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                   <ShieldCheck className="h-2.5 w-2.5" />
-                  Active mandate
+                  {i18n.t("runnerStatus.activeMandate")}
                 </div>
                 {mandate.expires_at && (
                   <span
@@ -291,24 +291,26 @@ export const RunnerStatus = memo(function RunnerStatus({ status, unavailable, ha
         type="button"
         onClick={() => setOpen((v) => !v)}
         className="inline-flex max-w-full items-center gap-1.5 justify-self-start rounded-lg bg-primary/10 px-2.5 py-1 text-left text-xs font-medium text-primary transition-colors hover:bg-primary/15"
-        aria-label="Connector runtime status"
+        aria-label={i18n.t("runnerStatus.connectorRuntime")}
         aria-expanded={open}
       >
         <Activity className="h-3 w-3 shrink-0" />
         <span className="shrink-0">{i18n.t("runnerStatus.connectorRuntime")}</span>
         <span className="truncate text-muted-foreground">
-          {authorizedCount > 0 ? `${authorizedCount} connected` : "no connector connected"}
+          {authorizedCount > 0
+            ? i18n.t("runnerStatus.connected", { count: authorizedCount })
+            : i18n.t("runnerStatus.noConnector")}
         </span>
         {anyRunning && !isHalted && (
           <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
             <CircleDot className="h-2.5 w-2.5" />
-            running
+            {i18n.t("runnerStatus.running")}
           </span>
         )}
         {isHalted && (
           <span className="inline-flex items-center gap-1 rounded-full bg-destructive/10 px-1.5 py-0.5 text-[10px] font-medium text-destructive">
             <OctagonX className="h-2.5 w-2.5" />
-            halted
+            {i18n.t("runnerStatus.halted")}
           </span>
         )}
         <ChevronDown className={["h-3 w-3 shrink-0 transition-transform", open ? "rotate-180" : ""].join(" ")} aria-hidden="true" />
