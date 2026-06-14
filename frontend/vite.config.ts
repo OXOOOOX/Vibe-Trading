@@ -11,6 +11,7 @@ const PROXY_PATHS = [
   "/mandate",
   "/live",
   "/upload",
+  "/reports",
   "/shadow-reports",
 ];
 

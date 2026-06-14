@@ -36,13 +36,15 @@ def test_generate_response_pdf_returns_download(monkeypatch) -> None:
     assert "Portfolio_Summary.pdf" in response.headers["content-disposition"]
 
 
-def test_generate_response_pdf_reports_native_library_failure(monkeypatch) -> None:
+def test_generate_response_pdf_falls_back_when_native_library_is_unavailable(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "weasyprint", None)
+    monkeypatch.setattr(api_server, "_render_pdf_reportlab", lambda title, content: b"%PDF-fallback")
     client = TestClient(api_server.app)
 
     response = client.post("/reports/pdf", json={"title": "Report", "content": "Summary"})
 
-    assert response.status_code == 501
+    assert response.status_code == 200
+    assert response.content == b"%PDF-fallback"
 
 
 def test_generate_response_pdf_preserves_colored_emoji_cues(monkeypatch) -> None:
