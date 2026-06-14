@@ -33,7 +33,7 @@ function toForm(settings: LLMSettings): LLMFormState {
 }
 
 export function Settings() {
-  
+
   const [settings, setSettings] = useState<LLMSettings | null>(null);
   const [dataSettings, setDataSettings] = useState<DataSourceSettings | null>(null);
   const [form, setForm] = useState<LLMFormState | null>(null);
