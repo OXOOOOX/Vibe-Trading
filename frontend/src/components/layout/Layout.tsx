@@ -13,6 +13,16 @@ const APP_VERSION = "v0.1.9";
 
 export function Layout() {
   const { t, i18n: i18nHook } = useTranslation();
+  const isChinese = i18nHook.resolvedLanguage?.startsWith("zh") ?? i18nHook.language.startsWith("zh");
+
+  const switchLanguage = async () => {
+    const nextLanguage = isChinese ? "en" : "zh-CN";
+    await i18nHook.changeLanguage(nextLanguage);
+    document.documentElement.lang = nextLanguage;
+    // Several legacy screens call the i18n singleton outside React hooks.
+    // Reload after persisting the choice so those modules initialize in the new language.
+    window.location.reload();
+  };
 
   const NAV = [
     { to: "/", icon: BarChart3, label: t('layout.home') },
@@ -116,7 +126,7 @@ export function Layout() {
             <div className="flex items-center justify-between px-4 py-2">
               <span className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
                 <MessageSquare className="h-3.5 w-3.5" />
-                Sessions
+                {t('layout.sessions')}
               </span>
               <Link
                 to="/agent"
@@ -228,7 +238,7 @@ export function Layout() {
                   className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
                 >
                   {dark ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
-                  {dark ? "Light" : "Dark"}
+                  {dark ? t('layout.light') : t('layout.dark')}
                 </button>
                 <div className="flex items-center gap-1">
                   <button
@@ -242,11 +252,11 @@ export function Layout() {
               </div>
               <div className="flex items-center justify-between">
                 <button
-                  onClick={() => { i18nHook.changeLanguage(i18nHook.language === "zh-CN" ? "en" : "zh-CN"); }}
+                  onClick={switchLanguage}
                   className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
                 >
                   <Languages className="h-3.5 w-3.5" />
-                  {i18nHook.language === "zh-CN" ? "English" : "中文"}
+                  {isChinese ? "English" : "中文"}
                 </button>
                 <p className="text-xs text-muted-foreground/60">{APP_VERSION}</p>
               </div>

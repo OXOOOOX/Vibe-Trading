@@ -51,7 +51,7 @@ export function Correlation() {
             className="w-full px-3 py-2 rounded-md border bg-background text-sm"
           />
           <p className="text-xs text-muted-foreground">
-            Comma-separated ticker symbols, e.g. BTC-USDT,ETH-USDT,AAPL,SPY
+            {i18n.t("correlation.assetCodesHint")}
           </p>
         </div>
 
