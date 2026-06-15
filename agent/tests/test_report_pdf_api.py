@@ -59,6 +59,16 @@ def test_reportlab_fallback_embeds_available_cjk_font() -> None:
         assert b"/FontFile2" in pdf
 
 
+def test_reportlab_fallback_renders_markdown_table() -> None:
+    pdf = api_server._render_pdf_reportlab(
+        "Markdown Report",
+        "# Summary\n\n**Important** result.\n\n| Metric | Value |\n|---|---|\n| Sharpe | 1.25 |",
+    )
+
+    assert pdf.startswith(b"%PDF-")
+    assert len(pdf) > 1_000
+
+
 def test_generate_response_pdf_preserves_colored_emoji_cues(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "weasyprint", SimpleNamespace(HTML=_FakeHTML))
     client = TestClient(api_server.app)

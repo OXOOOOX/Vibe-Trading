@@ -2077,7 +2077,7 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.cidfonts import UnicodeCIDFont
     from reportlab.pdfbase.ttfonts import TTFont
-    from reportlab.platypus import Paragraph, Preformatted, SimpleDocTemplate, Spacer
+    from reportlab.platypus import Paragraph, Preformatted, SimpleDocTemplate, Spacer, Table, TableStyle
 
     font_name = "STSong-Light"
     font_candidates = (
@@ -2093,6 +2093,13 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
         try:
             font_name = "VibeTradingCJK"
             pdfmetrics.registerFont(TTFont(font_name, str(font_path)))
+            pdfmetrics.registerFontFamily(
+                font_name,
+                normal=font_name,
+                bold=font_name,
+                italic=font_name,
+                boldItalic=font_name,
+            )
             break
         except Exception:
             logger.debug("Unable to register PDF fallback font %s", font_path, exc_info=True)
@@ -2109,7 +2116,13 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
         textColor=colors.HexColor("#172033"),
         spaceAfter=5,
     )
-    heading = ParagraphStyle("CJKHeading", parent=base, fontSize=16, leading=21, spaceBefore=10, spaceAfter=8)
+    heading_styles = {
+        1: ParagraphStyle("CJKH1", parent=base, fontSize=18, leading=23, spaceBefore=13, spaceAfter=9),
+        2: ParagraphStyle("CJKH2", parent=base, fontSize=15, leading=20, spaceBefore=11, spaceAfter=7),
+        3: ParagraphStyle("CJKH3", parent=base, fontSize=12.5, leading=18, spaceBefore=9, spaceAfter=5),
+        4: ParagraphStyle("CJKH4", parent=base, fontSize=11, leading=16, spaceBefore=7, spaceAfter=4),
+    }
+    heading = heading_styles[2]
     title_style = ParagraphStyle(
         "CJKTitle",
         parent=heading,
@@ -2128,6 +2141,68 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
         borderWidth=0.5,
         borderPadding=6,
     )
+    quote_style = ParagraphStyle(
+        "CJKQuote",
+        parent=base,
+        leftIndent=10,
+        borderColor=colors.HexColor("#60a5fa"),
+        borderWidth=0,
+        borderLeftWidth=2,
+        borderPadding=7,
+        textColor=colors.HexColor("#475569"),
+        backColor=colors.HexColor("#f8fafc"),
+    )
+    table_header_style = ParagraphStyle(
+        "CJKTableHeader",
+        parent=base,
+        fontSize=9,
+        leading=13,
+        textColor=colors.HexColor("#1e3a8a"),
+    )
+    table_cell_style = ParagraphStyle("CJKTableCell", parent=base, fontSize=9, leading=13)
+
+    def inline_markdown(value: str) -> str:
+        rendered = html.escape(value.strip())
+        rendered = re.sub(r"`([^`]+)`", r'<font face="Courier">\1</font>', rendered)
+        rendered = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", rendered)
+        rendered = re.sub(r"__([^_]+)__", r"<b>\1</b>", rendered)
+        rendered = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", rendered)
+        rendered = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r'<link href="\2" color="#2563eb">\1</link>', rendered)
+        return rendered
+
+    def table_cells(line: str) -> list[str]:
+        return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+    def is_table_separator(line: str) -> bool:
+        cells = table_cells(line)
+        return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells)
+
+    def append_table(lines: list[str]) -> None:
+        rows = [table_cells(line) for line in lines]
+        if len(rows) > 1 and is_table_separator(lines[1]):
+            rows.pop(1)
+        column_count = max(len(row) for row in rows)
+        normalized = [row + [""] * (column_count - len(row)) for row in rows]
+        data = [
+            [
+                Paragraph(inline_markdown(cell), table_header_style if row_index == 0 else table_cell_style)
+                for cell in row
+            ]
+            for row_index, row in enumerate(normalized)
+        ]
+        available_width = A4[0] - 36 * mm
+        table = Table(data, colWidths=[available_width / column_count] * column_count, repeatRows=1)
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eff6ff")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#1e3a8a")),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.extend([table, Spacer(1, 7)])
     buffer = BytesIO()
     document = SimpleDocTemplate(
         buffer,
@@ -2145,30 +2220,53 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
     ]
     in_code = False
     code_lines: list[str] = []
-    for raw_line in content.splitlines():
+    content_lines = content.splitlines()
+    line_index = 0
+    while line_index < len(content_lines):
+        raw_line = content_lines[line_index]
         line = raw_line.rstrip()
         if line.startswith("```"):
             if in_code:
                 story.append(Preformatted("\n".join(code_lines), code_style))
                 code_lines = []
             in_code = not in_code
+            line_index += 1
             continue
         if in_code:
             code_lines.append(line)
+            line_index += 1
             continue
         if not line:
             story.append(Spacer(1, 5))
+            line_index += 1
             continue
         heading_match = re.match(r"^(#{1,4})\s+(.*)$", line)
         if heading_match:
-            story.append(Paragraph(html.escape(heading_match.group(2)), heading))
+            level = len(heading_match.group(1))
+            story.append(Paragraph(inline_markdown(heading_match.group(2)), heading_styles[level]))
+            line_index += 1
             continue
-        if line.startswith("|") or line.startswith(">"):
-            story.append(Preformatted(line, code_style))
+        if line.startswith("|"):
+            table_lines = [line]
+            line_index += 1
+            while line_index < len(content_lines) and content_lines[line_index].strip().startswith("|"):
+                table_lines.append(content_lines[line_index].strip())
+                line_index += 1
+            append_table(table_lines)
             continue
-        if re.match(r"^\s*[-*]\s+", line):
-            line = "• " + re.sub(r"^\s*[-*]\s+", "", line)
-        story.append(Paragraph(html.escape(line), base))
+        if line.startswith(">"):
+            story.append(Paragraph(inline_markdown(re.sub(r"^>\s?", "", line)), quote_style))
+            line_index += 1
+            continue
+        bullet_match = re.match(r"^\s*[-*+]\s+(.*)$", line)
+        numbered_match = re.match(r"^\s*(\d+)[.)]\s+(.*)$", line)
+        if bullet_match:
+            story.append(Paragraph(inline_markdown(bullet_match.group(1)), base, bulletText="•"))
+        elif numbered_match:
+            story.append(Paragraph(inline_markdown(numbered_match.group(2)), base, bulletText=f"{numbered_match.group(1)}."))
+        else:
+            story.append(Paragraph(inline_markdown(line), base))
+        line_index += 1
     if code_lines:
         story.append(Preformatted("\n".join(code_lines), code_style))
     document.build(story)
