@@ -2068,6 +2068,7 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
     """Render a portable PDF fallback that does not require GTK/Pango."""
     import html
     from io import BytesIO
+    from pathlib import Path
 
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
@@ -2075,14 +2076,34 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
     from reportlab.lib.units import mm
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.platypus import Paragraph, Preformatted, SimpleDocTemplate, Spacer
 
-    pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+    font_name = "STSong-Light"
+    font_candidates = (
+        Path("C:/Windows/Fonts/simhei.ttf"),
+        Path("C:/Windows/Fonts/msyh.ttc"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
+        Path("/System/Library/Fonts/PingFang.ttc"),
+    )
+    for font_path in font_candidates:
+        if not font_path.is_file():
+            continue
+        try:
+            font_name = "VibeTradingCJK"
+            pdfmetrics.registerFont(TTFont(font_name, str(font_path)))
+            break
+        except Exception:
+            logger.debug("Unable to register PDF fallback font %s", font_path, exc_info=True)
+    else:
+        pdfmetrics.registerFont(UnicodeCIDFont(font_name))
+
     styles = getSampleStyleSheet()
     base = ParagraphStyle(
         "CJKBody",
         parent=styles["BodyText"],
-        fontName="STSong-Light",
+        fontName=font_name,
         fontSize=10.5,
         leading=16,
         textColor=colors.HexColor("#172033"),

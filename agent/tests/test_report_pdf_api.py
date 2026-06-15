@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -45,6 +46,17 @@ def test_generate_response_pdf_falls_back_when_native_library_is_unavailable(mon
 
     assert response.status_code == 200
     assert response.content == b"%PDF-fallback"
+
+
+def test_reportlab_fallback_embeds_available_cjk_font() -> None:
+    pdf = api_server._render_pdf_reportlab(
+        "中文报告",
+        "# 摘要\n\n这是中文正文。\n\n| 指标 | 数值 |\n|---|---|\n| 收益率 | 12.3% |",
+    )
+
+    assert pdf.startswith(b"%PDF-")
+    if Path("C:/Windows/Fonts/simhei.ttf").is_file():
+        assert b"/FontFile2" in pdf
 
 
 def test_generate_response_pdf_preserves_colored_emoji_cues(monkeypatch) -> None:
