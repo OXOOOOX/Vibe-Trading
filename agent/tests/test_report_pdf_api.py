@@ -39,6 +39,7 @@ def test_generate_response_pdf_returns_download(monkeypatch) -> None:
 
 def test_generate_response_pdf_falls_back_when_native_library_is_unavailable(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "weasyprint", None)
+    monkeypatch.setattr(api_server, "_render_pdf_chromium", lambda document: (_ for _ in ()).throw(OSError("missing")))
     monkeypatch.setattr(api_server, "_render_pdf_reportlab", lambda title, content: b"%PDF-fallback")
     client = TestClient(api_server.app)
 
@@ -46,6 +47,18 @@ def test_generate_response_pdf_falls_back_when_native_library_is_unavailable(mon
 
     assert response.status_code == 200
     assert response.content == b"%PDF-fallback"
+
+
+def test_generate_response_pdf_uses_chromium_before_reportlab(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "weasyprint", None)
+    monkeypatch.setattr(api_server, "_render_pdf_chromium", lambda document: b"%PDF-chromium")
+    monkeypatch.setattr(api_server, "_render_pdf_reportlab", lambda title, content: b"%PDF-reportlab")
+    client = TestClient(api_server.app)
+
+    response = client.post("/reports/pdf", json={"title": "Report", "content": "✅ Summary"})
+
+    assert response.status_code == 200
+    assert response.content == b"%PDF-chromium"
 
 
 def test_reportlab_fallback_embeds_available_cjk_font() -> None:

@@ -13,7 +13,10 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
+import subprocess
+import tempfile
 import time
 import csv
 import uuid
@@ -2326,6 +2329,57 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
     return buffer.getvalue()
 
 
+def _render_pdf_chromium(document: str) -> bytes:
+    """Render HTML to PDF through an installed Chromium browser."""
+    browser_candidates = [
+        os.environ.get("CHROMIUM_PATH"),
+        os.environ.get("CHROME_PATH"),
+        os.environ.get("EDGE_PATH"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        shutil.which("google-chrome"),
+        shutil.which("chrome"),
+        shutil.which("msedge"),
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ]
+    browser_path = next((Path(path) for path in browser_candidates if path and Path(path).is_file()), None)
+    if browser_path is None:
+        raise FileNotFoundError("No Chromium browser found for PDF rendering")
+
+    html_file = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".html", delete=False)
+    html_path = Path(html_file.name)
+    pdf_path = html_path.with_suffix(".pdf")
+    try:
+        html_file.write(document)
+        html_file.close()
+        command = [
+            str(browser_path),
+            "--headless=new",
+            "--disable-gpu",
+            "--no-pdf-header-footer",
+            f"--print-to-pdf={pdf_path}",
+            html_path.as_uri(),
+        ]
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=45, check=False)
+        if completed.returncode != 0:
+            raise RuntimeError((completed.stderr or completed.stdout or "Chromium PDF rendering failed").strip())
+        pdf = pdf_path.read_bytes()
+        if not pdf.startswith(b"%PDF-"):
+            raise RuntimeError("Chromium did not produce a valid PDF")
+        return pdf
+    finally:
+        html_file.close()
+        for path in (html_path, pdf_path):
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                logger.debug("Unable to remove temporary PDF render file %s", path, exc_info=True)
+
+
 @app.post("/reports/pdf", dependencies=[Depends(require_auth)])
 async def generate_response_pdf(payload: GeneratePdfRequest):
     """Render one assistant response as a downloadable PDF report."""
@@ -2387,11 +2441,15 @@ blockquote {{ border-left: 3px solid #60a5fa; margin-left: 0; padding-left: 12px
 
         pdf = HTML(string=document).write_pdf()
     except (ImportError, OSError):
-        logger.warning("WeasyPrint native dependencies unavailable; using ReportLab fallback")
+        logger.warning("WeasyPrint native dependencies unavailable; using Chromium PDF fallback")
         try:
-            pdf = _render_pdf_reportlab(payload.title, payload.content)
-        except (ImportError, OSError) as exc:
-            raise HTTPException(status_code=501, detail="PDF rendering dependencies are unavailable") from exc
+            pdf = _render_pdf_chromium(document)
+        except Exception:
+            logger.warning("Chromium PDF fallback unavailable; using ReportLab fallback", exc_info=True)
+            try:
+                pdf = _render_pdf_reportlab(payload.title, payload.content)
+            except (ImportError, OSError) as exc:
+                raise HTTPException(status_code=501, detail="PDF rendering dependencies are unavailable") from exc
     except Exception as exc:
         logger.exception("PDF rendering failed")
         raise HTTPException(status_code=500, detail="PDF rendering failed") from exc
