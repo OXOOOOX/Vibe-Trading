@@ -69,6 +69,16 @@ def test_reportlab_fallback_renders_markdown_table() -> None:
     assert len(pdf) > 1_000
 
 
+def test_reportlab_fallback_replaces_emoji_with_text_badges() -> None:
+    pdf = api_server._render_pdf_reportlab(
+        "Signals",
+        "✅ 看多\n❌ 风险\n⚠️ 谨慎\n🎯 目标\n📈 上行\n🧪 未知图标",
+    )
+
+    assert pdf.startswith(b"%PDF-")
+    assert len(pdf) > 1_000
+
+
 def test_generate_response_pdf_preserves_colored_emoji_cues(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "weasyprint", SimpleNamespace(HTML=_FakeHTML))
     client = TestClient(api_server.app)
