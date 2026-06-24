@@ -82,6 +82,14 @@ agent/tests/test_e2e_*.py
 # Local working notes
 NOTES.md
 
+# Local PDF/render validation artifacts
+/*.pdf
+/*.png
+/*.log
+/tmp_out.txt
+/agent/*.pdf
+/agent/pdf-request.json
+
 # Agent tool aliases (auto-generated mirror of CLAUDE.md)
 AGENTS.md
 
