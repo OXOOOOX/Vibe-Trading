@@ -20,6 +20,7 @@ import tempfile
 import time
 import csv
 import uuid
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -31,6 +32,7 @@ from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from rich.console import Console
 
+from cli._version import __version__ as APP_VERSION
 from src.goal.context import default_goal_criteria
 from src.ui_services import build_run_analysis, load_run_context
 
@@ -363,7 +365,7 @@ class CommitMandateRequest(BaseModel):
     """
 
     broker: str = Field(..., min_length=1, max_length=64)
-    proposal_id: str = Field(..., min_length=1, max_length=128)
+    proposal_id: str = Field(..., pattern=r"^mp_[0-9a-f]{32}$")
     selected_ordinal: int = Field(..., ge=1, le=10)
     adjustments: Optional[Dict[str, Any]] = None
     consent_ack: bool = Field(..., description="Explicit affirmative; must be true")
@@ -474,7 +476,7 @@ class LiveStatusResponse(BaseModel):
 app = FastAPI(
     title="Vibe-Trading API",
     description="Vibe-Trading API: natural-language finance research, backtesting, and swarm workflows",
-    version="5.0.0",
+    version=APP_VERSION,
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -487,6 +489,16 @@ _DEFAULT_CORS_ORIGINS = [
     "http://127.0.0.1:5173",
     "http://127.0.0.1:8000",
 ]
+
+_DEFAULT_LOOPBACK_HOSTS = frozenset({
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "[::1]",
+    # Starlette/FastAPI TestClient default host; included so unit tests exercise
+    # the API without having to override Host on every request.
+    "testserver",
+})
 
 
 def _parse_cors_origins(raw: Optional[str]) -> List[str]:
@@ -514,6 +526,37 @@ def _parse_cors_origins(raw: Optional[str]) -> List[str]:
     return origins
 
 
+def _parse_extra_loopback_hosts(raw: Optional[str]) -> set[str]:
+    """Return additional trusted Host names for loopback API traffic."""
+    if raw is None or not raw.strip():
+        return set()
+    return {host.strip().lower().rstrip(".") for host in raw.split(",") if host.strip()}
+
+
+_EXTRA_LOOPBACK_HOSTS = _parse_extra_loopback_hosts(os.getenv("API_ALLOWED_HOSTS"))
+
+
+def _host_without_port(host: str) -> str:
+    """Normalize a Host header to a lowercase hostname without a port."""
+    value = host.strip().lower().rstrip(".")
+    if not value:
+        return ""
+    if value.startswith("["):
+        end = value.find("]")
+        if end != -1:
+            return value[: end + 1]
+        return value
+    if value.count(":") == 1:
+        return value.rsplit(":", 1)[0]
+    return value
+
+
+def _is_allowed_loopback_host(host: str) -> bool:
+    """Return whether ``host`` is allowed for loopback-trusted API requests."""
+    normalized = _host_without_port(host)
+    return normalized in _DEFAULT_LOOPBACK_HOSTS or normalized in _EXTRA_LOOPBACK_HOSTS
+
+
 # CORS: override with CORS_ORIGINS (comma-separated explicit origins)
 _CORS_ORIGINS = _parse_cors_origins(os.getenv("CORS_ORIGINS"))
 
@@ -524,6 +567,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _reject_untrusted_loopback_host(request: Request, call_next):
+    """Block DNS-rebinding Host headers before loopback auth bypasses run."""
+    if _is_local_client(request) and not _is_allowed_loopback_host(request.headers.get("host", "")):
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={"detail": "Untrusted local API host"},
+        )
+    return await call_next(request)
 
 
 # ----------------------------------------------------------------------------
@@ -587,6 +641,13 @@ async def _run_startup_preflight() -> None:
     from src.preflight import run_preflight
 
     run_preflight(console)
+    _start_scheduled_research_executor()
+
+
+@app.on_event("shutdown")
+async def _stop_scheduled_research_on_shutdown() -> None:
+    """Stop the scheduled research executor on server shutdown."""
+    await _stop_scheduled_research_executor()
 
 
 # ============================================================================
@@ -654,6 +715,68 @@ def _auth_credential_from_header_or_query(
     return ""
 
 
+def _is_loopback_origin(origin: str) -> bool:
+    """Return whether a browser Origin header names a loopback web UI."""
+    try:
+        parsed = urllib.parse.urlsplit(origin)
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    host = parsed.hostname.rstrip(".").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _reject_cross_site_browser_request(request: Request) -> None:
+    """Reject unsafe browser requests from non-loopback origins.
+
+    CORS protects response reads, not blind form/fetch side effects. Keep local
+    CLI/curl clients working while refusing browser-originated cross-site POSTs
+    to local control-plane actions such as shutdown.
+    """
+    sec_fetch_site = request.headers.get("sec-fetch-site", "").lower()
+    if sec_fetch_site == "cross-site":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-site request denied")
+
+    origin = request.headers.get("origin")
+    if origin and not _is_loopback_origin(origin):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-site request denied")
+
+
+def _require_shutdown_authorization(
+    *,
+    request: Request,
+    cred: Optional[HTTPAuthorizationCredentials],
+) -> None:
+    """Authorize the local shutdown control-plane action.
+
+    Loopback peer IP alone is not enough for this browser-reachable, destructive
+    action. When API_AUTH_KEY is configured, require the Bearer token even for
+    loopback requests; otherwise preserve local dev-mode shutdown for direct
+    loopback clients while rejecting cross-site browser requests.
+    """
+    _reject_cross_site_browser_request(request)
+    api_key = _configured_api_key()
+    if api_key:
+        token = _auth_credential_from_header_or_query(cred, None, allow_query=False)
+        if not token or not hmac.compare_digest(token, api_key):
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        return
+    if not _is_local_client(request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API_AUTH_KEY is required for non-local API access",
+        )
+
+
+_SAFE_BROWSER_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
 def _validate_api_auth(
     *,
     request: Request,
@@ -662,6 +785,12 @@ def _validate_api_auth(
     allow_query: bool = False,
 ) -> None:
     """Validate configured auth, preserving loopback-only dev mode."""
+    # CORS protects response reads, not blind side effects. Reject unsafe
+    # browser-originated cross-site requests before honoring loopback dev-mode
+    # trust, otherwise a malicious page can drive local POST/PUT/DELETE routes.
+    if request.method.upper() not in _SAFE_BROWSER_METHODS:
+        _reject_cross_site_browser_request(request)
+
     # Loopback clients are always trusted, even when API_AUTH_KEY is set.
     # The key only gates non-local (LAN/remote) access.
     if _is_local_client(request):
@@ -740,7 +869,12 @@ def _env_shell_tools_enabled() -> bool:
 
 def _shell_tools_enabled_for_request(request: Request) -> bool:
     """Return whether this API request may expose shell tools to the agent."""
-    return _is_local_client(request) or _env_shell_tools_enabled()
+    # Shell-capable tools execute commands on the host as the API process user.
+    # Do not infer that privilege from peer IP alone: browser DNS rebinding can
+    # make attacker-controlled pages appear as loopback clients. Operators who
+    # intentionally want API-started agents or swarm workers to receive shell
+    # tools must opt in explicitly.
+    return _env_shell_tools_enabled()
 
 
 async def require_local_or_auth(
@@ -760,6 +894,31 @@ async def require_local_or_auth(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Settings access requires API_AUTH_KEY or a local loopback client",
+        )
+
+
+async def require_settings_write_auth(
+    request: Request,
+    cred: Optional[HTTPAuthorizationCredentials] = Security(_security),
+) -> None:
+    """Require explicit authorization before changing credential-routing settings.
+
+    Settings writes can redirect stored provider credentials to a different
+    endpoint. When an API key is configured, loopback peer IP alone is not a
+    sufficient user-intent signal because a browser can reach local APIs after
+    DNS rebinding.
+    """
+    api_key = _configured_api_key()
+    if api_key:
+        token = _auth_credential_from_header_or_query(cred, None, allow_query=False)
+        if not token or not hmac.compare_digest(token, api_key):
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        return
+
+    if not _is_local_client(request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Settings writes require API_AUTH_KEY or a local loopback client",
         )
 
 
@@ -1418,7 +1577,7 @@ async def get_llm_settings():
     return _build_llm_settings_response()
 
 
-@app.put("/settings/llm", response_model=LLMSettingsResponse, dependencies=[Depends(require_local_or_auth)])
+@app.put("/settings/llm", response_model=LLMSettingsResponse, dependencies=[Depends(require_settings_write_auth)])
 async def update_llm_settings(payload: UpdateLLMSettingsRequest):
     """Persist project-local LLM settings and update the running process."""
     provider_name = payload.provider.strip().lower()
@@ -1489,7 +1648,7 @@ async def get_data_source_settings():
 @app.put(
     "/settings/data-sources",
     response_model=DataSourceSettingsResponse,
-    dependencies=[Depends(require_local_or_auth)],
+    dependencies=[Depends(require_settings_write_auth)],
 )
 async def update_data_source_settings(payload: UpdateDataSourceSettingsRequest):
     """Persist project-local data source credentials and update the running process."""
@@ -1560,9 +1719,14 @@ def _terminate_current_process() -> None:
     os.kill(os.getpid(), signal.SIGTERM)
 
 
-@app.post("/system/shutdown", dependencies=[Depends(require_auth)])
-async def shutdown_local_api(background_tasks: BackgroundTasks, request: Request):
-    """Shut down the local API server when requested from loopback clients."""
+@app.post("/system/shutdown")
+async def shutdown_local_api(
+    background_tasks: BackgroundTasks,
+    request: Request,
+    cred: Optional[HTTPAuthorizationCredentials] = Security(_security),
+):
+    """Shut down the local API server after explicit local authorization."""
+    _require_shutdown_authorization(request=request, cred=cred)
     client_host = request.client.host if request.client else ""
     if client_host not in {"127.0.0.1", "::1", "localhost"}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Local access only")
@@ -1595,7 +1759,7 @@ async def api_info():
     """Service metadata."""
     return {
         "service": "Vibe-Trading API",
-        "version": "5.0.0",
+        "version": APP_VERSION,
         "docs": "/docs",
         "health": "/health",
     }
@@ -2790,7 +2954,7 @@ def _emit_live_event(session_id: Optional[str], event_type: str, data: Dict[str,
 # ``mandate.proposal`` frame. No protected touch.
 
 _PROPOSAL_TOOL_NAME = "propose_mandate_profiles"
-_PROPOSAL_ID_RE = re.compile(r'"proposal_id"\s*:\s*"(mp_[0-9a-zA-Z]+)"')
+_PROPOSAL_ID_RE = re.compile(r'"proposal_id"\s*:\s*"(mp_[0-9a-f]{32})"')
 
 
 def _load_full_proposal(proposal_id: str) -> Optional[Dict[str, Any]]:
@@ -3527,6 +3691,166 @@ async def stop_runner_endpoint(payload: LiveRunnerControlRequest):
 
 from src.api.alpha_routes import register_alpha_routes  # noqa: E402
 register_alpha_routes(app)
+
+
+# ============================================================================
+# Scheduled Research Routes
+# ============================================================================
+#
+# Lightweight CRUD endpoints backed by ScheduledResearchJobStore. The endpoint
+# handlers only record and expose jobs; the optional executor lifecycle is
+# guarded separately by VIBE_TRADING_ENABLE_SCHEDULER.
+
+
+_SCHEDULED_RESEARCH_SCHEDULER_ENV = "VIBE_TRADING_ENABLE_SCHEDULER"
+_SCHEDULED_RESEARCH_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+_scheduled_research_store: Optional["ScheduledResearchJobStore"] = None
+_scheduled_research_executor: Optional["ScheduledResearchExecutor"] = None
+
+
+def _get_scheduled_research_store() -> "ScheduledResearchJobStore":
+    """Return the singleton ScheduledResearchJobStore, creating it on first call."""
+    global _scheduled_research_store
+    if _scheduled_research_store is None:
+        from src.scheduled_research.store import ScheduledResearchJobStore
+
+        _scheduled_research_store = ScheduledResearchJobStore()
+    return _scheduled_research_store
+
+
+def _scheduled_research_scheduler_enabled() -> bool:
+    """Return whether scheduled research execution is enabled."""
+    return os.getenv(_SCHEDULED_RESEARCH_SCHEDULER_ENV, "").strip().lower() in _SCHEDULED_RESEARCH_TRUE_VALUES
+
+
+async def _dispatch_scheduled_research_job(job: "ScheduledResearchJob") -> None:
+    """Enqueue one scheduled research job through the session runtime.
+
+    ``send_message`` queues the agent attempt and returns once accepted; it
+    does not wait for that agent run to reach a terminal status. The executor's
+    ``COMPLETED`` state for this dispatch path means "successfully enqueued."
+    """
+    svc = _get_session_service()
+    if not svc:
+        raise RuntimeError("Session runtime not enabled")
+    # Pass a copy so the session runtime's internal config writes (e.g.
+    # include_shell_tools) do not mutate the persisted scheduled-run config.
+    session = svc.create_session(title=f"scheduled-research:{job.id}", config=dict(job.config))
+    logger.info("dispatching scheduled research job %s via session %s", job.id, session.session_id)
+    await svc.send_message(session.session_id, job.prompt)
+
+
+def _get_scheduled_research_executor() -> "ScheduledResearchExecutor":
+    """Return the singleton scheduled research executor."""
+    global _scheduled_research_executor
+    if _scheduled_research_executor is None:
+        from src.scheduled_research.executor import ScheduledResearchExecutor
+
+        _scheduled_research_executor = ScheduledResearchExecutor(
+            _get_scheduled_research_store(),
+            _dispatch_scheduled_research_job,
+            enabled=_scheduled_research_scheduler_enabled(),
+        )
+    return _scheduled_research_executor
+
+
+def _start_scheduled_research_executor() -> None:
+    """Start scheduled research execution when explicitly enabled."""
+    if not _scheduled_research_scheduler_enabled():
+        return
+    _get_scheduled_research_executor().start()
+
+
+async def _stop_scheduled_research_executor() -> None:
+    """Stop scheduled research execution if it was started."""
+    executor = _scheduled_research_executor
+    if executor is not None:
+        await executor.stop()
+
+
+class CreateScheduledRunRequest(BaseModel):
+    """Request body for POST /scheduled-runs."""
+
+    id: Optional[str] = Field(None, description="Job id; auto-generated UUID when omitted")
+    prompt: str = Field(..., min_length=1, description="Research prompt or backtest description")
+    schedule: str = Field(..., min_length=1, description="Interval-ms or 5-field cron expression")
+    next_run_at: Optional[int] = Field(None, description="Epoch-ms for next run; defaults to now")
+    config: Dict[str, Any] = Field(default_factory=dict, description="Optional backtest parameters")
+
+
+class ScheduledRunResponse(BaseModel):
+    """API response for a single scheduled job."""
+
+    id: str
+    prompt: str
+    schedule: str
+    next_run_at: int
+    status: str
+    created_at: int
+    config: Dict[str, Any] = Field(default_factory=dict)
+
+
+@app.post(
+    "/scheduled-runs",
+    response_model=ScheduledRunResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_auth)],
+)
+async def create_scheduled_run(request: CreateScheduledRunRequest) -> ScheduledRunResponse:
+    """Create (or replace) a scheduled research job.
+
+    The job is persisted immediately. No execution is triggered.
+    """
+    import time
+
+    from src.scheduled_research.models import JobStatus, ScheduledResearchJob
+    from src.scheduled_research.models import validate_schedule
+
+    try:
+        validate_schedule(request.schedule)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    now_ms = int(time.time() * 1000)
+    job = ScheduledResearchJob(
+        id=request.id or str(uuid.uuid4()),
+        prompt=request.prompt,
+        schedule=request.schedule,
+        next_run_at=request.next_run_at if request.next_run_at is not None else now_ms,
+        status=JobStatus.PENDING,
+        created_at=now_ms,
+        config=request.config,
+    )
+    _get_scheduled_research_store().upsert(job)
+    return ScheduledRunResponse(**job.to_dict())
+
+
+@app.get(
+    "/scheduled-runs",
+    response_model=List[ScheduledRunResponse],
+    dependencies=[Depends(require_auth)],
+)
+async def list_scheduled_runs(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    limit: int = Query(50, ge=1, le=200),
+) -> List[ScheduledRunResponse]:
+    """List scheduled research jobs, optionally filtered by status."""
+    jobs = _get_scheduled_research_store().list_jobs(status=status_filter, limit=limit)
+    return [ScheduledRunResponse(**j.to_dict()) for j in jobs]
+
+
+@app.delete(
+    "/scheduled-runs/{job_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_auth)],
+)
+async def delete_scheduled_run(job_id: str) -> None:
+    """Cancel (delete) a scheduled research job by id."""
+    _validate_path_param(job_id, "job_id")
+    removed = _get_scheduled_research_store().delete(job_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"scheduled run {job_id} not found")
 
 
 # ============================================================================
