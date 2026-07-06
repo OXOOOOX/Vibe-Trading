@@ -4,156 +4,157 @@ category: strategy
 description: "Buy-side discipline system. For each holding, maintain a written investment thesis — core thesis in 5 sentences, falsifiable assumptions, red lines, valuation anchors — and re-check it each quarter against new earnings/events. Scores thesis health 1-10 from assumption breakage and red-line triggers, and recommends hold / add / trim / exit. Use it right after buying a stock (to write the thesis) and every earnings season (to check it). Bridges the research→buy→monitor gap that most investors skip."
 ---
 
-# 投资论文追踪:买入后的纪律系统
+# Investment Thesis Tracker: Post-Buy Discipline
 
-对一只持仓执行投资论文追踪。首次对一个公司使用 → 建立论文;后续使用 → 季度检查。
+Track an investment thesis for a holding. First use on a company → build the thesis; later uses → quarterly check.
 
-**支持输入**:公司名(自动判断建立/追踪);`公司名 建立论文`(强制重建);`公司名 季度检查`(基于最新财报)。
+**Supported input**: company name (auto-decide build vs track); `company build` (force rebuild); `company quarterly check` (against latest earnings).
 
-> "买入只是开始。真正的工作是持有期间的持续跟踪。" —— 李录
+> "Buying is only the beginning. The real work is continuous tracking through the holding period." — Li Lu
 >
-> "当事实改变时,我就改变想法。你呢?" —— 凯恩斯
+> "When the facts change, I change my mind. What do you do, sir?" — Keynes
 
-## 设计理念
+## Design Philosophy
 
-大多数投资者的流程是:研究 → 买入 → 祈祷。缺少买入后的系统化跟踪,导致:该卖时舍不得卖("再等等,会涨回来");不该卖时恐慌卖出("跌了 20%,是不是我错了");忘记当初为什么买("我买这个是因为什么来着?")。
+Most investors' process is: research → buy → pray. Without systematic post-buy tracking, they: refuse to sell when they should ("wait, it'll come back"); panic-sell when they shouldn't ("down 20%, was I wrong?"); forget why they bought ("why did I buy this again?").
 
-巴菲特和李录的做法是:**买入前就写下卖出条件**,然后每个季度检查论文是否完整。
+Buffett and Li Lu write down sell conditions **before** buying, then check the thesis each quarter.
 
-## 第一步:判断操作模式
+## Step 1: Decide the Mode
 
-检查该公司是否已存在论文文件(用 `read_file` 读 `reports/{公司}-thesis.md`):不存在 → **建立论文**(模式 A);存在 → **追踪检查**(模式 B)。
+Check whether a thesis file already exists (use `read_file` on `reports/{company}-thesis.md`): not found → **Build** (Mode A); found → **Track** (Mode B).
 
 ---
 
-## 模式 A:建立投资论文
+## Mode A: Build the Investment Thesis
 
-### A0:数据收集
+### A0: Data Collection
 
-用 `web_search` 获取当前股价、估值指标(PE/PB/股息率)、最新财报核心数据。如果已有该公司的研究报告,优先 `read_file` 读取。用 `financial_rigor`(`command=verify_valuation`)校验估值数据,`financial_rigor`(`command=verify_market_cap`)核验市值。
+Use `web_search` to get the current price, valuation (PE/PB/dividend yield), and latest financials. If a research report exists, `read_file` it first. Use `financial_rigor` (`command=verify_valuation`) to verify valuation, `financial_rigor` (`command=verify_market_cap`) to sanity-check market cap.
 
-### A1:核心论文(必须用 200 字以内写清楚)
+### A1: Core Thesis (must be writable in ≤200 words)
 
-投资论文必须回答以下 5 个问题,每个一句话:
+The thesis must answer 5 questions, one sentence each:
 
 ```
-我以 ___元 买入 ___公司,因为:
-1. 这门生意的本质是___,我理解它的赚钱方式。
-2. 它的护城河是___,而且在变宽/稳定。
-3. 管理层___,值得信赖的原因是___。
-4. 当前价格相当于内在价值的___折,安全边际来自___。
-5. 即使我错了,下行风险可控,因为___。
+I bought {Company} at {price} because:
+1. The essence of this business is ___, and I understand how it makes money.
+2. Its moat is ___, and it's widening / stable.
+3. Management is ___, trustworthy because ___.
+4. The current price is a {discount}% to intrinsic value; the margin of safety comes from ___.
+5. Even if I'm wrong, downside is contained because ___.
 ```
 
-**5 句话写不完整 = 论文本身有问题,说明买入决策不够清晰。**
+**If you can't fill 5 sentences, the thesis itself is flawed — the buy decision isn't clear enough.**
 
-### A2:核心假设清单
+### A2: Core Assumptions List
 
-把论文拆成可验证的具体假设(通常 3-7 个。太少=思考不深,太多=论文不聚焦):
+Break the thesis into verifiable assumptions (3-7 typically; too few = shallow thinking, too many = unfocused):
 
-| # | 核心假设 | 验证方式 | 验证频率 | 当前状态 |
-|---|---------|---------|---------|---------|
-| 1 | 例:收入增速维持 15%+ | 季报收入增速 | 每季度 | 🟢 成立 |
-| 2 | 例:毛利率稳定在 60%+ | 季报毛利率 | 每季度 | 🟢 成立 |
-| 3 | 例:管理层持续回购 | 回购公告/现金流表 | 每季度 | 🟢 成立 |
-| 4 | 例:竞争对手未取得突破 | 行业数据/竞对财报 | 每半年 | 🟢 成立 |
+| # | Core Assumption | How to verify | Frequency | Status |
+|---|-----------------|---------------|-----------|--------|
+| 1 | e.g. revenue growth stays >15% | Quarterly revenue growth | Quarterly | 🟢 Holding |
+| 2 | e.g. gross margin stable >60% | Quarterly gross margin | Quarterly | 🟢 Holding |
 
-### A3:红线清单(触发任何一条 = 必须重新评估)
+### A3: Red Lines (triggering any one = must re-evaluate)
 
-| # | 红线条件 | 严重程度 | 触发后动作 |
-|---|---------|---------|-----------|
-| 1 | 管理层诚信出问题(造假、关联交易) | 致命 | 立即清仓 |
-| 2 | 核心业务连续 2 季度收入下滑 | 严重 | 减仓 50%,重新评估 |
-| 3 | 护城河被明确突破(竞对获得同等能力) | 严重 | 深度研究,考虑退出 |
-| 4 | 监管根本性改变商业模式 | 严重 | 重新评估内在价值 |
-| 5 | 管理层大规模非计划减持 | 警告 | 深入调查原因 |
+| # | Red-line condition | Severity | Action on trigger |
+|---|--------------------|----------|-------------------|
+| 1 | Management integrity problem (fraud, related-party) | Fatal | Exit immediately |
+| 2 | Core business revenue down 2 consecutive quarters | Severe | Trim 50%, re-evaluate |
+| 3 | Moat explicitly breached (competitor reaches parity) | Severe | Deep research, consider exit |
+| 4 | Regulatory change fundamentally alters the business model | Severe | Re-value intrinsic value |
+| 5 | Management large unplanned disposal | Warning | Investigate |
+| 6 | **Macro trend reversal for this name's end-market** — e.g. demographic clock (population decline) for consumer/property/education names; consumption downgrade (居民边际消费下降); generational shift away from the category | Severe | Re-evaluate the long-term demand base; for consumer-dependent names, this is often a slow-moving but fatal headwind — assess whether the thesis still holds at a structurally lower growth path |
 
-> 段永平:"卖出只有三个理由:1. 发现买错了;2. 公司基本面变了;3. 找到了更好的。"
+> The red line on macro trends (demographic clock / consumption / generational) is deliberately explicit: a value-investing thesis that picks a consumer name without weighing population decline and consumption-trend headwinds is incomplete. For non-consumer names (e.g. pure B2B industrial), this red line may be loose; for consumer/retail/education/property names, weight it heavily.
 
-### A4:估值锚点
+> Duan Yongping: "There are only three reasons to sell: 1. you got the buy wrong; 2. the fundamentals changed; 3. you found something better."
 
-| 指标 | 买入时 | 乐观目标 | 中性目标 | 悲观情景 |
-|------|-------|---------|---------|---------|
-| 股价 | | | | |
-| PE(TTM) | | | | |
-| 市值 | | | | |
-| 内在价值估算 | | | | |
-| 安全边际 | | | | |
+### A4: Valuation Anchors
 
-### A5:保存论文
+| Metric | At buy | Optimistic target | Neutral target | Pessimistic |
+|--------|--------|-------------------|-----------------|-------------|
+| Price | | | | |
+| PE (TTM) | | | | |
+| Market cap | | | | |
+| Intrinsic value estimate | | | | |
+| Margin of safety | | | | |
 
-用 `write_file` 把论文写入 `reports/{公司}-thesis.md`,包含:建立日期、买入价格和仓位、核心论文(5 句)、核心假设清单、红线清单、估值锚点、追踪记录表(初始为空)。
+### A5: Save the Thesis
 
----
-
-## 模式 B:追踪检查
-
-### B1:读取现有论文
-
-用 `read_file` 读 `reports/{公司}-thesis.md`,加载核心论文、假设清单、红线清单、上次检查记录。
-
-### B2:收集最新数据
-
-用 `web_search` / `get_stock_news` / `get_financial_statements` 收集:① 最新财报(如有新季报/年报);② 近期重大事件(管理层变动、监管、竞争);③ 当前股价和估值;④ 内部人交易(大股东增减持)。
-
-### B3:逐条检查核心假设
-
-| # | 核心假设 | 上次状态 | 最新证据 | 当前状态 | 变化 |
-|---|---------|---------|---------|---------|------|
-| 1 | 收入增速 15%+ | 🟢 成立 | Q4 收入增速 12% | 🟡 边际弱化 | ⚠️ |
-| 2 | 毛利率 60%+ | 🟢 成立 | 毛利率 61.2% | 🟢 成立 | — |
-
-状态定义:
-- 🟢 **成立**——最新数据支持
-- 🟡 **边际弱化**——仍在可接受范围,但趋势不利
-- 🔴 **受损**——数据明确不支持
-- ⚫ **破裂**——假设已被推翻
-
-### B4:红线检查
-
-逐条检查红线清单,任何一条触发 → 在报告中醒目标注 + 明确行动建议。
-
-### B5:估值更新
-
-用 `financial_rigor`(`command=verify_valuation`)重新计算 PE/PB/ROE 等,对比买入时与上次检查:
-
-| 指标 | 买入时 | 上次检查 | 当前 | 变化 |
-|------|-------|---------|------|------|
-| 股价 | | | | |
-| PE(TTM) | | | | |
-| 内在价值估算 | | | | |
-| 安全边际 | | | | |
-
-### B6:输出追踪报告
-
-结构:① 论文健康度评分(满分 10);② 核心假设检查表;③ 红线检查表;④ 本期关键变化(≤ 500 字);⑤ 估值更新;⑥ 结论与行动建议;⑦ 下次检查重点。
-
-**健康度公式**:`10 - (⚫破裂假设数 × 3) - (🔴受损假设数 × 2) - (🟡弱化假设数 × 1) - (红线触发数 × 5)`,最低 1 分,最高 10 分。
-
-| 评分 | 含义 | 建议动作 |
-|:----:|------|---------|
-| 9-10 | 所有假设成立,论文比买入时更强 | 考虑加仓 |
-| 7-8 | 核心假设成立,个别边际弱化 | 继续持有 |
-| 5-6 | 1-2 个假设受损,但核心逻辑未变 | 持有但提高警惕 |
-| 3-4 | 多个假设受损,论文基础动摇 | 考虑减仓 |
-| 1-2 | 红线触发或核心假设破裂 | 强烈建议卖出 |
-
-**结论必须明确回答**:① 论文还完整吗?(完整 / 边际弱化 / 受损 / 破裂);② 该怎么做?(加仓 / 持有 / 减仓 / 清仓);③ 下次检查时间(下一个季报后 / 特定事件后)。
-
-### B7:更新论文文件
-
-用 `write_file` 把本次检查记录追加到 `reports/{公司}-thesis.md` 的追踪记录表:
-
-| 检查日期 | 健康度 | 核心变化 | 动作建议 |
-|---------|:------:|---------|---------|
-| 2026-04-09 | 7/10 | 收入增速放缓至 12%,但利润率改善 | 持有 |
+Use `write_file` to write `reports/{company}-thesis.md`, including: build date, buy price and position, core thesis (5 sentences), assumptions list, red lines, valuation anchors, tracking table (empty initially).
 
 ---
 
-## 关键原则
+## Mode B: Tracking Check
 
-- **买入前就写好卖出条件**——冷静时做的决策比恐慌时做的好。
-- **论文要具体到可验证**——"公司很好"不是论文,"ROE > 25% 且趋势稳定"才是。
-- **红线一旦触发就行动**——最怕"再等等看",这是亏大钱的开始。
-- **论文破裂 ≠ 股价下跌**——股价跌 30% 不一定要卖,论文破裂才要卖。
-- **诚实面对错误**——论文建错了就承认,不要为了面子硬撑。
+### B1: Read the Existing Thesis
+
+Use `read_file` to load core thesis, assumptions, red lines, last check record.
+
+### B2: Gather Latest Data
+
+Use `web_search` / `get_stock_news` / `get_financial_statements`: ① latest earnings (if new quarter/year); ② recent material events (management, regulation, competition); ③ current price and valuation; ④ insider transactions (major shareholder changes).
+
+### B3: Check Each Assumption
+
+| # | Core Assumption | Last status | Latest evidence | Current status | Change |
+|---|-----------------|-------------|-----------------|----------------|--------|
+| 1 | Revenue growth >15% | 🟢 Holding | Q4 revenue growth 12% | 🟡 Weakening | ⚠️ |
+
+Status definitions:
+- 🟢 **Holding** — latest data supports
+- 🟡 **Weakening** — still acceptable, but trend is unfavorable
+- 🔴 **Impaired** — data clearly does not support
+- ⚫ **Broken** — assumption has been overturned
+
+### B4: Red-Line Check
+
+Check each red line; any triggered → flag prominently in the report + clear action recommendation.
+
+### B5: Valuation Update
+
+Use `financial_rigor` (`command=verify_valuation`) to recompute PE/PB/ROE; compare against buy-time and last check:
+
+| Metric | At buy | Last check | Current | Change |
+|--------|--------|------------|---------|--------|
+| Price | | | | |
+| PE (TTM) | | | | |
+| Intrinsic value estimate | | | | |
+| Margin of safety | | | | |
+
+### B6: Output the Tracking Report
+
+Structure: ① Thesis health score (out of 10); ② Assumption check table; ③ Red-line check table; ④ Key changes this period (≤500 words); ⑤ Valuation update; ⑥ Conclusion and action; ⑦ Focus for next check.
+
+**Health formula**: `10 - (⚫broken × 3) - (🔴impaired × 2) - (🟡weakening × 1) - (red-lines triggered × 5)`, min 1, max 10.
+
+| Score | Meaning | Action |
+|:-----:|---------|--------|
+| 9-10 | All assumptions hold, thesis stronger than at buy | Consider adding |
+| 7-8 | Core assumptions hold, some weakening | Continue holding |
+| 5-6 | 1-2 assumptions impaired, core logic intact | Hold but raise alertness |
+| 3-4 | Multiple assumptions impaired, foundation shaken | Consider trimming |
+| 1-2 | Red line triggered or core assumption broken | Strongly consider exit |
+
+**The conclusion must clearly answer**: ① Is the thesis still intact? (intact / weakening / impaired / broken); ② What to do? (add / hold / trim / exit); ③ Next check timing (next earnings / a specific event).
+
+### B7: Update the Thesis File
+
+Use `write_file` to append this check to the tracking table in `reports/{company}-thesis.md`:
+
+| Check date | Health | Key change | Action |
+|------------|:------:|------------|--------|
+| 2026-04-09 | 7/10 | Revenue growth slowed to 12%, but margins improved | Hold |
+
+---
+
+## Key Principles
+
+- **Write sell conditions before buying** — decisions made calmly beat decisions made in panic.
+- **Assumptions must be verifiable** — "a great company" is not a thesis; "ROE>25% and stable" is.
+- **Act when a red line triggers** — "let's wait and see" is how big losses happen.
+- **Thesis breaking ≠ stock falling** — a 30% price drop doesn't force a sell; a broken thesis does.
+- **Be honest about mistakes** — if the thesis was wrong, admit it; don't defend it to save face.
+- **Weigh macro headwinds for consumer names** — demographic decline and consumption downgrade are slow but can be fatal for consumer/property/education theses; bake them into red lines, not just quarterly checks.
