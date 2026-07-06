@@ -39,6 +39,14 @@ def test_list_presets_returns_full_roster() -> None:
     )
 
 
+def test_value_investing_committee_is_routable() -> None:
+    """value_investing_committee must be in the routing table, not just on disk."""
+    from src.tools.swarm_tool import _PRESET_NAMES, _normalize_preset_name
+
+    assert "value_investing_committee" in _PRESET_NAMES
+    assert _normalize_preset_name("value_investing_committee") == "value_investing_committee"
+
+
 def test_every_preset_yaml_is_loadable() -> None:
     """Every YAML in the bundle must parse and expose required keys."""
     for entry in list_presets():
