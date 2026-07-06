@@ -187,6 +187,23 @@ def test_three_scenario_future_eps_compounding() -> None:
     assert bear["upside_pct"] < 0  # bear case is below current price
 
 
+def test_three_scenario_normalizes_percent_growth() -> None:
+    # LLMs often pass 15 instead of 0.15; |g| > 1 is treated as a percent.
+    out = three_scenario_valuation(
+        current_price=510, current_eps=23.5, shares_billion=9.11,
+        growth_optimistic=15, growth_neutral=8, growth_pessimistic=0,
+        pe_optimistic=25, pe_neutral=20, pe_pessimistic=15, years=3,
+    )
+    bull = next(s for s in out["scenarios"] if s["scenario"] == "bull")
+    assert bull["future_eps"] == pytest.approx(23.5 * 1.15 ** 3)  # 15 -> 0.15
+    assert bull["annual_growth"] == pytest.approx(0.15)
+    assert "bull" in out["growth_normalized_from_percent"]
+    # bear g=0 is not normalized (|0| is not > 1).
+    bear = next(s for s in out["scenarios"] if s["scenario"] == "bear")
+    assert bear["future_eps"] == 23.5
+    assert "bear" not in out.get("growth_normalized_from_percent", [])
+
+
 # ── tool contract ─────────────────────────────────────────────────────────
 
 

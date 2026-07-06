@@ -401,8 +401,14 @@ def three_scenario_valuation(
         ("bear", growth_pessimistic, pe_pessimistic),
     ]
     scenarios: list[dict[str, Any]] = []
+    normalized: list[str] = []
     for name, growth, pe in spec:
         g, target_pe = _exact(growth), _exact(pe)
+        # Defensive: LLMs frequently pass "15%" as 15 instead of 0.15. Treat
+        # |growth| > 1 (i.e. > 100%) as a percent and normalize, flagging it.
+        if abs(float(g)) > 1:
+            g = _CTX.divide(g, Decimal("100"))
+            normalized.append(name)
         future_eps = eps
         for _ in range(int(years)):
             future_eps = _CTX.multiply(future_eps, _CTX.add(Decimal("1"), g))
@@ -416,7 +422,7 @@ def three_scenario_valuation(
             "target_price": float(target_price),
             "upside_pct": round(upside, 2),
         })
-    return {
+    result: dict[str, Any] = {
         "current_price": float(p),
         "current_eps": float(eps),
         "shares_billion": float(shares),
@@ -424,6 +430,13 @@ def three_scenario_valuation(
         "currency": currency,
         "scenarios": scenarios,
     }
+    if normalized:
+        result["growth_normalized_from_percent"] = normalized
+        result["note"] = (
+            f"growth values > 1 (100%) were treated as percentages and divided "
+            f"by 100 for scenarios: {normalized}. Pass 0.15 for 15% to avoid this."
+        )
+    return result
 
 
 class FinancialRigorTool(BaseTool):
@@ -487,7 +500,7 @@ class FinancialRigorTool(BaseTool):
             "growth": {
                 "type": "array", "items": {"type": "number"},
                 "minItems": 3, "maxItems": 3,
-                "description": "three_scenario: annual EPS growth [bull, base, bear].",
+                "description": "three_scenario: annual EPS growth as a decimal [bull, base, bear], e.g. 0.15 for 15% (values > 1 are auto-treated as percent).",
             },
             "pe": {
                 "type": "array", "items": {"type": "number"},
