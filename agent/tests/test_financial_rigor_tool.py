@@ -194,6 +194,7 @@ def test_tool_metadata() -> None:
     tool = FinancialRigorTool()
     assert tool.name == "financial_rigor"
     assert tool.is_readonly is True
+    assert tool.repeatable is True
     assert tool.parameters["required"] == ["command"]
     cmds = set(tool.parameters["properties"]["command"]["enum"])
     assert cmds == {"verify_market_cap", "verify_valuation", "cross_validate",

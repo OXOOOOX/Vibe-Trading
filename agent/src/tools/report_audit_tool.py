@@ -364,6 +364,8 @@ class ReportAuditTool(BaseTool):
         "required": ["command"],
     }
     is_readonly = True
+    repeatable = True  # loop.py dedups non-repeatable tools by name; extract
+                       # and verdict are commonly called back-to-back.
 
     def execute(self, **kwargs: Any) -> str:
         """Dispatch to ``extract`` or ``verdict`` and return a JSON envelope.

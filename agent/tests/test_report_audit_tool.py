@@ -178,6 +178,7 @@ def test_tool_metadata() -> None:
     tool = ReportAuditTool()
     assert tool.name == "report_audit"
     assert tool.is_readonly is True
+    assert tool.repeatable is True
     assert tool.parameters["required"] == ["command"]
     assert set(tool.parameters["properties"]["command"]["enum"]) == {"extract", "verdict"}
 

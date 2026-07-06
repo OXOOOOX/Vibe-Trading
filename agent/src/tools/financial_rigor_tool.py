@@ -499,6 +499,8 @@ class FinancialRigorTool(BaseTool):
         "required": ["command"],
     }
     is_readonly = True
+    repeatable = True  # loop.py dedups non-repeatable tools by name; users call
+                       # different sub-commands / params in one session.
 
     def execute(self, **kwargs: Any) -> str:
         """Dispatch to the requested sub-command and return a JSON envelope.
