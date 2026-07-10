@@ -225,7 +225,7 @@ LOADER_CACHE_ENV = "VIBE_TRADING_DATA_CACHE"
 _LOADER_CACHE_TRUE_VALUES = {"1", "true", "yes", "on"}
 # Bump when the key payload or on-disk layout changes so stale entries are
 # simply never matched (old files become unreachable garbage, safe to delete).
-_LOADER_CACHE_VERSION = 2
+_LOADER_CACHE_VERSION = 3
 
 
 def loader_cache_enabled() -> bool:
