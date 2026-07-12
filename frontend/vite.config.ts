@@ -15,6 +15,7 @@ const PROXY_PATHS = [
   "/portfolio/refresh-market-data",
   "/portfolio/analysis-sessions",
   "/market-cache",
+  "/data",
   "/mandate",
   "/live",
   "/upload",
@@ -35,6 +36,14 @@ export default defineConfig(({ mode }) => {
     },
   };
 
+  const previewProxy = {
+    ...Object.fromEntries(PROXY_PATHS.map((p) => [p, apiProxy])),
+    "^/runs/[^/]+/?$": apiProxyWithHtmlFallback,
+    "/runs": apiProxy,
+    "/correlation": apiProxyWithHtmlFallback,
+    "^/alpha(?:/|$)": apiProxy,
+  };
+
   return {
     plugins: [react()],
     resolve: {
@@ -53,6 +62,10 @@ export default defineConfig(({ mode }) => {
         "/correlation": apiProxyWithHtmlFallback,
         "^/alpha(?:/|$)": apiProxy,
       },
+    },
+    preview: {
+      port: 5899,
+      proxy: previewProxy,
     },
     build: {
       rollupOptions: {

@@ -317,7 +317,15 @@ def loader_cache_get(
         end_date=end_date,
         fields=fields,
     )
-    return _read_loader_cache_frame(cache_path)
+    frame = _read_loader_cache_frame(cache_path)
+    # ``mtime`` is the bounded-cache recency signal used by the unified data
+    # layer. Touch only an actual hit: a miss must not create or retain junk.
+    if frame is not None:
+        try:
+            cache_path.touch()
+        except OSError:
+            pass
+    return frame
 
 
 def loader_cache_put(

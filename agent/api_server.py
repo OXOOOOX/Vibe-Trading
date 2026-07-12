@@ -4439,6 +4439,10 @@ async def stop_runner_endpoint(payload: LiveRunnerControlRequest):
 from src.api.alpha_routes import register_alpha_routes  # noqa: E402
 register_alpha_routes(app)
 
+# Unified data routes retain /market-cache/* compatibility endpoints while
+# providing the single policy-aware API used by the Agent and Data Center.
+from src.api.data_routes import register_data_routes  # noqa: E402
+register_data_routes(app, require_local_or_auth)
 
 # ============================================================================
 # Scheduled Research Routes

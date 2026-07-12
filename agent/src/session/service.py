@@ -17,15 +17,13 @@ _AGENT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_na
 
 # Portfolio-page sessions are explicitly research-only. Keep their registry
 # narrow enough that an LLM cannot reach any broker/order tool even if a live
-# MCP connector is configured for ordinary Agent sessions. verified_market_data
-# is intentionally retained because it writes only the local verification cache.
+# MCP connector is configured for ordinary Agent sessions. The unified data
+# facade is the only price/news/report entry point exposed here.
 _PORTFOLIO_ANALYSIS_TOOL_NAMES = [
     "load_skill",
     "publish_obsidian_note",
     "portfolio_state",
-    "verified_market_data",
-    "get_market_data",
-    "get_stock_news",
+    "get_data_context",
     "web_search",
     "read_url",
     "get_stock_profile",
@@ -48,9 +46,7 @@ _PORTFOLIO_ANALYSIS_TOOL_NAMES = [
 _CHANNEL_RESEARCH_TOOL_NAMES = [
     "load_skill",
     "portfolio_state",
-    "verified_market_data",
-    "get_market_data",
-    "get_stock_news",
+    "get_data_context",
     "web_search",
     "read_url",
     "read_document",
@@ -71,7 +67,6 @@ _CHANNEL_RESEARCH_TOOL_NAMES = [
     "screen_market",
     "get_options_chain",
     "options_pricing",
-    "get_research_reports",
     "get_sec_filings",
     "search_symbol",
     "pattern",
@@ -103,6 +98,16 @@ _CHANNEL_RESEARCH_TOOL_NAMES = [
     "session_search",
     "publish_obsidian_note",
 ]
+
+# Compatibility tools remain available to API clients and local scripts, but
+# normal Agent sessions get one policy-controlled data surface. This avoids an
+# LLM silently bypassing cache/freshness/quorum rules with a lower-level call.
+_UNIFIED_DATA_SUPERSEDED_TOOL_NAMES = {
+    "get_market_data",
+    "verified_market_data",
+    "get_stock_news",
+    "get_research_reports",
+}
 
 from src.session.events import EventBus
 from src.session.models import (
@@ -532,6 +537,7 @@ class SessionService:
                     session_id=session_id,
                     event_callback=event_callback,
                     warn_callback=_mcp_collision_warn,
+                    exclude_tool_names=_UNIFIED_DATA_SUPERSEDED_TOOL_NAMES,
                 ),
             )
 

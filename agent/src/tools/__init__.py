@@ -72,6 +72,7 @@ def build_registry(
     event_callback: Callable[[str, dict], None] | None = None,
     warn_callback: Callable[[str], None] | None = None,
     interactive: bool | None = None,
+    exclude_tool_names: set[str] | None = None,
     _mcp_server_tool_name_segments: Mapping[str, str] | None = None,
 ) -> ToolRegistry:
     """Build the tool registry via auto-discovery, optionally enriched with MCP tools.
@@ -108,6 +109,9 @@ def build_registry(
             channel rather than blocking on a browser that cannot open
             (SPEC Transport §4). ``None`` (default) auto-detects via
             ``sys.stdin.isatty()``.
+        exclude_tool_names: Local tool names to keep out of this registry.
+            This is used when a policy facade supersedes lower-level tools while
+            retaining those tools for compatibility endpoints and local callers.
 
     Returns:
         ToolRegistry containing all available local tools followed by any
@@ -135,6 +139,9 @@ def build_registry(
     registry = ToolRegistry()
     for cls in _discover_subclasses():
         try:
+            if cls.name in (exclude_tool_names or set()):
+                logger.info("Tool %s hidden by registry policy", cls.name)
+                continue
             if cls.name in _SHELL_TOOL_NAMES and not include_shell_tools:
                 logger.info("Tool %s disabled by shell tool policy", cls.name)
                 continue
