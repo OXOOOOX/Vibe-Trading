@@ -317,7 +317,9 @@ class WebSearchTool(BaseTool):
                     f"Web search failed after {_MAX_ATTEMPTS} attempts "
                     f"(backends: {backends if supports_backend else 'duckduckgo'}): {last_error}. "
                     f"CN fallbacks (sogou, bing_cn): {fb_err}. "
-                    "Read a known URL directly with read_url."
+                    "Retry shortly, set VIBE_TRADING_SEARCH_BACKENDS to a different engine list, "
+                    "set VIBE_TRADING_SEARCH_BING_FALLBACK=0 to disable CN fallback, or read a "
+                    "known URL directly with read_url."
                 ),
             },
             ensure_ascii=False,

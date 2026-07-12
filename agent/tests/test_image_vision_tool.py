@@ -25,6 +25,13 @@ def tool() -> AnalyzeImageTool:
     return AnalyzeImageTool()
 
 
+def test_tool_is_auto_discovered() -> None:
+    from src.tools import build_filtered_registry
+
+    registry = build_filtered_registry(["analyze_image"])
+    assert "analyze_image" in registry.tool_names
+
+
 @pytest.fixture()
 def png_in_allowed_root(tmp_path, monkeypatch) -> Path:
     monkeypatch.setenv("VIBE_TRADING_ALLOWED_FILE_ROOTS", str(tmp_path))
@@ -67,7 +74,6 @@ def test_happy_path_sends_data_url_and_returns_answer(tool, png_in_allowed_root)
 
 
 def test_empty_model_answer_is_an_error(tool, png_in_allowed_root):
-    result = None
     response = MagicMock()
     response.content = ""
     with patch("src.providers.chat.ChatLLM") as chat_cls:

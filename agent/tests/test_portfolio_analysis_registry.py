@@ -30,6 +30,9 @@ def test_channel_research_registry_allows_backtests_but_excludes_remote_controls
         "factor_analysis",
         "run_research_autopilot",
         "read_document",
+        "analyze_image",
+        "financial_rigor",
+        "report_audit",
     } <= allowed
     forbidden = {
         "trading_connections",

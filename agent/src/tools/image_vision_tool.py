@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from src.agent.tools import BaseTool
-from src.tools.path_utils import allowed_file_roots, resolve_safe_path
+from src.tools.path_utils import safe_document_path
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +58,11 @@ class AnalyzeImageTool(BaseTool):
         "about it. Use this for charts, candlestick/K-line screenshots, "
         "account or app screenshots and photos - anything where reading the "
         "picture matters. (read_document only OCRs text and fails on charts.) "
+        "Requires a vision-capable session model (e.g. gpt-4o / claude / "
+        "gemini / qwen-vl); a text-only model may error or answer without "
+        "seeing the image. "
         "Supported: jpg/png/gif/bmp/webp under the allowed file roots. "
-        'Example: {"path": "/root/.vibe-trading/weixin/abc.jpg", '
+        'Example: {"path": "~/.vibe-trading/uploads/weixin/abc.jpg", '
         '"question": "解读这张K线图的走势"}.'
     )
     parameters = {
@@ -100,7 +103,7 @@ class AnalyzeImageTool(BaseTool):
             return _error("question must be a string")
 
         try:
-            path = resolve_safe_path(raw_path.strip(), None, allowed_file_roots(), purpose="file")
+            path = safe_document_path(raw_path.strip())
         except ValueError as exc:
             return _error(str(exc))
         if not path.is_file():

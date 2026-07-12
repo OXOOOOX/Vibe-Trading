@@ -313,10 +313,19 @@ class TestMergeBasicFieldsGuard:
 
 
 _token = os.getenv("TUSHARE_TOKEN", "")
-_skip_e2e = _token in ("", "your-tushare-token")
+_run_e2e = os.getenv("VIBE_TRADING_RUN_TUSHARE_E2E", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_skip_e2e = not _run_e2e or _token in ("", "your-tushare-token")
 
 
-@pytest.mark.skipif(_skip_e2e, reason="TUSHARE_TOKEN not set")
+@pytest.mark.skipif(
+    _skip_e2e,
+    reason="set VIBE_TRADING_RUN_TUSHARE_E2E=1 with a valid TUSHARE_TOKEN",
+)
 class TestTushareE2E:
     """Real API calls — requires TUSHARE_TOKEN env var."""
 

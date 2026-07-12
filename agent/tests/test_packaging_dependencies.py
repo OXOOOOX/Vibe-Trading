@@ -26,7 +26,7 @@ def test_harmonic_backend_is_not_a_core_install_dependency() -> None:
     }
     requirements_txt = {
         _normalized_requirement_name(line)
-        for line in (ROOT / "agent" / "requirements.txt").read_text().splitlines()
+        for line in (ROOT / "agent" / "requirements.txt").read_text(encoding="utf-8").splitlines()
         if line and not line.startswith("#")
     }
 
@@ -56,7 +56,7 @@ def test_channel_core_websocket_dependency_is_declared_for_baseline_installs() -
     }
     requirements_txt = {
         _normalized_requirement_name(line)
-        for line in (ROOT / "agent" / "requirements.txt").read_text().splitlines()
+        for line in (ROOT / "agent" / "requirements.txt").read_text(encoding="utf-8").splitlines()
         if line and not line.startswith("#")
     }
 
