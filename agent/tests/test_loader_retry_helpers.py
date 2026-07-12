@@ -262,6 +262,22 @@ def test_loader_cache_key_partitions_source_symbol_timeframe_date_and_fields():
     assert make_loader_cache_key(**{**base_args, "fields": ["pb"]}) != key
 
 
+def test_loader_cache_v3_invalidates_pre_resampling_entries(monkeypatch):
+    base_args = {
+        "source": "local",
+        "symbol": "AAPL.US",
+        "timeframe": "1H",
+        "start_date": "2025-01-01",
+        "end_date": "2025-01-03",
+        "fields": None,
+    }
+
+    assert base._LOADER_CACHE_VERSION == 3
+    v3_key = make_loader_cache_key(**base_args)
+    monkeypatch.setattr(base, "_LOADER_CACHE_VERSION", 2)
+    assert make_loader_cache_key(**base_args) != v3_key
+
+
 def test_loader_cache_happy_path_writes_then_reuses(
     tmp_path,
     monkeypatch,
