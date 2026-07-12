@@ -8,7 +8,7 @@ import os
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -173,8 +173,9 @@ class UnifiedDataService:
     ) -> dict[str, Any]:
         market: dict[str, Any] = {}
         research: dict[str, Any] = {}
-        tasks = []
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="unified-data") as pool:
+        tasks: list[tuple[str, Any]] = []
+        pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="unified-data")
+        try:
             if "market" in include:
                 tasks.append(("market", pool.submit(self._market_context, symbols, profile, effective_days, live, started)))
             if "fundamentals" in include:
@@ -183,16 +184,21 @@ class UnifiedDataService:
                 tasks.append(("news", pool.submit(self._research_context, "news", symbols, started)))
             if "reports" in include:
                 tasks.append(("reports", pool.submit(self._research_context, "report", symbols, started)))
+            done, _ = wait([task for _, task in tasks], timeout=max(0.1, _LIVE_TIMEOUT_SECONDS - (time.monotonic() - started)))
             for name, task in tasks:
-                remaining = max(0.1, _LIVE_TIMEOUT_SECONDS - (time.monotonic() - started))
                 try:
-                    value = task.result(timeout=remaining)
-                except Exception as exc:  # includes timeout; cached result is supplied below where possible
+                    value = task.result() if task in done else {"status": "partial", "error": "live request deadline reached"}
+                except Exception as exc:
                     value = {"status": "partial", "error": str(exc)}
                 if name == "market":
                     market = value
                 else:
                     research[name] = value
+        finally:
+            # A blocked upstream call must not extend the user-visible request
+            # budget. Running calls may finish their harmless cache write later;
+            # queued work is cancelled.
+            pool.shutdown(wait=False, cancel_futures=True)
         status = self._overall_status(market, research)
         self.control.log_event(request_id, "context", status, f"purpose={purpose}")
         self._enforce_retention()
