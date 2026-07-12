@@ -20,7 +20,7 @@ class DataContextRequest(BaseModel):
     symbols: list[str] = Field(min_length=1, max_length=25)
     purpose: Literal["latest_price", "holding", "premarket", "intraday", "long_term", "backtest"] = "holding"
     lookback_days: int | None = Field(default=None, ge=1, le=10_000)
-    include: list[Literal["market", "news", "reports"]] | None = None
+    include: list[Literal["market", "fundamentals", "news", "reports"]] | None = None
     force_live: bool | None = None
 
 

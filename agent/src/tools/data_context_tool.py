@@ -14,8 +14,8 @@ class DataContextTool(BaseTool):
 
     name = "get_data_context"
     description = (
-        "The unified data entry point for market bars, verified latest prices, "
-        "news, and research reports. Select a purpose; the system enforces the "
+        "The unified data entry point for market bars, fundamentals, verified "
+        "latest prices, news, and research reports. Select a purpose; the system enforces the "
         "minimum interval/history, keeps settled history cache-first, revalidates "
         "mutable prices and news live-first, and labels quorum/conflict/stale "
         "fallback explicitly. Returned bars are the latest 120 contiguous bars; "
@@ -34,7 +34,7 @@ class DataContextTool(BaseTool):
                 "default": "holding",
             },
             "lookback_days": {"type": "integer", "minimum": 1},
-            "include": {"type": "array", "items": {"type": "string", "enum": ["market", "news", "reports"]}},
+            "include": {"type": "array", "items": {"type": "string", "enum": ["market", "fundamentals", "news", "reports"]}},
             "force_live": {"type": "boolean"},
             "handle": {"type": "string"},
             "cursor": {"type": "integer", "minimum": 0, "default": 0},

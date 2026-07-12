@@ -18,7 +18,7 @@ _AGENT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_na
 # Portfolio-page sessions are explicitly research-only. Keep their registry
 # narrow enough that an LLM cannot reach any broker/order tool even if a live
 # MCP connector is configured for ordinary Agent sessions. The unified data
-# facade is the only price/news/report entry point exposed here.
+# facade is the only market/fundamentals/news/report entry point exposed here.
 _PORTFOLIO_ANALYSIS_TOOL_NAMES = [
     "load_skill",
     "publish_obsidian_note",
@@ -26,9 +26,7 @@ _PORTFOLIO_ANALYSIS_TOOL_NAMES = [
     "get_data_context",
     "web_search",
     "read_url",
-    "get_stock_profile",
     "get_sector_info",
-    "get_financial_statements",
     "get_fund_flow",
     "get_northbound_flow",
     "get_margin_trading",
@@ -52,9 +50,7 @@ _CHANNEL_RESEARCH_TOOL_NAMES = [
     "read_document",
     "read_file",
     "analyze_image",
-    "get_stock_profile",
     "get_sector_info",
-    "get_financial_statements",
     "get_fund_flow",
     "get_northbound_flow",
     "get_margin_trading",
@@ -107,6 +103,8 @@ _UNIFIED_DATA_SUPERSEDED_TOOL_NAMES = {
     "verified_market_data",
     "get_stock_news",
     "get_research_reports",
+    "get_financial_statements",
+    "get_stock_profile",
 }
 
 from src.session.events import EventBus

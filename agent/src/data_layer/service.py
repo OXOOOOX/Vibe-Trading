@@ -15,6 +15,7 @@ from typing import Any, Iterable
 
 from src.market_cache import get_market_refresh_service
 from src.portfolio.state import load_state, normalize_symbol
+from src.tools.financial_statements_tool import FinancialStatementsTool
 from src.tools.research_reports_tool import ResearchReportsTool
 from src.tools.stock_news_tool import StockNewsTool
 
@@ -74,12 +75,14 @@ class UnifiedDataService:
         market_service: Any | None = None,
         news_tool: Any | None = None,
         reports_tool: Any | None = None,
+        fundamentals_tool: Any | None = None,
     ) -> None:
         self.control = control or DataControlStore()
         self.research = research or ResearchCacheStore()
         self.market_service = market_service or get_market_refresh_service()
         self.news_tool = news_tool or StockNewsTool()
         self.reports_tool = reports_tool or ResearchReportsTool()
+        self.fundamentals_tool = fundamentals_tool or FinancialStatementsTool()
         self._inflight: dict[str, threading.Event] = {}
         self._inflight_results: dict[str, dict[str, Any]] = {}
         self._inflight_lock = threading.Lock()
@@ -102,7 +105,10 @@ class UnifiedDataService:
             raise ValueError(f"unsupported purpose: {purpose}")
         profile = PROFILES[purpose]
         effective_days = max(int(lookback_days or 0), int(profile["lookback_days"]))
-        include_set = {entry.strip().lower() for entry in (include or ["market", "news", "reports"])}
+        include_set = {entry.strip().lower() for entry in (include or ["market", "fundamentals", "news", "reports"])}
+        invalid_include = include_set - {"market", "fundamentals", "news", "reports"}
+        if invalid_include:
+            raise ValueError(f"unsupported data domains: {', '.join(sorted(invalid_include))}")
         live = bool(profile["live"] if force_live is None else force_live)
         fingerprint_data = {
             "symbols": normalized, "purpose": purpose, "days": effective_days,
@@ -171,6 +177,8 @@ class UnifiedDataService:
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="unified-data") as pool:
             if "market" in include:
                 tasks.append(("market", pool.submit(self._market_context, symbols, profile, effective_days, live, started)))
+            if "fundamentals" in include:
+                tasks.append(("fundamentals", pool.submit(self._research_context, "fundamental", symbols, started)))
             if "news" in include:
                 tasks.append(("news", pool.submit(self._research_context, "news", symbols, started)))
             if "reports" in include:
@@ -312,12 +320,19 @@ class UnifiedDataService:
                 output["status"] = "partial"
                 break
             try:
-                raw = self.news_tool.execute(code=symbol, limit=20) if kind == "news" else self.reports_tool.execute(code=symbol, limit=20)
+                if kind == "news":
+                    raw = self.news_tool.execute(code=symbol, limit=20)
+                elif kind == "report":
+                    raw = self.reports_tool.execute(code=symbol, limit=20)
+                else:
+                    raw = self.fundamentals_tool.execute(code=symbol, statement="indicators", period="annual")
                 envelope = _parse_json(raw)
                 if not envelope.get("ok"):
                     raise RuntimeError(str(envelope.get("error") or "research source failed"))
                 data = envelope.get("data") or {}
                 documents = data.get("articles") or data.get("reports") or data.get("matches") or []
+                if kind == "fundamental":
+                    documents = [{"title": "annual indicators", "published_at": data.get("as_of") or data.get("report_date"), "summary": "latest annual indicator payload", "data": data}]
                 source = envelope.get("source")
                 self.research.replace_documents(kind, symbol, [item for item in documents if isinstance(item, dict)], source=str(source) if source else None)
                 output["items"][symbol] = {"mode": "live", "source": source, "documents": self.research.latest(kind, symbol)}

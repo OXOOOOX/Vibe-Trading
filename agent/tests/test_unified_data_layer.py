@@ -36,6 +36,8 @@ class _ResearchTool:
     def execute(self, **kwargs):
         if self.kind == "news":
             return '{"ok": true, "source": "test-news", "data": {"articles": [{"title": "Live headline", "published_at": "2026-07-13"}]}}'
+        if self.kind == "fundamental":
+            return '{"ok": true, "source": "test-fundamentals", "data": {"periods": [{"REPORT_DATE": "2025-12-31"}]}}'
         return '{"ok": true, "source": "test-report", "data": {"reports": [{"title": "Live report", "publish_date": "2026-07-13"}]}}'
 
 
@@ -46,7 +48,7 @@ def _unified(tmp_path: Path, fetcher):
     return UnifiedDataService(
         control=DataControlStore(tmp_path / "control.sqlite3"),
         research=ResearchCacheStore(tmp_path / "research.sqlite3"),
-        market_service=market, news_tool=_ResearchTool("news"), reports_tool=_ResearchTool("report"),
+        market_service=market, news_tool=_ResearchTool("news"), reports_tool=_ResearchTool("report"), fundamentals_tool=_ResearchTool("fundamental"),
     )
 
 
@@ -89,7 +91,8 @@ def test_live_failure_uses_explicit_stale_market_cache_fallback(tmp_path, monkey
 def test_live_research_is_cached_and_failed_refresh_is_historical_background(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("VIBE_TRADING_PORTFOLIO_STATE_PATH", str(tmp_path / "portfolio.json"))
     service = _unified(tmp_path, lambda **kwargs: _outcome(kwargs))
-    fresh = service.get_context(symbols=["588870.SH"], purpose="long_term", include=["news", "reports"])
+    fresh = service.get_context(symbols=["588870.SH"], purpose="long_term", include=["fundamentals", "news", "reports"])
+    assert fresh["research"]["fundamentals"]["items"]["588870.SH"]["mode"] == "live"
     assert fresh["research"]["news"]["items"]["588870.SH"]["mode"] == "live"
     assert fresh["research"]["reports"]["items"]["588870.SH"]["mode"] == "live"
 
@@ -117,10 +120,11 @@ def test_watchlist_and_source_circuit_policy(tmp_path) -> None:
 
 
 def test_registry_can_hide_low_level_data_tools_without_hiding_the_facade() -> None:
-    registry = build_registry(exclude_tool_names={"get_market_data", "verified_market_data", "get_stock_news", "get_research_reports"})
+    registry = build_registry(exclude_tool_names={"get_market_data", "verified_market_data", "get_stock_news", "get_research_reports", "get_financial_statements", "get_stock_profile"})
     assert "get_data_context" in registry.tool_names
     assert "get_market_data" not in registry.tool_names
     assert "verified_market_data" not in registry.tool_names
+    assert "get_financial_statements" not in registry.tool_names
 
 
 def test_prewarm_runs_each_market_calendar_slot_once() -> None:
