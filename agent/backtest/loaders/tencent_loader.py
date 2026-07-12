@@ -21,6 +21,7 @@ from backtest.loaders.registry import register
 logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+_MINUTE_URL = "https://web.ifzq.gtimg.cn/appstock/app/minute/query"
 
 
 def _is_a_share(code: str) -> bool:
@@ -50,8 +51,15 @@ class DataLoader:
         *,
         interval: str = "1D",
         fields: Optional[List[str]] = None,
+        adjustment: str = "qfq",
     ) -> Dict[str, pd.DataFrame]:
         validate_date_range(start_date, end_date)
+        if interval not in {"1D", "1m", "5m"}:
+            raise ValueError("Tencent loader supports intervals 1D, 1m, and 5m")
+        if adjustment not in {"raw", "qfq"}:
+            raise ValueError("Tencent loader adjustment must be 'raw' or 'qfq'")
+        if interval in {"1m", "5m"} and adjustment != "raw":
+            raise ValueError("Tencent intraday data is available only with adjustment='raw'")
 
         result: Dict[str, pd.DataFrame] = {}
         for code in codes:
@@ -62,8 +70,8 @@ class DataLoader:
                     timeframe=interval,
                     start_date=start_date,
                     end_date=end_date,
-                    fields=None,
-                    fetch=lambda code=code: self._fetch_one(code, start_date, end_date),
+                    fields=[f"adjustment:{adjustment}"],
+                    fetch=lambda code=code: self._fetch_one(code, start_date, end_date, adjustment, interval),
                 )
                 if df is not None and not df.empty:
                     result[code] = df
@@ -72,7 +80,7 @@ class DataLoader:
         return result
 
     def _fetch_one(
-        self, code: str, start_date: str, end_date: str,
+        self, code: str, start_date: str, end_date: str, adjustment: str = "qfq", interval: str = "1D",
     ) -> Optional[pd.DataFrame]:
         if not _is_a_share(code):
             return None
@@ -88,10 +96,11 @@ class DataLoader:
         else:
             return None
 
-        url = (
-            f"{_BASE_URL}?param={tencent_code},day,"
-            f"{start_date},{end_date},500,qfq"
-        )
+        if interval in {"1m", "5m"}:
+            return self._fetch_intraday(tencent_code, start_date, end_date, interval)
+
+        adjustment_token = "qfq" if adjustment == "qfq" else ""
+        url = f"{_BASE_URL}?param={tencent_code},day,{start_date},{end_date},1000,{adjustment_token}"
 
         import urllib.request
         req = urllib.request.Request(url, headers={
@@ -112,8 +121,8 @@ class DataLoader:
         if not stock_key:
             return None
 
-        # Try "day" first, then "qfqday" (forward-adjusted)
-        klines = stock_data[stock_key].get("qfqday") or stock_data[stock_key].get("day")
+        key_order = ("qfqday", "day") if adjustment == "qfq" else ("day",)
+        klines = next((stock_data[stock_key].get(key) for key in key_order if stock_data[stock_key].get(key)), None)
         if not klines:
             return None
 
@@ -140,3 +149,69 @@ class DataLoader:
             subset=["open", "high", "low", "close"]
         )
         return df
+
+    @staticmethod
+    def _fetch_intraday(
+        tencent_code: str, start_date: str, end_date: str, interval: str,
+    ) -> Optional[pd.DataFrame]:
+        import urllib.parse
+        import urllib.request
+
+        url = f"{_MINUTE_URL}?{urllib.parse.urlencode({'code': tencent_code})}"
+        request = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://gu.qq.com/",
+        })
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        instrument = (payload.get("data") or {}).get(tencent_code) or {}
+        minute_payload = instrument.get("data") or {}
+        session_date = str(minute_payload.get("date") or "")
+        if len(session_date) != 8:
+            return None
+        date_text = f"{session_date[:4]}-{session_date[4:6]}-{session_date[6:]}"
+        if date_text < start_date or date_text > end_date:
+            return None
+
+        rows: list[dict[str, float | str]] = []
+        previous_volume = 0.0
+        previous_amount = 0.0
+        for raw in minute_payload.get("data") or []:
+            parts = str(raw).split()
+            if len(parts) < 4:
+                continue
+            time_text = parts[0]
+            if not ("0930" <= time_text <= "1130" or "1300" <= time_text <= "1500"):
+                continue
+            price = float(parts[1])
+            cumulative_volume = float(parts[2])
+            cumulative_amount = float(parts[3])
+            volume = max(0.0, cumulative_volume - previous_volume)
+            amount = max(0.0, cumulative_amount - previous_amount)
+            previous_volume = cumulative_volume
+            previous_amount = cumulative_amount
+            rows.append({
+                "trade_date": f"{date_text} {time_text[:2]}:{time_text[2:]}",
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "volume": volume,
+                "amount": amount,
+            })
+        if not rows:
+            return None
+        frame = pd.DataFrame(rows)
+        frame["trade_date"] = pd.to_datetime(frame["trade_date"])
+        frame = frame.set_index("trade_date").sort_index()
+        if interval == "1m":
+            return frame
+
+        grouped = frame.groupby(frame.index.floor("5min"))
+        output = grouped.agg({
+            "open": "first", "high": "max", "low": "min", "close": "last",
+            "volume": "sum", "amount": "sum",
+        })
+        output.index.name = "trade_date"
+        return output

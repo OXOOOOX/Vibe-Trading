@@ -22,6 +22,7 @@ from pathlib import Path
 
 _ALLOWED_FILE_ROOTS_ENV = "VIBE_TRADING_ALLOWED_FILE_ROOTS"
 _ALLOWED_RUN_ROOTS_ENV = "VIBE_TRADING_ALLOWED_RUN_ROOTS"
+_OBSIDIAN_VAULT_ROOTS_ENV = "VIBE_TRADING_OBSIDIAN_VAULT_ROOTS"
 
 
 def _rejects_unc(p: str) -> None:
@@ -130,6 +131,74 @@ def _allowed_run_roots() -> list[Path]:
         if resolved not in roots:
             roots.append(resolved)
     return roots
+
+
+def _configured_obsidian_vault_roots() -> list[Path]:
+    """Return Obsidian vault roots configured through the environment."""
+    raw = os.getenv(_OBSIDIAN_VAULT_ROOTS_ENV, "")
+    roots: list[Path] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        _rejects_unc(item)
+        resolved = Path(item).expanduser().resolve()
+        if resolved not in roots:
+            roots.append(resolved)
+    return roots
+
+
+def safe_obsidian_note_path(note_path: str, *, vault_root: str | None = None) -> Path:
+    """Resolve an Obsidian note path under an explicitly configured vault root.
+
+    Args:
+        note_path: Relative note path inside the vault. Must end in ``.md``.
+        vault_root: Optional configured vault root to use when multiple roots
+            are configured. If omitted, exactly one configured root is required.
+
+    Returns:
+        Absolute resolved path inside the selected vault root.
+
+    Raises:
+        ValueError: If no vault root is configured, the note is not Markdown,
+            the path is absolute/UNC, or it escapes the selected vault root.
+    """
+    _rejects_unc(note_path)
+    note = Path(note_path)
+    if note.is_absolute():
+        raise ValueError("Obsidian note path must be relative to the vault root")
+    if not note_path.strip() or any(part in {"", ".", ".."} for part in note.parts):
+        raise ValueError("Obsidian note path must not contain empty, dot, or parent segments")
+    if note.suffix.lower() != ".md":
+        raise ValueError("Obsidian note path must end with .md")
+
+    roots = _configured_obsidian_vault_roots()
+    if not roots:
+        raise ValueError(
+            "No Obsidian vault root configured. Set "
+            f"{_OBSIDIAN_VAULT_ROOTS_ENV} in agent/.env, for example "
+            f"{_OBSIDIAN_VAULT_ROOTS_ENV}=C:\\Users\\you\\Documents\\Obsidian."
+        )
+
+    if vault_root:
+        _rejects_unc(vault_root)
+        selected = Path(vault_root).expanduser().resolve()
+        if selected not in roots:
+            raise ValueError(
+                "Requested Obsidian vault root is not configured in "
+                f"{_OBSIDIAN_VAULT_ROOTS_ENV}"
+            )
+    elif len(roots) == 1:
+        selected = roots[0]
+    else:
+        raise ValueError(
+            "Multiple Obsidian vault roots configured; pass vault_root explicitly"
+        )
+
+    resolved = (selected / note).resolve()
+    if not resolved.is_relative_to(selected):
+        raise ValueError("Obsidian note path escapes the vault root")
+    return resolved
 
 
 def _import_candidate(p: str) -> Path:

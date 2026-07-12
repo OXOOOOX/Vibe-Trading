@@ -232,6 +232,7 @@
     "edit": "编辑",
     "cancel": "取消",
     "save": "保存",
+    "saveAndSend": "保存并发送",
     "cancelGoal": "取消目标",
     "describeGoal": "描述要附加到此会话的研究目标",
     "placeholder": "例如：为 000001.SZ 创建双均线交叉策略，回测 2024 年",
@@ -265,7 +266,9 @@
     "uploaded": "已上传：{{filename}}",
     "uploadFailed": "上传失败：{{error}}",
     "failedToSend": "发送消息失败，请重试。",
-    "failedToContinue": "继续目标失败，请重试。"
+    "failedToContinue": "继续目标失败，请重试。",
+    "conversationForked": "已派生为新对话",
+    "failedToForkConversation": "派生对话失败。"
   },
   "runDetail": {
     "title": "运行详情",
@@ -529,6 +532,7 @@
   "messageBubble": {
     "copied": "已复制",
     "copy": "复制",
+    "forkConversation": "从这里派生对话",
     "generatePdf": "生成 PDF",
     "pdfRendererUnavailable": "PDF 渲染器不可用，已打开系统 PDF 保存窗口。",
     "pdfGenerationFailed": "PDF 生成失败。",

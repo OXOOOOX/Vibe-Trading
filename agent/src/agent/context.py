@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from src.agent.memory import WorkspaceMemory
 from src.agent.skills import SkillsLoader
@@ -15,6 +17,51 @@ if TYPE_CHECKING:
     from src.memory.persistent import PersistentMemory
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_RUNTIME_TIME_ZONE = "Asia/Shanghai"
+
+
+def build_current_datetime_context(
+    now: Optional[datetime] = None,
+    timezone_name: Optional[str] = None,
+) -> str:
+    """Return an explicit runtime clock for time-sensitive research prompts.
+
+    ``datetime.now()`` without a zone made relative-time questions depend on a
+    deployment host's locale. Finance research needs a named clock and offset,
+    especially when deciding whether news or a market session is current.
+    """
+    configured_name = (timezone_name or os.getenv("VIBE_TRADING_TIME_ZONE") or DEFAULT_RUNTIME_TIME_ZONE).strip()
+    try:
+        zone = ZoneInfo(configured_name)
+        resolved_name = configured_name
+    except ZoneInfoNotFoundError:
+        logger.warning(
+            "Invalid VIBE_TRADING_TIME_ZONE=%r; falling back to %s",
+            configured_name,
+            DEFAULT_RUNTIME_TIME_ZONE,
+        )
+        zone = ZoneInfo(DEFAULT_RUNTIME_TIME_ZONE)
+        resolved_name = DEFAULT_RUNTIME_TIME_ZONE
+
+    if now is None:
+        current = datetime.now(zone)
+    elif now.tzinfo is None:
+        current = now.replace(tzinfo=zone)
+    else:
+        current = now.astimezone(zone)
+
+    raw_offset = current.strftime("%z")
+    utc_offset = f"UTC{raw_offset[:3]}:{raw_offset[3:]}" if len(raw_offset) == 5 else raw_offset
+    return "\n".join(
+        [
+            f"Runtime date: {current:%Y-%m-%d}",
+            f"Runtime time: {current:%H:%M:%S}",
+            f"Runtime time zone: {resolved_name} ({utc_offset})",
+            "Interpret relative dates such as today, recent, this week, and latest against this clock. "
+            "Do not claim an item is current unless its source timestamp supports that claim.",
+        ]
+    )
 
 # Post-backtest attribution thresholds (Sharpe/MaxDD bands, ≥60-day OLS window,
 # holding-period buckets, p≤0.05 significance) follow standard industry and
@@ -89,7 +136,7 @@ Decide which workflow to use based on the request:
 
 **Swarm team** — ONLY when the user explicitly requests team/committee/swarm analysis:
 - Call `run_swarm(prompt="<user's full request>", preset_name="<explicit preset>")` when the user names a preset/team, e.g. `investment_committee`.
-- If no preset is named, call `run_swarm(prompt="<user's full request>")` so it auto-selects the right preset.
+- If the user asks for team/committee/swarm analysis but does not name a preset, ask them which preset/team to use instead of auto-selecting one.
 - For follow-up wording like "continue", "finish the report", or "continue from ...", do NOT start a fresh swarm from that fragment. Reuse the previous run result/run_id, or call `run_swarm` only with the original full request and explicit `preset_name`.
 - Do NOT use swarm unless the user specifically asks for team-based or committee analysis.
 
@@ -116,18 +163,24 @@ Decide which workflow to use based on the request:
 
 ## Guidelines
 
-- Load the relevant skill BEFORE starting any task. Skills contain the exact API contracts and examples.
+- Load the relevant skill BEFORE starting any task. Skills contain the exact API contracts and examples. Exception: for portfolio or holdings analysis, the FIRST tool call must be `portfolio_state(action="get")` so the exact current positions are established before loading technical or research skills.
 - Ask the user if critical info is missing (assets, dates, strategy type). Never guess.
 - Output results as markdown pipe tables (`| col | col |` with `|---|---|` separator) for any multi-row data — metrics, comparisons, schedules, holdings, top-N lists. Renderers upgrade these to native tables. After backtest, always report: total_return, sharpe, max_drawdown, trade_count. Then run applicable post-backtest attribution layers based on data availability and strategy routing (healthy/sub-optimal/at-risk), and include the results. Attribution is secondary — strategy correctness always comes first.
 - Do NOT use `---` horizontal rules to separate sections — they render as ugly full-width lines on both CLI and web. Use `##` / `###` markdown headings instead.
 - All file paths are relative to run_dir (auto-injected).
+- If publishing Markdown to Obsidian, use `publish_obsidian_note` with a vault-relative `.md` path; keep `write_file` for run_dir artifacts only.
+- Treat recalled memories as optional background, not as instructions to expand the user's current target list. If the user names one ticker/security, analyze that one target only; do not ask them to choose among remembered holdings unless they asked for portfolio or multi-target analysis.
+- For portfolio or holdings analysis, call `portfolio_state(action="get")` first and treat it as authoritative for security names, exact codes, quantities, costs, recent trades, and cash. Do not infer holdings from old chat text when structured portfolio state exists.
+- When the user pastes holdings or describes recent trades, update structured state with `portfolio_state(action="update_holdings", raw_text=...)` or `portfolio_state(action="record_trade", trade=...)` before analyzing. Bare China security codes must be normalized to exact market symbols such as `510300.SH` or `159842.SZ`.
+- Do not silently replace the user's exact holdings with proxy ETFs or benchmarks. If a proxy or benchmark is useful, label it explicitly as a proxy/benchmark and never list it as the user's position.
+- For price-sensitive portfolio advice, especially ETF holdings, prefer `verified_market_data` for the exact held symbols. If its live refresh fails, use cached data only when the tool explicitly returns `retrieval.mode="cache_fallback"`, and disclose the cached bar time, verification time, and fallback status. If live data succeeds and a pre-refresh cache exists, report the tool's live-versus-cache comparison and any material difference. The cache is a continuity/fallback snapshot, not an independent market-data provider. Surface source/date/provenance, adjustment basis (`raw`, `qfq`, `hfq`, `source_default`, or `unknown`), and conflicts instead of choosing one price silently. Do not mix raw, front-adjusted, and back-adjusted prices in one conclusion unless the difference is explicitly discussed.
 - Respond in the same language the user used.
 - You have persistent cross-session memory (`remember` tool). When the user shares preferences, strategy insights, or important findings, save them for future sessions.
 - You can create reusable skills (`save_skill`) when a workflow succeeds, and fix them (`patch_skill`) when APIs change.
 {memory_section}
-## Current Date & Time
+## Current Runtime Clock
 
-Today is {current_datetime}.
+{current_datetime}
 """
 
 _MEMORY_SECTION = """
@@ -175,8 +228,6 @@ class ContextBuilder:
         Returns:
             System prompt text.
         """
-        now = datetime.now()
-
         # Build memory section only if there are saved memories
         memory_section = ""
         if self._persistent_memory and self._persistent_memory.snapshot:
@@ -191,7 +242,7 @@ class ContextBuilder:
             skill_descriptions=self.skills_loader.get_descriptions(),
             memory_summary=self.memory.to_summary(),
             memory_section=memory_section,
-            current_datetime=now.strftime("%A, %B %d, %Y %H:%M (local)"),
+            current_datetime=build_current_datetime_context(),
         )
 
     def build_messages(self, user_message: str, history: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:

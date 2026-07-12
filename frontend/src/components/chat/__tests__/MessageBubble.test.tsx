@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MessageBubble } from "../MessageBubble";
+import { buildPdfReportTitle, MessageBubble, sanitizePdfFilename } from "../MessageBubble";
 import type { AgentMessage } from "@/types/agent";
 import { api } from "@/lib/api";
 
@@ -39,6 +39,14 @@ describe("MessageBubble", () => {
       render(<MessageBubble msg={makeMsg({ type: "user" })} />);
       expect(screen.getByText("14:30")).toBeInTheDocument();
     });
+
+    it("does not offer branching from a persisted user message", () => {
+      const onFork = vi.fn();
+      const msg = makeMsg({ type: "user", sourceMessageId: "server-msg-1" });
+      render(<MessageBubble msg={msg} onFork={onFork} />);
+
+      expect(screen.queryByTitle("Fork conversation from here")).not.toBeInTheDocument();
+    });
   });
 
   describe("answer messages", () => {
@@ -72,15 +80,48 @@ describe("MessageBubble", () => {
       vi.spyOn(api, "generatePdf").mockResolvedValue(pdf);
       const createObjectURL = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:report");
       const revokeObjectURL = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
-      const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+      let downloadedName = "";
+      const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function () {
+        downloadedName = this.download;
+      });
+      const content = [
+        "数据已齐全，现在开始撰写完整分析。",
+        "",
+        "🔬 科创50ETF（588870.SH）单标持仓深度分析",
+        "分析日期：2026-07-11（周六）",
+        "数据截止：日线至 2026-07-11 收盘",
+      ].join("\n");
 
-      render(<MessageBubble msg={makeMsg({ type: "answer", content: "Report content" })} />);
+      render(<MessageBubble msg={makeMsg({ type: "answer", content })} />);
       await userEvent.setup().click(screen.getByTitle("Generate PDF"));
 
-      expect(api.generatePdf).toHaveBeenCalledWith("Vibe-Trading Research Report", "Report content");
+      expect(api.generatePdf).toHaveBeenCalledWith(
+        "2026-07-11_科创50ETF（588870.SH）单标持仓深度分析",
+        content,
+      );
+      expect(downloadedName).toBe("2026-07-11_科创50ETF（588870.SH）单标持仓深度分析.pdf");
       expect(createObjectURL).toHaveBeenCalledWith(pdf);
       expect(click).toHaveBeenCalled();
       expect(revokeObjectURL).toHaveBeenCalledWith("blob:report");
+    });
+
+    it("builds report titles from markdown headings and uses a safe filename", () => {
+      expect(buildPdfReportTitle(
+        "# 半导体：周度复盘\n\n> **报告日期**: 2026-07-10",
+        new Date(2024, 0, 1),
+      )).toBe("2026-07-10_半导体：周度复盘");
+      expect(sanitizePdfFilename("2026-07-10_半导体：周度复盘/观察?"))
+        .toBe("2026-07-10_半导体：周度复盘_观察_");
+    });
+
+    it("can fork from a persisted answer message", async () => {
+      const onFork = vi.fn();
+      const msg = makeMsg({ type: "answer", sourceMessageId: "server-msg-2" });
+      render(<MessageBubble msg={msg} onFork={onFork} />);
+
+      await userEvent.setup().click(screen.getByTitle("Fork conversation from here"));
+
+      expect(onFork).toHaveBeenCalledWith(msg);
     });
 
     it("generates a PDF without the post-disclaimer follow-up", async () => {
@@ -96,7 +137,7 @@ describe("MessageBubble", () => {
       await userEvent.setup().click(screen.getByTitle("Generate PDF"));
 
       expect(api.generatePdf).toHaveBeenCalledWith(
-        "Vibe-Trading Research Report",
+        expect.stringMatching(/^\d{4}-\d{2}-\d{2}_Vibe-Trading Research Report$/),
         "结论\n免责声明：不构成投资建议。",
       );
     });

@@ -152,6 +152,22 @@ class SessionStore:
             f.flush()
             os.fsync(f.fileno())
 
+    def replace_messages(self, session_id: str, messages: List[Message]) -> None:
+        """Replace the full message log for a session.
+
+        This is used for explicit user edits, where later assistant output from
+        the superseded turn must be pruned before the edited prompt is rerun.
+        """
+        path = self._messages_file(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(".jsonl.tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            for message in messages:
+                f.write(json.dumps(message.to_dict(), ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        tmp_path.replace(path)
+
     def get_messages(self, session_id: str, limit: int = 100) -> List[Message]:
         """Read all messages for a session.
 
@@ -177,6 +193,10 @@ class SessionStore:
                         line[:200],
                     )
         return messages[-limit:]
+
+    def get_all_messages(self, session_id: str) -> List[Message]:
+        """Read all messages for a session in chronological order."""
+        return self.get_messages(session_id, limit=1_000_000)
 
     # ---- Attempt CRUD ----
 

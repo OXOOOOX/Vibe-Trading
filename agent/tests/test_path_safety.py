@@ -6,7 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from src.tools.path_utils import safe_document_path, safe_path, safe_run_dir, safe_run_id, safe_user_path
+from src.tools.path_utils import (
+    safe_document_path,
+    safe_obsidian_note_path,
+    safe_path,
+    safe_run_dir,
+    safe_run_id,
+    safe_user_path,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -168,3 +175,30 @@ class TestSafeRunId:
 
         with pytest.raises(ValueError, match="was not found"):
             safe_run_id("missing_run")
+
+
+class TestSafeObsidianNotePath:
+    def test_configured_vault_relative_note_accepted(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("VIBE_TRADING_OBSIDIAN_VAULT_ROOTS", str(tmp_path))
+
+        result = safe_obsidian_note_path("QQQ/Invest/daily.md")
+
+        assert result == (tmp_path / "QQQ" / "Invest" / "daily.md").resolve()
+
+    def test_unconfigured_vault_rejected(self, tmp_path: Path, monkeypatch):
+        monkeypatch.delenv("VIBE_TRADING_OBSIDIAN_VAULT_ROOTS", raising=False)
+
+        with pytest.raises(ValueError, match="No Obsidian vault root configured"):
+            safe_obsidian_note_path("QQQ/Invest/daily.md")
+
+    def test_parent_traversal_rejected(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("VIBE_TRADING_OBSIDIAN_VAULT_ROOTS", str(tmp_path))
+
+        with pytest.raises(ValueError, match="parent segments"):
+            safe_obsidian_note_path("QQQ/../secrets.md")
+
+    def test_non_markdown_rejected(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("VIBE_TRADING_OBSIDIAN_VAULT_ROOTS", str(tmp_path))
+
+        with pytest.raises(ValueError, match="end with .md"):
+            safe_obsidian_note_path("QQQ/Invest/daily.txt")

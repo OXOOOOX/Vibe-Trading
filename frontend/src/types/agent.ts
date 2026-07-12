@@ -46,6 +46,7 @@ export interface AgentMessage {
   status?: "running" | "ok" | "error";
   elapsed_ms?: number;
   timestamp: number;
+  sourceMessageId?: string;
   runId?: string;
   swarmRunId?: string;
   swarmStatus?: SwarmRunStatus;

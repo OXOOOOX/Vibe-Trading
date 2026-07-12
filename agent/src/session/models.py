@@ -201,3 +201,9 @@ class Attempt:
         self.status = AttemptStatus.FAILED
         self.completed_at = datetime.now().isoformat()
         self.error = error
+
+    def mark_cancelled(self, error: str = "cancelled by user") -> None:
+        """Mark the attempt as explicitly cancelled by the user."""
+        self.status = AttemptStatus.CANCELLED
+        self.completed_at = datetime.now().isoformat()
+        self.error = error

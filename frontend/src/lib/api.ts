@@ -96,9 +96,19 @@ export const api = {
   getRunPine: (id: string) => request<PineScriptResult>(`/runs/${id}/pine`),
   listSessions: () => request<SessionItem[]>("/sessions"),
   createSession: (title?: string) => request<SessionItem>("/sessions", { method: "POST", body: JSON.stringify({ title: title || "" }) }),
+  forkSession: (sid: string, afterMessageId: string, title?: string) =>
+    request<SessionItem>(`/sessions/${sid}/fork`, {
+      method: "POST",
+      body: JSON.stringify({ after_message_id: afterMessageId, title: title || "" }),
+    }),
   deleteSession: (sid: string) => request<{ status: string }>(`/sessions/${sid}`, { method: "DELETE" }),
   renameSession: (sid: string, title: string) => request<{ status: string }>(`/sessions/${sid}`, { method: "PATCH", body: JSON.stringify({ title }) }),
   sendMessage: (sid: string, content: string) => request<{ message_id: string; attempt_id: string }>(`/sessions/${sid}/messages`, { method: "POST", body: JSON.stringify({ content }) }),
+  editMessage: (sid: string, messageId: string, content: string, rerun = true) =>
+    request<{ message_id: string; attempt_id?: string }>(`/sessions/${sid}/messages/${messageId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ content, rerun }),
+    }),
   cancelSession: (sid: string) => request<{ status: string }>(`/sessions/${sid}/cancel`, { method: "POST" }),
   getSessionMessages: (sid: string) => request<MessageItem[]>(`/sessions/${sid}/messages`),
   createGoal: (sid: string, body: CreateGoalRequest) =>
@@ -154,6 +164,57 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(settings),
     }),
+  getPortfolioReview: (limit?: number) =>
+    request<PortfolioReview>(`/portfolio/review${limit ? `?limit=${encodeURIComponent(String(limit))}` : ""}`),
+  updatePortfolioHoldings: (body: UpdatePortfolioHoldingsRequest) =>
+    request<PortfolioReview>("/portfolio/holdings", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  recordPortfolioTrade: (body: RecordPortfolioTradeRequest) =>
+    request<PortfolioReview>("/portfolio/trades", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  refreshPortfolioMarketData: (body: PortfolioMarketRefreshRequest = {}) =>
+    request<PortfolioReview>("/portfolio/refresh-market-data", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  startPortfolioAnalysis: (body: PortfolioAnalysisSessionRequest) =>
+    request<PortfolioAnalysisSession>("/portfolio/analysis-sessions", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  getPortfolioAnalysis: (analysisId: string) =>
+    request<PortfolioAnalysisSession>(`/portfolio/analysis-sessions/${encodeURIComponent(analysisId)}`),
+  startMarketCacheRefresh: (body: MarketCacheRefreshRequest = {}) =>
+    request<MarketCacheRefreshAccepted>("/market-cache/refresh", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  getMarketCacheRun: (runId: string) =>
+    request<MarketCacheRun>(`/market-cache/runs/${encodeURIComponent(runId)}`),
+  getMarketCacheQuotes: (symbols?: string[]) =>
+    request<{ status: string; quotes: MarketCacheQuote[] }>(
+      `/market-cache/quotes${symbols?.length ? `?symbols=${encodeURIComponent(symbols.join(","))}` : ""}`,
+    ),
+  getMarketCacheCoverage: (symbols?: string[]) =>
+    request<{ status: string; coverage: MarketCacheCoverage[] }>(
+      `/market-cache/coverage${symbols?.length ? `?symbols=${encodeURIComponent(symbols.join(","))}` : ""}`,
+    ),
+  getMarketCacheBars: (params: MarketCacheBarsParams) => {
+    const query = new URLSearchParams({
+      symbol: params.symbol,
+      interval: params.interval,
+      adjustment: params.adjustment,
+      view: params.view || "consensus",
+      limit: String(params.limit || 20000),
+    });
+    if (params.start_date) query.set("start_date", params.start_date);
+    if (params.end_date) query.set("end_date", params.end_date);
+    return request<MarketCacheBarsResponse>(`/market-cache/bars?${query.toString()}`);
+  },
 
   // Alpha Zoo API
   listAlphas: (params: AlphaListParams = {}) => {
@@ -287,6 +348,230 @@ export interface DataSourceSettings {
 export interface UpdateDataSourceSettingsRequest {
   tushare_token?: string;
   clear_tushare_token?: boolean;
+}
+
+export interface UpdatePortfolioHoldingsRequest {
+  raw_text: string;
+  cash?: number | null;
+  cash_currency?: string;
+}
+
+export interface RecordPortfolioTradeRequest {
+  code?: string;
+  symbol?: string;
+  name?: string;
+  side: string;
+  quantity?: number | null;
+  price?: number | null;
+  trade_date?: string;
+  notes?: string;
+}
+
+export interface PortfolioMarketRefreshRequest {
+  start_date?: string;
+  end_date?: string;
+  sources?: string[];
+  adjustment?: "source_default" | "raw" | "qfq" | "hfq" | "unknown";
+  tolerance_pct?: number;
+  max_rows?: number;
+}
+
+export interface MarketCacheRefreshRequest {
+  symbols?: string[];
+  profile?: string;
+  sources?: string[];
+  force?: boolean;
+  start_date?: string;
+  end_date?: string;
+}
+
+export interface MarketCacheRefreshItem {
+  id: number;
+  run_id: string;
+  symbol: string;
+  interval: "1m" | "5m" | "1D" | string;
+  adjustment: "raw" | "qfq" | string;
+  status: string;
+  requested_sources: string[];
+  actual_sources: string[];
+  rows_written: number;
+  message?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
+export interface MarketCacheRun {
+  run_id: string;
+  profile: string;
+  status: string;
+  symbols: string[];
+  config: Record<string, unknown>;
+  total_items: number;
+  completed_items: number;
+  conflict_items: number;
+  failed_items: number;
+  current_symbol?: string | null;
+  current_source?: string | null;
+  progress_pct: number;
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  error?: string | null;
+  items: MarketCacheRefreshItem[];
+}
+
+export interface MarketCacheRefreshAccepted {
+  status: string;
+  run_id: string;
+  deduplicated: boolean;
+  run: MarketCacheRun;
+}
+
+export interface MarketCacheCoverage {
+  symbol: string;
+  actual_source: string;
+  interval: string;
+  actual_adjustment: string;
+  min_bar_time: string;
+  max_bar_time: string;
+  row_count: number;
+  last_success_at: string;
+}
+
+export interface MarketCacheQuote {
+  symbol: string;
+  interval: string;
+  bar_time: string;
+  adjustment: string;
+  last_price?: number | null;
+  volume?: number | null;
+  amount?: number | null;
+  vwap?: number | null;
+  status: string;
+  sources: string[];
+  verified_at: string;
+}
+
+export interface MarketCacheBarsParams {
+  symbol: string;
+  interval: "1m" | "5m" | "1D" | string;
+  adjustment: "raw" | "qfq" | string;
+  view?: "consensus" | "source";
+  start_date?: string;
+  end_date?: string;
+  limit?: number;
+}
+
+export interface MarketCacheBar {
+  symbol: string;
+  interval: string;
+  bar_time: string;
+  session_date?: string;
+  adjustment?: string;
+  actual_adjustment?: string;
+  open?: number | null;
+  high?: number | null;
+  low?: number | null;
+  close?: number | null;
+  volume?: number | null;
+  amount?: number | null;
+  vwap?: number | null;
+  status?: string;
+  source_count?: number;
+  sources?: string[];
+  verified_at?: string;
+}
+
+export interface MarketCacheBarsResponse {
+  status: string;
+  symbol: string;
+  interval: string;
+  adjustment: string;
+  view: "consensus" | "source";
+  bars: MarketCacheBar[];
+}
+
+export interface PortfolioHolding {
+  name?: string;
+  code?: string;
+  symbol?: string;
+  quantity?: number | null;
+  cost_price?: number | null;
+  last_price?: number | null;
+  market_value?: number | null;
+  pnl?: number | null;
+  pnl_pct?: number | null;
+  updated_at?: string;
+  [key: string]: unknown;
+}
+
+export interface PortfolioStateSnapshot {
+  holdings: PortfolioHolding[];
+  recent_trades: Array<Record<string, unknown>>;
+  cash?: number | null;
+  cash_currency?: string;
+  updated_at?: string | null;
+}
+
+export interface VerifiedMarketCacheRow {
+  file_name: string;
+  path: string;
+  symbol?: string;
+  status?: string;
+  consensus_close?: number | null;
+  spread_pct?: number | null;
+  requested_adjustment?: string | null;
+  actual_adjustment?: string | null;
+  source_adjustments?: Record<string, { adjustment?: string; confidence?: string; note?: string }>;
+  sources?: string[];
+  observations?: Array<Record<string, unknown>>;
+  interval?: string;
+  bar_time?: string;
+  source_count?: number;
+  volume?: number | null;
+  amount?: number | null;
+  vwap?: number | null;
+  volume_spread_pct?: number | null;
+  amount_spread_pct?: number | null;
+  verified_at?: string;
+  start_date?: string;
+  end_date?: string;
+  modified_at?: string;
+  error?: string;
+}
+
+export interface PortfolioReview {
+  status: string;
+  portfolio_path: string;
+  portfolio_state: PortfolioStateSnapshot;
+  verified_cache_dir: string;
+  verified_market_cache: VerifiedMarketCacheRow[];
+  market_cache_db?: string | null;
+  market_cache_coverage?: MarketCacheCoverage[];
+  active_market_refresh?: MarketCacheRun | null;
+  market_refresh?: Record<string, unknown> | null;
+}
+
+export type PortfolioAnalysisScope = "holding" | "portfolio" | "market";
+export type PortfolioAnalysisPhase = "premarket" | "intraday";
+
+export interface PortfolioAnalysisSessionRequest {
+  scope: PortfolioAnalysisScope;
+  symbol?: string;
+}
+
+export interface PortfolioAnalysisSession {
+  analysis_id: string;
+  session_id: string;
+  scope: PortfolioAnalysisScope;
+  symbol?: string | null;
+  analysis_phase?: PortfolioAnalysisPhase | null;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled" | string;
+  queue_position?: number | null;
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  error?: string | null;
 }
 
 // --- Types matching backend API contracts ---

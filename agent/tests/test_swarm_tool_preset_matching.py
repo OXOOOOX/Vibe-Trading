@@ -55,6 +55,17 @@ def test_ambiguous_continuation_does_not_fallback_to_equity_team() -> None:
     assert "equity_research_team" in error
 
 
+def test_plain_stock_analysis_does_not_fallback_to_equity_team() -> None:
+    preset, error = swarm_tool._resolve_preset(
+        "Analyze 600519.SH and tell me whether to buy or sell."
+    )
+
+    assert preset is None
+    assert error is not None
+    assert "ordinary analysis" in error
+    assert "equity_research_team" in error
+
+
 def test_swarm_tool_rejects_ambiguous_continuation_before_starting_run() -> None:
     payload = json.loads(
         swarm_tool.SwarmTool().execute(

@@ -668,7 +668,9 @@ def test_swarm_tool_forwards_started_and_live_events(monkeypatch):
     monkeypatch.setattr("src.swarm.runtime.SwarmRuntime", FakeRuntime)
 
     tool = swarm_tool.SwarmTool(event_callback=lambda etype, data: captured.append((etype, data)))
-    payload = json.loads(tool.execute(prompt="analyze AAPL"))
+    payload = json.loads(
+        tool.execute(prompt="analyze AAPL", preset_name="equity_research_team")
+    )
 
     assert payload["run_id"] == "r-web-chat"
     assert captured[0][0] == "swarm.started"
@@ -711,7 +713,12 @@ def test_swarm_tool_without_session_callback_preserves_plain_runtime(monkeypatch
     monkeypatch.setattr("src.swarm.store.SwarmStore", FakeStore)
     monkeypatch.setattr("src.swarm.runtime.SwarmRuntime", FakeRuntime)
 
-    payload = json.loads(swarm_tool.SwarmTool().execute(prompt="analyze AAPL"))
+    payload = json.loads(
+        swarm_tool.SwarmTool().execute(
+            prompt="analyze AAPL",
+            preset_name="equity_research_team",
+        )
+    )
 
     assert payload["run_id"] == "r-no-session"
     assert payload["status"] == "running"

@@ -1,7 +1,8 @@
 """SwarmTool: tool for the main agent to invoke a swarm multi-agent team.
 
-The user provides a natural-language prompt; the tool auto-selects the best preset and extracts variables.
-Blocks synchronously until the run completes and returns a JSON summary.
+Use only when the user explicitly asks for team/committee/swarm analysis or
+names a preset. Blocks synchronously until the run completes and returns a
+JSON summary.
 """
 
 from __future__ import annotations
@@ -458,6 +459,14 @@ def _resolve_preset(prompt: str, explicit_preset: str | None = None) -> tuple[st
             "Refusing to auto-route this continuation to equity_research_team.",
         )
 
+    if not _has_preset_signal(prompt):
+        return (
+            None,
+            "No explicit swarm preset or team keyword found. Refusing to auto-route "
+            "ordinary analysis to equity_research_team; ask the user for a preset_name "
+            "or handle the request as single-agent analysis.",
+        )
+
     return _match_preset(prompt), None
 
 
@@ -632,17 +641,18 @@ def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
 class SwarmTool(BaseTool):
     """Launch a swarm multi-agent team to execute complex tasks.
 
-    Accepts a natural-language prompt, auto-selects the best preset,
+    Accepts a natural-language prompt only for explicit team/swarm requests
     and blocks synchronously until the swarm run completes or times out.
     """
 
     name = "run_swarm"
     description = (
-        "Run a multi-agent swarm team for complex analysis tasks. "
-        "Provide a natural language prompt and, when known, an explicit preset_name from agent/src/swarm/presets "
+        "Run a multi-agent swarm team only when the user explicitly asks for team, committee, swarm, or preset-based analysis. "
+        "Provide a natural language prompt and an explicit preset_name from agent/src/swarm/presets whenever possible "
         "(e.g. equity_research_team, quant_strategy_desk, global_allocation_committee, risk_committee) "
         "so follow-up/continuation prompts do not lose routing context. "
-        "Example: run_swarm(prompt='Analyze A-share new energy opportunities for Q2 2026', preset_name='equity_research_team')"
+        "Do not use this for ordinary single-stock analysis unless the user requested a multi-agent team. "
+        "Example: run_swarm(prompt='Use the equity_research_team preset to analyze A-share new energy opportunities for Q2 2026', preset_name='equity_research_team')"
     )
     parameters = {
         "type": "object",

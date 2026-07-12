@@ -232,6 +232,7 @@
     "edit": "Edit",
     "cancel": "Cancel",
     "save": "Save",
+    "saveAndSend": "Save & send",
     "cancelGoal": "Cancel goal",
     "describeGoal": "Describe the research goal to attach to this session",
     "placeholder": "e.g. Create a dual MA crossover strategy for 000001.SZ, backtest 2024",
@@ -265,7 +266,9 @@
     "uploaded": "Uploaded: {{filename}}",
     "uploadFailed": "Upload failed: {{error}}",
     "failedToSend": "Failed to send message, please retry.",
-    "failedToContinue": "Failed to continue goal, please retry."
+    "failedToContinue": "Failed to continue goal, please retry.",
+    "conversationForked": "Forked into a new conversation",
+    "failedToForkConversation": "Failed to fork conversation."
   },
   "runDetail": {
     "title": "Run Detail",
@@ -529,6 +532,7 @@
   "messageBubble": {
     "copied": "Copied",
     "copy": "Copy",
+    "forkConversation": "Fork conversation from here",
     "generatePdf": "Generate PDF",
     "pdfRendererUnavailable": "The PDF renderer is unavailable. The system print dialog has been opened instead.",
     "pdfGenerationFailed": "PDF generation failed.",

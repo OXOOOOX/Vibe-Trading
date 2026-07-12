@@ -47,6 +47,9 @@ pydantic>=2.0.0
 python-multipart>=0.0.18
 sse-starlette>=1.6.0
 
+# Feishu bot long-connection channel (also available via the `feishu` package extra)
+lark-oapi>=1.7.1,<2
+
 # MCP Server
 fastmcp>=2.14.0
 

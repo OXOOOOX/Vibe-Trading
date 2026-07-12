@@ -32,6 +32,20 @@ interface Props {
   height?: number;
 }
 
+export function getCandlestickValues(param: { data?: unknown; value?: unknown }): [number, number, number, number] | null {
+  for (const candidate of [param.data, param.value]) {
+    const value = candidate && typeof candidate === "object" && !Array.isArray(candidate) && "value" in candidate
+      ? (candidate as { value?: unknown }).value
+      : candidate;
+    if (!Array.isArray(value) || value.length < 4) continue;
+    const raw = value.slice(-4);
+    if (raw.every((item) => typeof item === "number" && Number.isFinite(item))) {
+      return raw as [number, number, number, number];
+    }
+  }
+  return null;
+}
+
 export function CandlestickChart({ data, markers, indicators, height = 500 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<ReturnType<typeof echarts.init> | null>(null);
@@ -202,18 +216,40 @@ export function CandlestickChart({ data, markers, indicators, height = 500 }: Pr
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         formatter: (params: any) => {
           if (!Array.isArray(params) || !params.length) return "";
-          let html = `<b>${params[0].axisValue}</b>`;
+          const indexedParam = params.find((p: { dataIndex?: unknown }) => Number.isInteger(p.dataIndex));
+          const axisValue = indexedParam?.axisValue ?? params[0].axisValue;
+          const axisIndex = typeof indexedParam?.dataIndex === "number"
+            ? indexedParam.dataIndex
+            : dates.indexOf(String(axisValue));
+          const sourceBar = axisIndex >= 0 ? data[axisIndex] : undefined;
+          const candleParam = params.find((p: { seriesName?: string }) => p.seriesName === "K");
+          const fallbackValues = candleParam ? getCandlestickValues(candleParam) : null;
+          const candleValues = sourceBar
+            ? [sourceBar.open, sourceBar.close, sourceBar.low, sourceBar.high] as [number, number, number, number]
+            : fallbackValues;
+
+          let html = `<b>${axisValue ?? ""}</b>`;
+          if (candleValues) {
+            const [open, close, low, high] = candleValues;
+            const previousClose = axisIndex > 0 ? data[axisIndex - 1]?.close : undefined;
+            const change = previousClose == null ? null : close - previousClose;
+            const changePct = previousClose ? (change! / previousClose) * 100 : null;
+            const amplitude = previousClose ? ((high - low) / previousClose) * 100 : null;
+            const priceDigits = candleValues.some((value) => Math.abs(value) < 10) ? 3 : 2;
+            const directionColor = change == null || change >= 0 ? t.upColor : t.downColor;
+            const signed = (value: number, digits = priceDigits) => `${value >= 0 ? "+" : ""}${value.toFixed(digits)}`;
+            const changeText = change == null || changePct == null
+              ? "--"
+              : `<span style="color:${directionColor}">${signed(change)} (${signed(changePct, 2)}%)</span>`;
+
+            html += `<br/>开盘：${open.toFixed(priceDigits)}&nbsp;&nbsp;最高：${high.toFixed(priceDigits)}`;
+            html += `<br/>最低：${low.toFixed(priceDigits)}&nbsp;&nbsp;收盘：<b style="color:${directionColor}">${close.toFixed(priceDigits)}</b>`;
+            html += `<br/>涨跌：${changeText}&nbsp;&nbsp;振幅：${amplitude == null ? "--" : `${amplitude.toFixed(2)}%`}`;
+            if (sourceBar) html += `<br/>成交量：${abbreviateNum(sourceBar.volume)}`;
+          }
+
           for (const p of params) {
-            if (p.seriesName === "K" && Array.isArray(p.value)) {
-              const [open, close, low, high] = p.value;
-              const chg = close - open;
-              const pct = open ? ((chg / open) * 100).toFixed(2) : "0.00";
-              const clr = chg >= 0 ? t.upColor : t.downColor;
-              html += `<br/>O: ${open.toFixed(2)}&nbsp; H: ${high.toFixed(2)}`;
-              html += `<br/>L: ${low.toFixed(2)}&nbsp; C: <span style="color:${clr}"><b>${close.toFixed(2)}</b> ${chg >= 0 ? "+" : ""}${chg.toFixed(2)} (${chg >= 0 ? "+" : ""}${pct}%)</span>`;
-            } else if (p.seriesName === "Vol") {
-              html += `<br/>Vol: ${abbreviateNum(Number(p.value))}`;
-            } else if (p.value != null) {
+            if (p.seriesName !== "K" && p.seriesName !== "Vol" && p.value != null) {
               html += `<br/>${p.marker} ${p.seriesName}: ${Number(p.value).toFixed(2)}`;
             }
           }

@@ -1,7 +1,7 @@
 import { useTranslation } from "react-i18next";
 import { useEffect, useState } from "react";
 import { Link, Outlet, useLocation, useSearchParams } from "react-router-dom";
-import { Activity, BarChart3, Bot, FileText, Languages, Moon, Sun, Plus, Trash2, Pencil, MessageSquare, ChevronsLeft, ChevronsRight, Settings, Layers, Loader2 } from "lucide-react";
+import { Activity, BarChart3, Bot, BriefcaseBusiness, FileText, Languages, Moon, Sun, Plus, Trash2, Pencil, MessageSquare, ChevronsLeft, ChevronsRight, Settings, Layers, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useDarkMode } from "@/hooks/useDarkMode";
 import { api, type SessionItem } from "@/lib/api";
@@ -28,6 +28,7 @@ export function Layout() {
     { to: "/", icon: BarChart3, label: t('layout.home') },
     { to: "/agent", icon: Bot, label: t('layout.agent') },
     { to: "/runtime", icon: Activity, label: t('layout.runtime') },
+    { to: "/portfolio", icon: BriefcaseBusiness, label: isChinese ? "组合/持仓" : "Portfolio" },
     { to: "/reports", icon: FileText, label: t('layout.reports') },
     { to: "/alpha-zoo", icon: Layers, label: t('layout.alphaZoo') },
     { to: "/settings", icon: Settings, label: t('layout.settings') },
@@ -86,19 +87,19 @@ export function Layout() {
     <div className="flex h-screen bg-background">
       {/* Sidebar */}
       <aside className={cn(
-        "border-r bg-card flex flex-col shrink-0 transition-all duration-200",
-        collapsed ? "w-12" : "w-64"
+        "flex w-12 shrink-0 flex-col border-r bg-card transition-all duration-200",
+        collapsed ? "md:w-12" : "md:w-64"
       )}>
         {/* Brand */}
-        <div className={cn("border-b", collapsed ? "p-2 flex justify-center" : "p-4")}>
-          <Link to="/" className={cn("flex items-center font-bold text-base tracking-tight", collapsed ? "justify-center" : "gap-2")}>
+        <div className={cn("flex justify-center border-b p-2", !collapsed && "md:block md:p-4")}>
+          <Link to="/" className={cn("flex items-center justify-center text-base font-bold tracking-tight", !collapsed && "md:justify-start md:gap-2")} title="Vibe-Trading">
             <BarChart3 className="h-5 w-5 text-primary shrink-0" />
-            {!collapsed && "Vibe-Trading"}
+            {!collapsed ? <span className="hidden md:inline">Vibe-Trading</span> : null}
           </Link>
         </div>
 
         {/* Nav */}
-        <nav className={cn("space-y-0.5", collapsed ? "p-1" : "p-2")}>
+        <nav className={cn("space-y-0.5 p-1", !collapsed && "md:p-2")}>
           {NAV.map(({ to, icon: Icon, label }) => {
             const text = label;
             return (
@@ -107,15 +108,16 @@ export function Layout() {
                 to={to}
                 className={cn(
                   "flex items-center rounded-md text-sm transition-colors",
-                  collapsed ? "justify-center p-2" : "gap-3 px-3 py-2",
+                  "justify-center p-2",
+                  !collapsed && "md:justify-start md:gap-3 md:px-3 md:py-2",
                   (to === "/" ? pathname === "/" : pathname.startsWith(to))
                     ? "bg-primary/10 text-primary font-medium"
                     : "text-muted-foreground hover:bg-muted hover:text-foreground"
                 )}
-                title={collapsed ? text : undefined}
+                title={text}
               >
                 <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
-                {!collapsed && text}
+                {!collapsed ? <span className="hidden md:inline">{text}</span> : null}
               </Link>
             );
           })}
@@ -123,7 +125,7 @@ export function Layout() {
 
         {/* Sessions — hidden when collapsed */}
         {!collapsed && (
-          <div className="flex-1 overflow-auto border-t mt-2 flex flex-col">
+          <div className="mt-2 hidden flex-1 flex-col overflow-auto border-t md:flex">
             <div className="flex items-center justify-between px-4 py-2">
               <span className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
                 <MessageSquare className="h-3.5 w-3.5" />
@@ -219,9 +221,19 @@ export function Layout() {
 
         {/* Spacer when collapsed */}
         {collapsed && <div className="flex-1" />}
+        {!collapsed ? <div className="flex-1 md:hidden" /> : null}
+
+        <div className="flex flex-col items-center gap-1 border-t p-1 md:hidden">
+          <button onClick={toggle} className="p-1.5 text-muted-foreground transition-colors hover:text-foreground" title={dark ? t('layout.light') : t('layout.dark')}>
+            {dark ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
+          </button>
+          <button onClick={switchLanguage} className="p-1.5 text-muted-foreground transition-colors hover:text-foreground" title={isChinese ? "English" : "中文"}>
+            <Languages className="h-3.5 w-3.5" />
+          </button>
+        </div>
 
         {/* Footer */}
-        <div className={cn("border-t", collapsed ? "p-1 flex flex-col items-center gap-1" : "p-3 space-y-2")}>
+        <div className={cn("hidden border-t", collapsed ? "md:flex md:flex-col md:items-center md:gap-1 md:p-1" : "md:block md:space-y-2 md:p-3")}>
           {collapsed ? (
             <>
               <button onClick={toggle} className="p-1.5 text-muted-foreground hover:text-foreground rounded transition-colors" title={dark ? t('layout.light') : t('layout.dark')}>
@@ -267,7 +279,7 @@ export function Layout() {
       </aside>
 
       {/* Main */}
-      <div className="flex-1 flex flex-col overflow-hidden">
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <ConnectionBanner status={sseStatus} retryAttempt={sseRetryAttempt} />
         <main className="flex-1 overflow-auto">
           <Outlet />

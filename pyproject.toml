@@ -94,6 +94,9 @@ include = ["src*", "backtest*", "cli*"]
 "src.factors" = ["zoo/**/*.yaml", "zoo/**/*.md", "zoo/**/NOTICE"]
 
 [project.optional-dependencies]
+feishu = [
+    "lark-oapi>=1.7.1,<2",
+]
 ibkr = [
     "ib_async>=2.0",
 ]

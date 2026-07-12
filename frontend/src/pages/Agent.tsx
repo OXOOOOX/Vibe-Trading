@@ -1,4 +1,4 @@
-import { useTranslation } from 'react-i18next';
+﻿import { useTranslation } from 'react-i18next';
 import { useEffect, useRef, useState, useMemo, useCallback, type FormEvent } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Send, Loader2, ArrowDown, Square, Download, Plus, Paperclip, X, Users, Target, ChevronDown, Pencil, Check, Play, OctagonX, Activity, Ban, CheckCircle2, Landmark } from "lucide-react";
@@ -46,7 +46,7 @@ function groupMessages(msgs: AgentMessage[]): MsgGroup[] {
 
 const act = () => useAgentStore.getState();
 
-// i18n hook for Agent component — used inside the component below
+// i18n hook for Agent component 鈥?used inside the component below
 // (declared at module scope for helper usage is fine since t() reads from i18n singleton)
 
 /** Poll cadence for the shared `GET /live/status` snapshot. */
@@ -58,7 +58,7 @@ const CONNECTOR_PORTFOLIO_PROMPT =
 
 /* ---------- Connector runtime channel ----------
  * Mandate proposals and live-action chips render as standalone timeline items,
- * never folded into the thinking timeline (SPEC Consent §2 grouping note). They
+ * never folded into the thinking timeline (SPEC Consent 搂2 grouping note). They
  * are driven by dedicated state rather than the chat message store because they
  * are privileged-surface artifacts, not chat messages, and the proposal card
  * needs commit/adjust callbacks the generic MessageBubble does not carry. */
@@ -121,20 +121,21 @@ function LiveActionChip({ action }: { action: LiveAction }) {
           <span className="shrink-0 font-medium uppercase tracking-wide text-[10px]">RUNTIME</span>
           <span className="shrink-0 font-medium">{liveActionLabel(action)}</span>
           {action.intent_normalized && (
-            <span className="truncate text-foreground/80">· {action.intent_normalized}</span>
+            <span className="truncate text-foreground/80">路 {action.intent_normalized}</span>
           )}
           {action.outcome && (
-            <span className="shrink-0 font-mono text-[10px] text-muted-foreground">· {action.outcome}</span>
+            <span className="shrink-0 font-mono text-[10px] text-muted-foreground">路 {action.outcome}</span>
           )}
           {action.remote_tool && (
-            <span className="shrink-0 font-mono text-[10px] text-muted-foreground">· {action.remote_tool}</span>
+            <span className="shrink-0 font-mono text-[10px] text-muted-foreground">路 {action.remote_tool}</span>
           )}
-          {action.error && <span className="truncate text-destructive">· {action.error}</span>}
+          {action.error && <span className="truncate text-destructive">路 {action.error}</span>}
         </div>
       </div>
     </div>
   );
 }
+
 
 function isCriterionStatusMet(status: string): boolean {
   return !["", "pending", "open", "unsatisfied"].includes(status.toLowerCase());
@@ -225,7 +226,7 @@ export function Agent() {
   const lastEventRef = useRef(0);
   const sseTimeoutMsRef = useRef(90_000);
 
-  /* tool_progress coalescing — keep latest payload per-tool, flush once per rAF. */
+  /* tool_progress coalescing 鈥?keep latest payload per-tool, flush once per rAF. */
   const pendingProgressRef = useRef<Map<string, NonNullable<ToolCallEntry["progress"]>>>(new Map());
   const progressRafRef = useRef(0);
 
@@ -241,7 +242,7 @@ export function Agent() {
   const [goalEditActive, setGoalEditActive] = useState(false);
   const [goalEditValue, setGoalEditValue] = useState("");
 
-  /* Connector runtime channel state (SPEC Consent §1/§4/§5) */
+  /* Connector runtime channel state (SPEC Consent 搂1/搂4/搂5) */
   const [liveItems, setLiveItems] = useState<LiveItem[]>([]);
   const [committedMandates, setCommittedMandates] = useState<Record<string, MandateCommitted>>({});
   const [liveHalted, setLiveHalted] = useState<LiveHalted | null>(null);
@@ -252,7 +253,7 @@ export function Agent() {
   /* Shared `GET /live/status` snapshot. Owned here (single poller) and passed down
    * to RunnerStatus, so the global kill switch can be shown whenever connector runtime
    * could be active out-of-band (CLI/another session), not only off in-session SSE
-   * items (audit M2: always-available global halt — SPEC Consent §4). */
+   * items (audit M2: always-available global halt 鈥?SPEC Consent 搂4). */
   const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
   const [reasoningActive, setReasoningActive] = useState(false);
   /* The status endpoint is not wired on every backend; a 404/501 hides the panel
@@ -270,7 +271,7 @@ export function Agent() {
 
   const urlSessionId = searchParams.get("session");
 
-  /* Smart scroll — only auto-scroll when near bottom */
+  /* Smart scroll 鈥?only auto-scroll when near bottom */
   const isNearBottom = useCallback(() => {
     const el = listRef.current;
     if (!el) return true;
@@ -356,14 +357,14 @@ export function Agent() {
         const metrics = meta?.metrics as Record<string, number> | undefined;
         const ts = new Date(m.created_at).getTime();
         if (m.role === "user") {
-          agentMsgs.push({ id: m.message_id, type: "user", content: m.content, timestamp: ts });
+          agentMsgs.push({ id: m.message_id, sourceMessageId: m.message_id, type: "user", content: m.content, timestamp: ts });
         } else if (runId) {
           // Show text answer first (if non-empty), then chart card
           if (m.content && m.content !== "Strategy execution completed.") {
-            agentMsgs.push({ id: m.message_id + "_ans", type: "answer", content: m.content, timestamp: ts });
+            agentMsgs.push({ id: m.message_id + "_ans", sourceMessageId: m.message_id, type: "answer", content: m.content, timestamp: ts });
           }
           if (metrics && Object.keys(metrics).length > 0) {
-            agentMsgs.push({ id: m.message_id, type: "run_complete", content: "", runId, metrics, timestamp: ts + 1 });
+            agentMsgs.push({ id: m.message_id, sourceMessageId: m.message_id, type: "run_complete", content: "", runId, metrics, timestamp: ts + 1 });
           } else {
             // Fetch run data to check report-worthiness; show fallback card if fetch fails
             let fetchedMetrics: Record<string, number> | undefined;
@@ -376,14 +377,15 @@ export function Agent() {
                 fetchedCurve = runData.equity_curve?.map((e) => ({ time: e.time, equity: Number(e.equity) }));
                 showCard = true;
               }
-              // succeeded but not report-worthy (plain chat turn) → skip card
+              // succeeded but not report-worthy (plain chat turn) 鈫?skip card
             } catch {
-              // fetch failed (auth/404/network) → can't tell, show link as fallback
+              // fetch failed (auth/404/network) 鈫?can't tell, show link as fallback
               showCard = true;
             }
             if (showCard) {
               agentMsgs.push({
                 id: m.message_id,
+                sourceMessageId: m.message_id,
                 type: "run_complete",
                 content: "",
                 runId,
@@ -394,7 +396,7 @@ export function Agent() {
             }
           }
         } else {
-          agentMsgs.push({ id: m.message_id, type: "answer", content: m.content, timestamp: ts });
+          agentMsgs.push({ id: m.message_id, sourceMessageId: m.message_id, type: "answer", content: m.content, timestamp: ts });
         }
       }
       if (genRef.current !== gen) return;
@@ -465,7 +467,7 @@ export function Agent() {
         if (act().status !== "streaming") act().setStatus("streaming");
         scrollToBottom();
       },
-      thinking_done: () => { touch(); /* don't flush — keep streaming text visible */ },
+      thinking_done: () => { touch(); /* don't flush 鈥?keep streaming text visible */ },
 
       tool_call: (d) => {
         touch();
@@ -540,7 +542,7 @@ export function Agent() {
 
       "attempt.created": () => {
         touch();
-        // Backend has created a new attempt — ensure streaming state is active
+        // Backend has created a new attempt 鈥?ensure streaming state is active
         // even if we connected mid-stream (SSE replay / page reload).
         if (act().status !== "streaming") act().setStatus("streaming");
       },
@@ -596,7 +598,7 @@ export function Agent() {
               showCard = true;
             }
           } catch {
-            showCard = true; // fetch failed → show link as fallback
+            showCard = true; // fetch failed 鈫?show link as fallback
           }
           if (showCard || shadowId) {
             s.addMessage({
@@ -625,6 +627,16 @@ export function Agent() {
         act().setStatus("idle");
         // Clear stale toolCalls so the next turn's running indicator doesn't
         // briefly show the previous turn's progress before fresh events land.
+        useAgentStore.setState({ toolCalls: [] });
+        scrollToBottom();
+      },
+
+      "attempt.cancelled": () => {
+        touch();
+        setReasoningActive(false);
+        act().clearStreaming();
+        act().addMessage({ id: "", type: "answer", content: "Execution cancelled.", timestamp: Date.now() });
+        act().setStatus("idle");
         useAgentStore.setState({ toolCalls: [] });
         scrollToBottom();
       },
@@ -696,7 +708,7 @@ export function Agent() {
         touch();
         const halted = d as unknown as LiveHalted;
         // Preemptive kill switch: the server has cancelled resting orders and may have
-        // flattened positions (SPEC §7.5 #6). Reflect the halted state across surfaces;
+        // flattened positions (SPEC 搂7.5 #6). Reflect the halted state across surfaces;
         // the RunnerStatus panel re-polls so its per-broker rows show "halted".
         setLiveHalted(halted);
         setLiveStatusRefresh((n) => n + 1);
@@ -705,7 +717,7 @@ export function Agent() {
 
       "live.resumed": (d) => {
         touch();
-        // Kill switch cleared via a privileged surface action (SPEC Consent §4);
+        // Kill switch cleared via a privileged surface action (SPEC Consent 搂4);
         // clear the halted banner and re-poll runtime status.
         void d;
         setLiveHalted(null);
@@ -841,7 +853,7 @@ export function Agent() {
     // Arm the clock at the start of every streaming turn. Without this, a turn
     // whose very first event never arrives (e.g. the LLM provider hangs before
     // emitting a single token) left lastEventRef at its 0 / stale value, so the
-    // guard below short-circuited and the UI hung on "Agent is working…"
+    // guard below short-circuited and the UI hung on "Agent is working鈥?
     // forever. touch() refreshes this on every real event; the no-op heartbeat
     // deliberately does not, so a connection that only keep-alives still trips.
     lastEventRef.current = Date.now();
@@ -960,7 +972,7 @@ export function Agent() {
       // global trip.
       await api.haltLive(sessionId ?? undefined);
       // Preemptive halt: the server trips the kill switch (cancel resting orders +
-      // optional flatten per SPEC §7.5 #6) and broadcasts live.halted. Reflect
+      // optional flatten per SPEC 搂7.5 #6) and broadcasts live.halted. Reflect
       // optimistically and re-poll the runtime panel so the runner shows stopped.
       setLiveHalted((cur) => cur ?? { broker: null, by: "frontend", tripped_at: new Date().toISOString() });
       setLiveStatusRefresh((n) => n + 1);
@@ -1047,6 +1059,47 @@ export function Agent() {
     if (!userContent) return;
     runPrompt(userContent);
   }, [status]);
+
+  const latestUserMessageId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i].type === "user") return messages[i].id;
+    }
+    return null;
+  }, [messages]);
+
+  const handleEditUserMessage = useCallback(async (msg: AgentMessage, content: string) => {
+    if (!sessionId || !msg.sourceMessageId || status === "streaming") return;
+    try {
+      setupSSE(sessionId);
+      const msgIndex = messages.findIndex((candidate) => candidate.id === msg.id);
+      act().loadHistory(messages.filter((item) => {
+        const itemIndex = messages.findIndex((candidate) => candidate.id === item.id);
+        return msgIndex < 0 || itemIndex <= msgIndex;
+      }).map((item) => (item.id === msg.id ? { ...item, content, timestamp: Date.now() } : item)));
+      act().setStatus("streaming");
+      setReasoningActive(false);
+      useAgentStore.setState({ toolCalls: [] });
+      forceScrollToBottom();
+      const sent = await api.editMessage(sessionId, msg.sourceMessageId, content, true);
+      if (sent.attempt_id) void syncCompletedAttempt(sessionId, sent.attempt_id);
+    } catch (error) {
+      act().setStatus("error");
+      const message = error instanceof Error ? error.message : t('agent.failedToSend');
+      toast.error(message);
+      act().addMessage({ id: "", type: "error", content: message, timestamp: Date.now() });
+    }
+  }, [forceScrollToBottom, messages, sessionId, setupSSE, status, syncCompletedAttempt, t]);
+
+  const handleFork = useCallback(async (msg: AgentMessage) => {
+    if (!sessionId || !msg.sourceMessageId) return;
+    try {
+      const fork = await api.forkSession(sessionId, msg.sourceMessageId);
+      setSearchParams({ session: fork.session_id });
+      toast.success(t('agent.conversationForked'));
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : t('agent.failedToForkConversation'));
+    }
+  }, [sessionId, setSearchParams, t]);
 
   const handleExport = () => {
     if (messages.length === 0) return;
@@ -1140,8 +1193,8 @@ export function Agent() {
     return rows.sort((a, b) => a.sort - b.sort);
   }, [groups, liveItems]);
 
-  /* Whether connector runtime activity could be active *anywhere* — the global kill switch must be
-   * available whenever it could (audit M2 / SPEC Consent §4). Driven off both
+  /* Whether connector runtime activity could be active *anywhere* 鈥?the global kill switch must be
+   * available whenever it could (audit M2 / SPEC Consent 搂4). Driven off both
    * in-session SSE artifacts AND the shared `/live/status` snapshot, so a runner
    * started from the CLI or another browser session still surfaces the halt button
    * in a freshly-loaded web session. */
@@ -1212,7 +1265,13 @@ export function Agent() {
             }
             return (
               <div key={row.key} data-msg-idx={msgIdx}>
-                <MessageBubble msg={g.msg} onRetry={g.msg.type === "error" ? handleRetry : undefined} />
+                <MessageBubble
+                  msg={g.msg}
+                  onRetry={g.msg.type === "error" ? handleRetry : undefined}
+                  onFork={g.msg.type === "answer" ? handleFork : undefined}
+                  canEdit={g.msg.type === "user" && g.msg.id === latestUserMessageId && status !== "streaming"}
+                  onEdit={handleEditUserMessage}
+                />
               </div>
             );
           })}
@@ -1252,7 +1311,7 @@ export function Agent() {
             </div>
           )}
 
-          {/* Persistent streaming pulse bar — always visible while agent is working */}
+          {/* Persistent streaming pulse bar 鈥?always visible while agent is working */}
           {status === "streaming" && (
             <div className="flex items-center gap-2 px-1 pt-1">
               <div className="h-0.5 flex-1 rounded-full bg-primary/20 overflow-hidden">
@@ -1464,8 +1523,8 @@ export function Agent() {
               )}
             </div>
           )}
-          {/* Persistent live runtime status panel — sits alongside the goal/mandate
-              badges (SPEC §7.5 + audit C2). Self-hides when no broker is configured. */}
+          {/* Persistent live runtime status panel 鈥?sits alongside the goal/mandate
+              badges (SPEC 搂7.5 + audit C2). Self-hides when no broker is configured. */}
           <RunnerStatus
             status={liveStatus}
             unavailable={liveStatusUnavailable}
@@ -1491,8 +1550,8 @@ export function Agent() {
               {t('agent.uploading')}
             </div>
           )}
-          {/* Persistent kill switch — distinct from the per-turn Stop button
-              above; disables all live order activity (SPEC Consent §4). */}
+          {/* Persistent kill switch 鈥?distinct from the per-turn Stop button
+              above; disables all live order activity (SPEC Consent 搂4). */}
           {liveActive && (
             <div className="flex items-center gap-2">
               {liveIsHalted ? (

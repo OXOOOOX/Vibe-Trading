@@ -93,6 +93,14 @@ class TestAttributionPromptIntegrity:
 
         assert "Override" in _SYSTEM_PROMPT or "override" in _SYSTEM_PROMPT
 
+    def test_obsidian_publish_rule_present(self):
+        """Obsidian publishing should route to the dedicated vault tool."""
+        from src.agent.context import _SYSTEM_PROMPT
+
+        assert "publish_obsidian_note" in _SYSTEM_PROMPT
+        assert "write_file" in _SYSTEM_PROMPT
+        assert "run_dir artifacts" in _SYSTEM_PROMPT
+
     def test_threshold_rationale_self_contained(self):
         """Threshold rationale is documented inline, not via a gitignored docs/ path."""
         from pathlib import Path

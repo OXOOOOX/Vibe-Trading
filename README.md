@@ -566,10 +566,13 @@ Copy `agent/.env.example` to `agent/.env` and uncomment the provider block you w
 | `VIBE_TRADING_ENABLE_SHELL_TOOLS` | No | Explicit opt-in for shell-capable tools in remote API/MCP-SSE style deployments |
 | `VIBE_TRADING_ALLOWED_FILE_ROOTS` | No | Extra comma-separated roots for document and broker-journal imports |
 | `VIBE_TRADING_ALLOWED_RUN_ROOTS` | No | Extra comma-separated roots for generated-code run directories |
+| `VIBE_TRADING_OBSIDIAN_VAULT_ROOTS` | No | Extra comma-separated Obsidian vault roots for `publish_obsidian_note`; note paths must be relative `.md` files inside a configured vault |
 
 <sub>* Ollama does not require an API key. OpenAI Codex uses ChatGPT OAuth and stores tokens via `oauth-cli-kit`, not in `agent/.env`.</sub>
 
 **Free data (no key needed):** A-shares via AKShare, HK/US equities via yfinance, crypto via OKX, 100+ crypto exchanges via CCXT. The system automatically selects the best available source for each market.
+
+**Obsidian publishing:** Set `VIBE_TRADING_OBSIDIAN_VAULT_ROOTS` before asking the agent to publish notes to Obsidian, for example `VIBE_TRADING_OBSIDIAN_VAULT_ROOTS=C:\Users\you\Documents\Obsidian`. The publishing tool writes only Markdown notes under that configured vault and refuses paths outside it.
 
 ### 🎯 Recommended Models
 
@@ -746,6 +749,26 @@ vibe-trading run -p "Summarize the key risks and beats/misses from this earnings
 ---
 
 ## 🌐 API Server
+
+### Feishu bot (home-server remote access)
+
+Vibe-Trading can receive research and backtest questions from a Feishu self-built app bot over the official long connection. The API remains bound to localhost; the bot only needs outbound internet access.
+
+```bash
+pip install "vibe-trading-ai[feishu]"
+```
+
+Configure the app credentials and explicit chat/user allowlists in `agent/.env`, then restart `vibe-trading serve`:
+
+```dotenv
+FEISHU_BOT_ENABLED=1
+FEISHU_APP_ID=cli_xxx
+FEISHU_APP_SECRET=xxx
+FEISHU_ALLOWED_CHAT_IDS=oc_xxx
+FEISHU_OPERATOR_OPEN_IDS=ou_xxx
+```
+
+Enable the bot capability, subscribe to `im.message.receive_v1`, grant group `@bot` message read and bot-message send permissions, and select long connection in the Feishu developer console. In group chats, each top-level `@bot` message creates a Vibe-Trading session; replies inside that Feishu topic continue it. Different topics can run concurrently, while messages in one topic are queued in order. Commands are `/status`, `/cancel`, `/sessions`, and `/help`. The channel intentionally exposes research and backtesting only—live-trading controls are not available through Feishu.
 
 ```bash
 vibe-trading serve --port 8899

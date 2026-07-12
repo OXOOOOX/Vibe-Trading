@@ -1,6 +1,6 @@
 import i18n from '@/i18n';
 import { memo, useState, useCallback } from "react";
-import { User, XCircle, RefreshCw, Copy, Check, FileDown, Loader2 } from "lucide-react";
+import { User, XCircle, RefreshCw, Copy, Check, FileDown, Loader2, GitBranch, Pencil, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -29,6 +29,61 @@ export function trimPostDisclaimerFollowUp(text: string): string {
   return text.slice(0, disclaimerIndex + markerIndex).trimEnd();
 }
 
+function localIsoDate(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function cleanReportTitleLine(line: string): string {
+  return line
+    .trim()
+    .replace(/^#{1,6}\s+/, "")
+    .replace(/^[^\p{L}\p{N}]+/u, "")
+    .replace(/(?:\*\*|__|`)+$/g, "")
+    .trim();
+}
+
+export function buildPdfReportTitle(text: string, now = new Date()): string {
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const plainText = text.replace(/[*_`]/g, "");
+  const dateMatch = plainText.match(/(?:分析日期|报告日期)\s*[：:]\s*(\d{4}-\d{2}-\d{2})/);
+  const date = dateMatch?.[1] ?? localIsoDate(now);
+  const metadataLine = /^(?:分析日期|报告日期|数据截止|声明|免责声明)\s*[：:]/;
+  const isMetadataLine = (line: string) => metadataLine.test(
+    cleanReportTitleLine(line).replace(/[*_`]/g, ""),
+  );
+
+  const markdownHeading = lines.find((line) => /^#{1,6}\s+\S/.test(line));
+  const decoratedHeading = lines.find((line) => {
+    if (isMetadataLine(line) || !/^[\p{Extended_Pictographic}\p{Emoji_Presentation}\p{So}]/u.test(line)) return false;
+    const cleaned = cleanReportTitleLine(line);
+    return cleaned.length >= 4 && cleaned.length <= 120;
+  });
+  const descriptiveHeading = lines.find((line) => {
+    const cleaned = cleanReportTitleLine(line);
+    return !isMetadataLine(line)
+      && cleaned.length >= 4
+      && cleaned.length <= 120
+      && /(?:分析|报告|复盘|研究|策略|展望|总结)$/.test(cleaned);
+  });
+  const reportTitle = cleanReportTitleLine(
+    markdownHeading ?? decoratedHeading ?? descriptiveHeading ?? "Vibe-Trading Research Report",
+  ).replace(/^\d{4}-\d{2}-\d{2}[_\s-]+/, "");
+
+  return `${date}_${reportTitle}`;
+}
+
+export function sanitizePdfFilename(title: string): string {
+  return title
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
+    .replace(/\s+/g, " ")
+    .replace(/[. ]+$/g, "")
+    .slice(0, 160)
+    || "research_report";
+}
+
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
   const handleCopy = useCallback(() => {
@@ -48,9 +103,22 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
+function ForkButton({ onFork }: { onFork: () => void }) {
+  return (
+    <button
+      onClick={onFork}
+      className="p-1.5 rounded-md bg-muted/80 hover:bg-muted text-muted-foreground hover:text-foreground"
+      title={i18n.t("messageBubble.forkConversation")}
+    >
+      <GitBranch className="h-3.5 w-3.5" />
+    </button>
+  );
+}
+
 function PdfButton({ text }: { text: string }) {
   const [loading, setLoading] = useState(false);
   const pdfText = trimPostDisclaimerFollowUp(text);
+  const pdfTitle = buildPdfReportTitle(pdfText);
   const printFallback = useCallback(() => {
     const frame = document.createElement("iframe");
     frame.style.position = "fixed";
@@ -64,31 +132,32 @@ function PdfButton({ text }: { text: string }) {
       throw new Error("Unable to open the PDF print view");
     }
     const title = doc.createElement("h1");
-    title.textContent = "Vibe-Trading Research Report";
+    title.textContent = pdfTitle;
     const content = doc.createElement("pre");
     content.textContent = pdfText;
-    doc.head.innerHTML = `<title>Vibe-Trading Research Report</title><style>
+    doc.head.innerHTML = `<title></title><style>
       @page { size: A4; margin: 18mm; }
       body { font-family: "Microsoft YaHei", sans-serif; color: #172033; line-height: 1.6; }
       h1 { font-size: 22px; border-bottom: 2px solid #2563eb; padding-bottom: 8px; }
       pre { white-space: pre-wrap; font: inherit; }
     </style>`;
+    doc.title = pdfTitle;
     doc.body.append(title, content);
     setTimeout(() => {
       frame.contentWindow?.print();
       setTimeout(() => frame.remove(), 1000);
     }, 50);
-  }, [pdfText]);
+  }, [pdfText, pdfTitle]);
 
   const handlePdf = useCallback(async () => {
     if (loading) return;
     setLoading(true);
     try {
-      const blob = await api.generatePdf("Vibe-Trading Research Report", pdfText);
+      const blob = await api.generatePdf(pdfTitle, pdfText);
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = `research_report_${new Date().toISOString().slice(0, 10)}.pdf`;
+      link.download = `${sanitizePdfFilename(pdfTitle)}.pdf`;
       link.click();
       URL.revokeObjectURL(url);
     } catch (error) {
@@ -101,7 +170,7 @@ function PdfButton({ text }: { text: string }) {
     } finally {
       setLoading(false);
     }
-  }, [loading, pdfText, printFallback]);
+  }, [loading, pdfText, pdfTitle, printFallback]);
   return (
     <button
       onClick={handlePdf}
@@ -128,17 +197,88 @@ function getRetryHint(content: string): string {
 interface Props {
   msg: AgentMessage;
   onRetry?: (msg: AgentMessage) => void;
+  onFork?: (msg: AgentMessage) => void;
+  canEdit?: boolean;
+  onEdit?: (msg: AgentMessage, content: string) => Promise<void> | void;
 }
 
-export const MessageBubble = memo(function MessageBubble({ msg, onRetry }: Props) {
+export const MessageBubble = memo(function MessageBubble({ msg, onRetry, onFork, canEdit, onEdit }: Props) {
   const ts = msg.timestamp ? formatTimestamp(msg.timestamp) : null;
+  const forkable = Boolean(msg.type === "answer" && onFork && msg.sourceMessageId);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(msg.content);
+  const [savingEdit, setSavingEdit] = useState(false);
+
+  const startEdit = useCallback(() => {
+    setDraft(msg.content);
+    setEditing(true);
+  }, [msg.content]);
+
+  const saveEdit = useCallback(async () => {
+    const content = draft.trim();
+    if (!content || content === msg.content) {
+      setEditing(false);
+      return;
+    }
+    setSavingEdit(true);
+    try {
+      await onEdit?.(msg, content);
+      setEditing(false);
+    } finally {
+      setSavingEdit(false);
+    }
+  }, [draft, msg, onEdit]);
 
   if (msg.type === "user") {
     return (
       <div className="flex justify-end gap-3 group">
-        <div className="max-w-[72%] rounded-2xl rounded-tr-sm bg-primary text-primary-foreground px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap">
-          {msg.content}
-          {ts && <span className="block text-[9px] opacity-50 text-right mt-1">{ts}</span>}
+        <div className="max-w-[72%] flex flex-col items-end gap-1">
+          {canEdit && !editing && (
+            <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+              <button
+                onClick={startEdit}
+                className="p-1.5 rounded-md bg-muted/80 hover:bg-muted text-muted-foreground hover:text-foreground"
+                title={i18n.t("agent.edit")}
+              >
+                <Pencil className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
+          {editing ? (
+            <div className="w-[min(42rem,72vw)] rounded-2xl rounded-tr-sm border bg-background p-2 shadow-sm">
+              <textarea
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                className="min-h-24 w-full resize-y rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/30"
+                autoFocus
+              />
+              <div className="mt-2 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setEditing(false)}
+                  disabled={savingEdit}
+                  className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs disabled:opacity-50"
+                >
+                  <X className="h-3 w-3" />
+                  {i18n.t("agent.cancel")}
+                </button>
+                <button
+                  type="button"
+                  onClick={saveEdit}
+                  disabled={savingEdit}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-primary px-2.5 py-1.5 text-xs text-primary-foreground disabled:opacity-50"
+                >
+                  {savingEdit ? <Loader2 className="h-3 w-3 animate-spin" /> : <Check className="h-3 w-3" />}
+                  {i18n.t("agent.saveAndSend")}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="rounded-2xl rounded-tr-sm bg-primary text-primary-foreground px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap">
+              {msg.content}
+              {ts && <span className="block text-[9px] opacity-50 text-right mt-1">{ts}</span>}
+            </div>
+          )}
         </div>
         <div className="h-8 w-8 rounded-full bg-muted flex items-center justify-center shrink-0 mt-0.5">
           <User className="h-4 w-4 text-muted-foreground" />
@@ -153,6 +293,7 @@ export const MessageBubble = memo(function MessageBubble({ msg, onRetry }: Props
         <AgentAvatar />
         <div className="flex-1 min-w-0 relative">
           <div className="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+            {forkable && <ForkButton onFork={() => onFork?.(msg)} />}
             <PdfButton text={msg.content} />
             <CopyButton text={msg.content} />
           </div>

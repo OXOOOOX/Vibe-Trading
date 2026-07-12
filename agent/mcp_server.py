@@ -614,7 +614,7 @@ def web_search(query: str, max_results: int = 5) -> str:
 
 
 # ---------------------------------------------------------------------------
-# File I/O tools (sandboxed to workspace)
+# File I/O tools (sandboxed to workspace / configured vaults)
 # ---------------------------------------------------------------------------
 
 
@@ -640,6 +640,35 @@ def read_file(path: str) -> str:
     """
     registry = _get_registry()
     return registry.execute("read_file", {"path": path})
+
+
+@mcp.tool
+def publish_obsidian_note(
+    path: str,
+    content: str,
+    overwrite: bool = False,
+    vault_root: str | None = None,
+) -> str:
+    """Publish a Markdown note into a configured Obsidian vault.
+
+    Set ``VIBE_TRADING_OBSIDIAN_VAULT_ROOTS`` to one or more vault roots.
+    ``path`` must be relative to the selected vault root and end with ``.md``.
+
+    Args:
+        path: Relative Markdown path inside the vault.
+        content: Markdown content to write.
+        overwrite: Whether to replace an existing note (default false).
+        vault_root: Optional configured vault root when multiple are configured.
+    """
+    registry = _get_registry()
+    payload: dict[str, Any] = {
+        "path": path,
+        "content": content,
+        "overwrite": overwrite,
+    }
+    if vault_root:
+        payload["vault_root"] = vault_root
+    return registry.execute("publish_obsidian_note", payload)
 
 
 # ---------------------------------------------------------------------------

@@ -16,18 +16,21 @@ Symbol routing is delegated to :func:`eastmoney_client.resolve_secid`:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Dict, List, Optional
 
 import pandas as pd
+import requests
 
 from backtest.loaders import eastmoney_client
-from backtest.loaders.base import cached_loader_fetch, validate_date_range
+from backtest.loaders.base import cached_loader_fetch, retry_with_budget, validate_date_range
 from backtest.loaders.registry import register
 
 logger = logging.getLogger(__name__)
 
-# OHLCV columns the engine consumes, in canonical order.
+# Canonical fields; amount is retained when the endpoint provides it.
 _OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
+_OPTIONAL_COLUMNS = ["amount"]
 
 
 def _to_compact_date(value: str) -> str:
@@ -68,6 +71,7 @@ class DataLoader:
         *,
         interval: str = "1D",
         fields: Optional[List[str]] = None,
+        adjustment: str = "qfq",
     ) -> Dict[str, pd.DataFrame]:
         """Fetch OHLCV for each symbol; a single failure never aborts the batch.
 
@@ -88,6 +92,9 @@ class DataLoader:
             ValueError: ``start_date``/``end_date`` are malformed or inverted.
         """
         validate_date_range(start_date, end_date)
+        if adjustment not in {"raw", "qfq"}:
+            raise ValueError("Eastmoney loader adjustment must be 'raw' or 'qfq'")
+        include_amount = bool(fields and "amount" in fields)
 
         result: Dict[str, pd.DataFrame] = {}
         for code in codes:
@@ -98,9 +105,9 @@ class DataLoader:
                     timeframe=interval,
                     start_date=start_date,
                     end_date=end_date,
-                    fields=None,
+                    fields=[f"adjustment:{adjustment}", *(fields or [])],
                     fetch=lambda code=code: self._fetch_one(
-                        code, start_date, end_date, interval
+                        code, start_date, end_date, interval, adjustment, include_amount
                     ),
                 )
                 if df is not None and not df.empty:
@@ -111,6 +118,7 @@ class DataLoader:
 
     def _fetch_one(
         self, code: str, start_date: str, end_date: str, interval: str,
+        adjustment: str = "qfq", include_amount: bool = False,
     ) -> Optional[pd.DataFrame]:
         """Resolve one symbol and build its OHLCV frame, or ``None`` on a miss.
 
@@ -133,17 +141,24 @@ class DataLoader:
         if not secid:
             return None
 
-        rows = eastmoney_client.fetch_kline(
-            secid,
-            klt=klt,
-            fqt=1,
-            beg=_to_compact_date(start_date),
-            end=_to_compact_date(end_date),
+        rows = retry_with_budget(
+            lambda: eastmoney_client.fetch_kline(
+                secid,
+                klt=klt,
+                fqt=0 if adjustment == "raw" else 1,
+                beg=_to_compact_date(start_date),
+                end=_to_compact_date(end_date),
+            ),
+            transient=requests.RequestException,
+            deadline=time.monotonic() + 20.0,
+            label=f"eastmoney {interval} fetch for {code}",
+            max_retries=2,
+            backoff=(1.0, 2.0),
         )
-        return self._frame_from_rows(rows)
+        return self._frame_from_rows(rows, include_amount=include_amount)
 
     @staticmethod
-    def _frame_from_rows(rows: List[dict]) -> Optional[pd.DataFrame]:
+    def _frame_from_rows(rows: List[dict], *, include_amount: bool = False) -> Optional[pd.DataFrame]:
         """Assemble the canonical OHLCV DataFrame from client kline rows.
 
         Args:
@@ -170,7 +185,14 @@ class DataLoader:
                 return None
             df[column] = pd.to_numeric(df[column], errors="coerce").astype(float)
 
-        df = df[_OHLCV_COLUMNS].dropna(subset=["open", "high", "low", "close"])
+        for column in _OPTIONAL_COLUMNS:
+            if column in df.columns:
+                df[column] = pd.to_numeric(df[column], errors="coerce").astype(float)
+
+        selected = _OHLCV_COLUMNS + [
+            column for column in _OPTIONAL_COLUMNS if include_amount and column in df.columns
+        ]
+        df = df[selected].dropna(subset=["open", "high", "low", "close"])
         if df.empty:
             return None
         return df

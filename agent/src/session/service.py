@@ -7,12 +7,39 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 # Dedicated thread pool limited to four concurrent agents to avoid exhausting the default executor.
 _AGENT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="agent")
+
+# Portfolio-page sessions are explicitly research-only. Keep their registry
+# narrow enough that an LLM cannot reach any broker/order tool even if a live
+# MCP connector is configured for ordinary Agent sessions. verified_market_data
+# is intentionally retained because it writes only the local verification cache.
+_PORTFOLIO_ANALYSIS_TOOL_NAMES = [
+    "load_skill",
+    "publish_obsidian_note",
+    "portfolio_state",
+    "verified_market_data",
+    "get_market_data",
+    "get_stock_news",
+    "web_search",
+    "read_url",
+    "get_stock_profile",
+    "get_sector_info",
+    "get_financial_statements",
+    "get_fund_flow",
+    "get_northbound_flow",
+    "get_margin_trading",
+    "get_block_trades",
+    "get_dragon_tiger",
+    "get_shareholder_count",
+    "get_lockup_expiry",
+    "pattern",
+]
 
 from src.session.events import EventBus
 from src.session.models import (
@@ -51,6 +78,7 @@ class SessionService:
         self.event_bus = event_bus
         self.runs_dir = runs_dir
         self._active_loops: Dict[str, "AgentLoop"] = {}
+        self._session_locks: Dict[str, asyncio.Lock] = {}
         self._search_index = get_shared_index()
 
     def create_session(self, title: str = "", config: Optional[Dict[str, Any]] = None) -> Session:
@@ -68,6 +96,69 @@ class SessionService:
         self._search_index.index_session(session.session_id, title)
         self.event_bus.emit(session.session_id, "session.created", {"session_id": session.session_id, "title": title})
         return session
+
+    def fork_session(self, session_id: str, after_message_id: str, title: str = "") -> Session:
+        """Create a new session containing history through one source message.
+
+        Args:
+            session_id: Source session ID.
+            after_message_id: Last source message to include in the fork.
+            title: Optional title for the forked session.
+
+        Returns:
+            The newly created Session.
+
+        Raises:
+            ValueError: If the source session or target message does not exist.
+            PermissionError: If the target is not an assistant output.
+        """
+        source = self.store.get_session(session_id)
+        if not source:
+            raise ValueError(f"Session {session_id} not found")
+
+        messages = self.store.get_all_messages(session_id)
+        target_index = next(
+            (idx for idx, msg in enumerate(messages) if msg.message_id == after_message_id),
+            -1,
+        )
+        if target_index < 0:
+            raise ValueError(f"Message {after_message_id} not found in session {session_id}")
+        if messages[target_index].role != "assistant":
+            raise PermissionError("Conversation branches can only start from assistant outputs")
+
+        fork_title = title.strip() or f"{source.title or session_id} (fork)"
+        fork = Session(title=fork_title, config=dict(source.config))
+        self.store.create_session(fork)
+        self._search_index.index_session(fork.session_id, fork.title)
+
+        for source_message in messages[: target_index + 1]:
+            metadata = dict(source_message.metadata)
+            metadata.setdefault("forked_from_session_id", session_id)
+            metadata.setdefault("forked_from_message_id", source_message.message_id)
+            copied = Message(
+                session_id=fork.session_id,
+                role=source_message.role,
+                content=source_message.content,
+                created_at=source_message.created_at,
+                linked_attempt_id=None,
+                metadata=metadata,
+            )
+            self.store.append_message(copied)
+            self._search_index.index_message(fork.session_id, copied.role, copied.content)
+
+        fork.updated_at = datetime.now().isoformat()
+        self.store.update_session(fork)
+        self.event_bus.emit(
+            fork.session_id,
+            "session.created",
+            {
+                "session_id": fork.session_id,
+                "title": fork.title,
+                "forked_from_session_id": session_id,
+                "forked_after_message_id": after_message_id,
+            },
+        )
+        return fork
 
     def get_session(self, session_id: str) -> Optional[Session]:
         """Return a session by ID."""
@@ -90,7 +181,7 @@ class SessionService:
         *,
         include_shell_tools: bool = False,
     ) -> Dict[str, Any]:
-        """Send a message to a session and trigger execution.
+        """Reserve IDs and schedule a serialized turn for this session.
 
         Args:
             session_id: Session ID.
@@ -101,32 +192,140 @@ class SessionService:
         Returns:
             Dictionary containing message_id and attempt_id.
         """
-        session = self.store.get_session(session_id)
-        if not session:
+        if not self.store.get_session(session_id):
             raise ValueError(f"Session {session_id} not found")
+        message_id = uuid.uuid4().hex[:12]
+        attempt_id = uuid.uuid4().hex[:12]
+        asyncio.create_task(
+            self.execute_message(
+                session_id=session_id,
+                content=content,
+                role=role,
+                include_shell_tools=include_shell_tools,
+                message_id=message_id,
+                attempt_id=attempt_id,
+            )
+        )
+        result: Dict[str, Any] = {"message_id": message_id}
+        if role == "user":
+            result["attempt_id"] = attempt_id
+        return result
 
-        message = Message(session_id=session_id, role=role, content=content)
-        self.store.append_message(message)
-        self._search_index.index_message(session_id, role, content)
-        self.event_bus.emit(session_id, "message.received", {"message_id": message.message_id, "role": role, "content": content})
+    async def execute_message(
+        self,
+        session_id: str,
+        content: str,
+        role: str = "user",
+        *,
+        include_shell_tools: bool = False,
+        message_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
+        message_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Persist and execute one turn under a per-session single-flight lock."""
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            session = self.store.get_session(session_id)
+            if not session:
+                raise ValueError(f"Session {session_id} not found")
 
-        if role != "user":
-            return {"message_id": message.message_id}
+            message = Message(
+                message_id=message_id or uuid.uuid4().hex[:12],
+                session_id=session_id,
+                role=role,
+                content=content,
+                metadata=dict(message_metadata or {}),
+            )
+            self.store.append_message(message)
+            self._search_index.index_message(session_id, role, content)
+            self.event_bus.emit(
+                session_id,
+                "message.received",
+                {"message_id": message.message_id, "role": role, "content": content},
+            )
+            if role != "user":
+                return {"message_id": message.message_id}
 
-        attempt = Attempt(session_id=session_id, parent_attempt_id=session.last_attempt_id, prompt=content)
-        self.store.create_attempt(attempt)
-        session.config["include_shell_tools"] = include_shell_tools
-        session.last_attempt_id = attempt.attempt_id
-        session.updated_at = datetime.now().isoformat()
-        self.store.update_session(session)
-        self.event_bus.emit(session_id, "attempt.created", {"attempt_id": attempt.attempt_id, "prompt": content})
-
-        asyncio.create_task(self._run_attempt(session, attempt, include_shell_tools=include_shell_tools))
-        return {"message_id": message.message_id, "attempt_id": attempt.attempt_id}
+            attempt = Attempt(
+                attempt_id=attempt_id or uuid.uuid4().hex[:12],
+                session_id=session_id,
+                parent_attempt_id=session.last_attempt_id,
+                prompt=content,
+            )
+            self.store.create_attempt(attempt)
+            message.linked_attempt_id = attempt.attempt_id
+            self.store.replace_messages(session_id, self.store.get_all_messages(session_id)[:-1] + [message])
+            session.config["include_shell_tools"] = include_shell_tools
+            session.last_attempt_id = attempt.attempt_id
+            session.updated_at = datetime.now().isoformat()
+            self.store.update_session(session)
+            self.event_bus.emit(
+                session_id,
+                "attempt.created",
+                {"attempt_id": attempt.attempt_id, "prompt": content},
+            )
+            await self._run_attempt(session, attempt, include_shell_tools=include_shell_tools)
+            return {"message_id": message.message_id, "attempt_id": attempt.attempt_id}
 
     def get_messages(self, session_id: str, limit: int = 100) -> list[Message]:
         """Return the message history."""
         return self.store.get_messages(session_id, limit)
+
+    async def edit_user_message(
+        self,
+        session_id: str,
+        message_id: str,
+        content: str,
+        *,
+        rerun: bool = True,
+        include_shell_tools: bool = False,
+    ) -> Dict[str, Any]:
+        """Edit the latest user message, prune its old response, and optionally rerun it."""
+        session = self.store.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        if session_id in self._active_loops:
+            raise RuntimeError("Cannot edit while an agent attempt is still running; cancel it first.")
+
+        messages = self.store.get_all_messages(session_id)
+        target_index = next((idx for idx, msg in enumerate(messages) if msg.message_id == message_id), -1)
+        if target_index < 0:
+            raise ValueError(f"Message {message_id} not found in session {session_id}")
+        target = messages[target_index]
+        if target.role != "user":
+            raise ValueError("Only user messages can be edited")
+        if any(msg.role == "user" for msg in messages[target_index + 1:]):
+            raise ValueError("Only the latest user message can be edited")
+
+        old_content = target.content
+        target.content = content
+        target.metadata = dict(target.metadata or {})
+        target.metadata.setdefault("original_content", old_content)
+        target.metadata["edited_at"] = datetime.now().isoformat()
+        kept = messages[: target_index + 1]
+
+        result: Dict[str, Any] = {"message_id": target.message_id}
+        if rerun:
+            attempt = Attempt(session_id=session_id, parent_attempt_id=session.last_attempt_id, prompt=content)
+            self.store.create_attempt(attempt)
+            target.linked_attempt_id = attempt.attempt_id
+            session.config["include_shell_tools"] = include_shell_tools
+            session.last_attempt_id = attempt.attempt_id
+            result["attempt_id"] = attempt.attempt_id
+        else:
+            target.linked_attempt_id = None
+
+        self.store.replace_messages(session_id, kept)
+        self._search_index.reindex_from_store(self.store.base_dir)
+        session.updated_at = datetime.now().isoformat()
+        self.store.update_session(session)
+        self.event_bus.emit(session_id, "message.edited", {"message_id": target.message_id, "content": content})
+
+        if rerun:
+            self.event_bus.emit(session_id, "attempt.created", {"attempt_id": result["attempt_id"], "prompt": content})
+            asyncio.create_task(self._run_attempt(session, attempt, include_shell_tools=include_shell_tools))
+
+        return result
 
     def cancel_current(self, session_id: str) -> bool:
         """Cancel the currently running AgentLoop for a session.
@@ -159,6 +358,8 @@ class SessionService:
             )
             if result.get("status") == "success":
                 attempt.mark_completed(summary=result.get("content", ""))
+            elif result.get("status") == "cancelled":
+                attempt.mark_cancelled(result.get("reason", "cancelled by user"))
             else:
                 attempt.mark_failed(error=result.get("reason", "unknown"))
             attempt.run_dir = result.get("run_dir")
@@ -179,9 +380,16 @@ class SessionService:
             )
             self.store.append_message(reply)
             self._search_index.index_message(session.session_id, "assistant", reply.content)
+            terminal_event = (
+                "attempt.completed"
+                if attempt.status == AttemptStatus.COMPLETED
+                else "attempt.cancelled"
+                if attempt.status == AttemptStatus.CANCELLED
+                else "attempt.failed"
+            )
             self.event_bus.emit(
                 session.session_id,
-                "attempt.completed" if attempt.status == AttemptStatus.COMPLETED else "attempt.failed",
+                terminal_event,
                 {"attempt_id": attempt.attempt_id, "status": attempt.status.value,
                  "summary": attempt.summary, "error": attempt.error, "run_dir": attempt.run_dir,
                  "message_id": reply.message_id},
@@ -214,7 +422,7 @@ class SessionService:
         Returns:
             Result dictionary containing status, run_dir, run_id, metrics, and related fields.
         """
-        from src.tools import build_registry
+        from src.tools import build_filtered_registry, build_registry
         from src.providers.chat import ChatLLM
         from src.agent.loop import AgentLoop
         from src.memory.persistent import PersistentMemory
@@ -239,17 +447,24 @@ class SessionService:
             """Forward MCP server-name collision warnings to the operator event channel."""
             self.event_bus.emit(session_id, "mcp.warning", {"attempt_id": attempt_id, "message": msg})
 
-        registry = await loop.run_in_executor(
-            _AGENT_EXECUTOR,
-            lambda: build_registry(
-                persistent_memory=pm,
-                include_shell_tools=include_shell_tools,
-                agent_config=agent_config,
-                session_id=session_id,
-                event_callback=event_callback,
-                warn_callback=_mcp_collision_warn,
-            ),
-        )
+        portfolio_analysis = dict((session_config or {}).get("portfolio_analysis") or {})
+        if portfolio_analysis.get("research_only"):
+            registry = await loop.run_in_executor(
+                _AGENT_EXECUTOR,
+                lambda: build_filtered_registry(_PORTFOLIO_ANALYSIS_TOOL_NAMES, include_shell_tools=False),
+            )
+        else:
+            registry = await loop.run_in_executor(
+                _AGENT_EXECUTOR,
+                lambda: build_registry(
+                    persistent_memory=pm,
+                    include_shell_tools=include_shell_tools,
+                    agent_config=agent_config,
+                    session_id=session_id,
+                    event_callback=event_callback,
+                    warn_callback=_mcp_collision_warn,
+                ),
+            )
 
         agent = AgentLoop(
             registry=registry,
@@ -349,4 +564,6 @@ class SessionService:
         """Format the final execution result message."""
         if attempt.status == AttemptStatus.COMPLETED:
             return attempt.summary or "Strategy execution completed."
+        if attempt.status == AttemptStatus.CANCELLED:
+            return "Execution cancelled by user."
         return f"Execution failed: {attempt.error or 'unknown error'}"

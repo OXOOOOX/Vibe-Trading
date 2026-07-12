@@ -21,9 +21,9 @@ import time
 import csv
 import uuid
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Security, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -206,6 +206,93 @@ class DataSourceSettingsResponse(BaseModel):
     env_path: str
 
 
+class PortfolioReviewResponse(BaseModel):
+    """Read-only structured portfolio and verified market-data cache snapshot."""
+
+    status: str
+    portfolio_path: str
+    portfolio_state: Dict[str, Any]
+    verified_cache_dir: str
+    verified_market_cache: List[Dict[str, Any]] = Field(default_factory=list)
+    market_cache_db: Optional[str] = None
+    market_cache_coverage: List[Dict[str, Any]] = Field(default_factory=list)
+    active_market_refresh: Optional[Dict[str, Any]] = None
+    market_refresh: Optional[Dict[str, Any]] = None
+
+
+class UpdatePortfolioHoldingsRequest(BaseModel):
+    """Persist a pasted broker holdings table into structured portfolio state."""
+
+    raw_text: str = Field(..., min_length=1, max_length=200_000)
+    cash: Optional[float] = None
+    cash_currency: str = Field("CNY", max_length=16)
+
+
+class RecordPortfolioTradeRequest(BaseModel):
+    """Persist one recent trade into structured portfolio state."""
+
+    code: Optional[str] = Field(None, max_length=64)
+    symbol: Optional[str] = Field(None, max_length=64)
+    name: Optional[str] = Field(None, max_length=200)
+    side: str = Field(..., min_length=1, max_length=16)
+    quantity: Optional[float] = None
+    price: Optional[float] = None
+    trade_date: Optional[str] = Field(None, max_length=64)
+    notes: Optional[str] = Field(None, max_length=1000)
+
+
+class PortfolioMarketRefreshRequest(BaseModel):
+    """Refresh current holdings with multi-source verified market data."""
+
+    start_date: Optional[str] = Field(None, description="YYYY-MM-DD. Defaults to 14 days before end_date.")
+    end_date: Optional[str] = Field(None, description="YYYY-MM-DD. Defaults to today.")
+    sources: Optional[List[str]] = Field(None, description="Optional explicit source list.")
+    adjustment: str = Field("source_default", max_length=32)
+    tolerance_pct: float = Field(0.5, ge=0, le=100)
+    max_rows: int = Field(10, ge=1, le=500)
+
+
+class MarketCacheRefreshRequest(BaseModel):
+    """Start an incremental market-cache refresh."""
+
+    symbols: Optional[List[str]] = None
+    profile: str = Field("portfolio_default", max_length=64)
+    sources: Optional[List[str]] = None
+    force: bool = False
+    start_date: Optional[str] = Field(None, description="Optional YYYY-MM-DD override.")
+    end_date: Optional[str] = Field(None, description="Optional YYYY-MM-DD override.")
+
+
+class MarketCacheRefreshAccepted(BaseModel):
+    status: str
+    run_id: str
+    deduplicated: bool = False
+    run: Dict[str, Any]
+
+
+class PortfolioAnalysisSessionRequest(BaseModel):
+    """Start one background, research-only analysis session for current holdings."""
+
+    scope: Literal["holding", "portfolio", "market"]
+    symbol: Optional[str] = Field(None, max_length=64)
+
+
+class PortfolioAnalysisSessionResponse(BaseModel):
+    """Background portfolio analysis job and its Agent session."""
+
+    analysis_id: str
+    session_id: str
+    scope: Literal["holding", "portfolio", "market"]
+    symbol: Optional[str] = None
+    analysis_phase: Optional[Literal["premarket", "intraday"]] = None
+    status: str
+    queue_position: Optional[int] = None
+    created_at: str
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    error: Optional[str] = None
+
+
 class UpdateDataSourceSettingsRequest(BaseModel):
     """Update project-local data source credentials."""
 
@@ -241,6 +328,20 @@ class SessionResponse(BaseModel):
 class SendMessageRequest(BaseModel):
     """Send chat message: natural-language strategy description."""
     content: str = Field(..., description="Natural language strategy description", min_length=1, max_length=5000)
+
+
+class EditMessageRequest(BaseModel):
+    """Edit a user message and optionally rerun the turn."""
+
+    content: str = Field(..., min_length=1, max_length=5000)
+    rerun: bool = True
+
+
+class ForkSessionRequest(BaseModel):
+    """Create a new session from existing history through one message."""
+
+    after_message_id: str = Field(..., min_length=1, description="Last message to include in the fork")
+    title: str = Field("", max_length=200, description="Optional title for the forked session")
 
 
 class MessageResponse(BaseModel):
@@ -599,7 +700,7 @@ async def _reject_untrusted_loopback_host(request: Request, call_next):
 # text/html`` (e.g. a user pasting the URL into the address bar).
 
 _FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
-_SPA_HTML_EXACT_PATHS: frozenset[str] = frozenset({"/correlation"})
+_SPA_HTML_EXACT_PATHS: frozenset[str] = frozenset({"/correlation", "/portfolio"})
 # Each regex matches a complete request path. Trailing slash optional.
 _SPA_HTML_PATH_REGEX: tuple[re.Pattern[str], ...] = (
     # ``/runs/{run_id}`` — RunDetail page. Excludes ``/runs/{id}/code``,
@@ -641,12 +742,25 @@ async def _run_startup_preflight() -> None:
     from src.preflight import run_preflight
 
     run_preflight(console)
+    from src.market_cache import get_market_refresh_service
+
+    get_market_refresh_service().prepare_startup()
     _start_scheduled_research_executor()
+    dispatcher = _get_session_dispatcher()
+    if dispatcher is not None:
+        dispatcher.start()
+    bot = _get_feishu_bot()
+    if bot is not None:
+        bot.start()
 
 
 @app.on_event("shutdown")
 async def _stop_scheduled_research_on_shutdown() -> None:
-    """Stop the scheduled research executor on server shutdown."""
+    """Stop channel, message-dispatch, and scheduled workers on shutdown."""
+    if _feishu_bot is not None:
+        await _feishu_bot.stop()
+    if _session_dispatcher is not None:
+        await _session_dispatcher.stop()
     await _stop_scheduled_research_executor()
 
 
@@ -1140,6 +1254,200 @@ def _build_data_source_settings_response(values: Optional[Dict[str, str]] = None
         baostock_message=baostock_message,
         env_path=_project_relative_path(ENV_PATH),
     )
+
+
+def _load_verified_market_cache(limit: int = 50) -> tuple[str, List[Dict[str, Any]]]:
+    from src.market_cache import get_market_refresh_service
+    from src.market_verification import verified_cache_dir
+
+    service = get_market_refresh_service()
+    sqlite_rows = service.store.cache_summaries(limit=limit)
+    if sqlite_rows:
+        return str(service.store.path), sqlite_rows
+
+    cache_dir = verified_cache_dir()
+    if not cache_dir.exists():
+        return str(cache_dir), []
+
+    rows: List[Dict[str, Any]] = []
+    files = sorted(
+        (path for path in cache_dir.glob("*.json") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for path in files[:limit]:
+        modified_at = datetime.fromtimestamp(path.stat().st_mtime).isoformat()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            rows.append(
+                {
+                    "file_name": path.name,
+                    "path": str(path),
+                    "status": "error",
+                    "error": str(exc),
+                    "modified_at": modified_at,
+                }
+            )
+            continue
+        if not isinstance(payload, dict):
+            continue
+        rows.append(
+            {
+                "file_name": path.name,
+                "path": str(path),
+                "symbol": payload.get("symbol"),
+                "status": payload.get("status"),
+                "consensus_close": payload.get("consensus_close"),
+                "spread_pct": payload.get("spread_pct"),
+                "requested_adjustment": payload.get("requested_adjustment"),
+                "source_adjustments": payload.get("source_adjustments"),
+                "sources": payload.get("sources"),
+                "observations": payload.get("observations"),
+                "verified_at": payload.get("verified_at"),
+                "start_date": payload.get("start_date"),
+                "end_date": payload.get("end_date"),
+                "modified_at": modified_at,
+            }
+        )
+    return str(cache_dir), rows
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(str(value).replace(",", "").replace("%", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _portfolio_refresh_window(payload: PortfolioMarketRefreshRequest) -> tuple[str, str]:
+    end_date = payload.end_date or datetime.now().date().isoformat()
+    start_date = payload.start_date
+    if not start_date:
+        end = datetime.fromisoformat(end_date).date()
+        start_date = (end - timedelta(days=14)).isoformat()
+    return start_date, end_date
+
+
+def _apply_verified_prices_to_holdings(state: Any, refresh_result: Dict[str, Any]) -> dict[str, Any]:
+    results = refresh_result.get("results") if isinstance(refresh_result, dict) else {}
+    if not isinstance(results, dict):
+        results = {}
+    by_symbol = {str(symbol).upper(): item for symbol, item in results.items() if isinstance(item, dict)}
+    updated = 0
+    skipped = 0
+
+    for holding in state.holdings:
+        symbol = str(holding.get("symbol") or holding.get("code") or "").strip().upper()
+        item = by_symbol.get(symbol)
+        if not item:
+            skipped += 1
+            continue
+        close = _float_or_none(item.get("consensus_close"))
+        if close is None:
+            skipped += 1
+            holding["market_status"] = item.get("status")
+            holding["market_verified_at"] = item.get("verified_at")
+            continue
+
+        quantity = _float_or_none(holding.get("quantity"))
+        cost_price = _float_or_none(holding.get("cost_price"))
+        holding["last_price"] = close
+        holding["market_status"] = item.get("status")
+        holding["market_spread_pct"] = item.get("spread_pct")
+        holding["market_verified_at"] = item.get("verified_at")
+        holding["market_cache_path"] = item.get("cache_path")
+        holding["market_adjustment"] = item.get("requested_adjustment")
+        if quantity is not None:
+            market_value = close * quantity
+            holding["market_value"] = market_value
+            if cost_price is not None:
+                pnl = (close - cost_price) * quantity
+                holding["pnl"] = pnl
+                holding["pnl_pct"] = ((close - cost_price) / cost_price * 100.0) if cost_price else None
+        updated += 1
+
+    return {"updated_holdings": updated, "skipped_holdings": skipped}
+
+
+def _build_portfolio_review(
+    state: Any,
+    *,
+    limit: int = 50,
+    market_refresh: Dict[str, Any] | None = None,
+) -> PortfolioReviewResponse:
+    from src.market_cache import get_market_refresh_service
+    from src.portfolio.state import state_path
+
+    service = get_market_refresh_service()
+    cache_dir, market_cache = _load_verified_market_cache(limit=limit)
+    symbols = [
+        str(row.get("symbol") or row.get("code") or "").upper()
+        for row in state.holdings
+        if row.get("symbol") or row.get("code")
+    ]
+    return PortfolioReviewResponse(
+        status="ok",
+        portfolio_path=str(state_path()),
+        portfolio_state=state.to_dict(),
+        verified_cache_dir=cache_dir,
+        verified_market_cache=market_cache,
+        market_cache_db=str(service.store.path),
+        market_cache_coverage=service.store.list_coverage(symbols or None),
+        active_market_refresh=service.store.latest_active_run(),
+        market_refresh=market_refresh,
+    )
+
+
+def _portfolio_analysis_job_response(job: Any) -> PortfolioAnalysisSessionResponse:
+    """Expose only portfolio-originated dispatcher jobs to the web UI."""
+    from src.portfolio.analysis import PORTFOLIO_ANALYSIS_SOURCE
+
+    metadata = dict(getattr(job, "source_metadata", {}) or {})
+    if getattr(job, "source", None) != PORTFOLIO_ANALYSIS_SOURCE:
+        raise HTTPException(status_code=404, detail="Portfolio analysis session not found")
+
+    scope = metadata.get("scope")
+    if scope not in {"holding", "portfolio", "market"}:
+        raise HTTPException(status_code=404, detail="Portfolio analysis session not found")
+
+    raw_status = str(getattr(job, "status", "failed"))
+    return PortfolioAnalysisSessionResponse(
+        analysis_id=str(getattr(job, "job_id", "")),
+        session_id=str(getattr(job, "session_id", "")),
+        scope=scope,
+        symbol=metadata.get("symbol"),
+        analysis_phase=metadata.get("analysis_phase"),
+        status="queued" if raw_status == "pending" else raw_status,
+        queue_position=metadata.get("queue_position"),
+        created_at=str(getattr(job, "created_at", "")),
+        started_at=getattr(job, "started_at", None),
+        completed_at=getattr(job, "completed_at", None),
+        error=getattr(job, "error", None),
+    )
+
+
+_market_refresh_tasks: Dict[str, asyncio.Task[Any]] = {}
+
+
+async def _run_market_refresh_background(run_id: str) -> None:
+    from src.market_cache import get_market_refresh_service
+
+    try:
+        await asyncio.to_thread(get_market_refresh_service().run_refresh, run_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("market-cache refresh %s failed", run_id)
+    finally:
+        _market_refresh_tasks.pop(run_id, None)
+
+
+def _schedule_market_refresh(run_id: str) -> None:
+    existing = _market_refresh_tasks.get(run_id)
+    if existing and not existing.done():
+        return
+    _market_refresh_tasks[run_id] = asyncio.create_task(_run_market_refresh_background(run_id))
 
 
 def _sync_runtime_env(provider: LLMProviderOption, updates: Dict[str, str]) -> None:
@@ -1673,6 +1981,286 @@ async def update_data_source_settings(payload: UpdateDataSourceSettingsRequest):
     return _build_data_source_settings_response(_read_env_values(ENV_PATH))
 
 
+@app.get(
+    "/portfolio/review",
+    response_model=PortfolioReviewResponse,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def get_portfolio_review(limit: int = Query(50, ge=1, le=200)):
+    """Return a read-only portfolio state and verified market-data cache snapshot."""
+    from src.portfolio.state import load_state
+
+    return _build_portfolio_review(load_state(), limit=limit)
+
+
+@app.post(
+    "/portfolio/holdings",
+    response_model=PortfolioReviewResponse,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def update_portfolio_holdings(payload: UpdatePortfolioHoldingsRequest):
+    """Persist a broker-style holdings table, then return the refreshed review snapshot."""
+    from src.portfolio.state import parse_holdings_text, update_holdings
+
+    if not parse_holdings_text(payload.raw_text):
+        raise HTTPException(status_code=400, detail="No recognizable holdings rows found; existing portfolio state was not changed.")
+
+    state = update_holdings(
+        raw_text=payload.raw_text,
+        cash=payload.cash,
+        cash_currency=payload.cash_currency,
+    )
+    return _build_portfolio_review(state)
+
+
+@app.post(
+    "/portfolio/trades",
+    response_model=PortfolioReviewResponse,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def record_portfolio_trade(payload: RecordPortfolioTradeRequest):
+    """Persist one recent trade, then return the refreshed review snapshot."""
+    from src.portfolio.state import record_trade
+
+    trade = payload.model_dump(exclude_none=True)
+    if not (trade.get("symbol") or trade.get("code")):
+        raise HTTPException(status_code=400, detail="symbol or code is required")
+    state = record_trade(trade=trade)
+    return _build_portfolio_review(state)
+
+
+@app.post(
+    "/portfolio/refresh-market-data",
+    response_model=PortfolioReviewResponse,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def refresh_portfolio_market_data(payload: PortfolioMarketRefreshRequest):
+    """Synchronous compatibility wrapper around the incremental cache service."""
+    from src.market_cache import get_market_refresh_service
+    from src.portfolio.state import load_state
+
+    state = load_state()
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for holding in state.holdings:
+        symbol = str(holding.get("symbol") or holding.get("code") or "").strip().upper()
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            symbols.append(symbol)
+    if not symbols:
+        raise HTTPException(status_code=400, detail="No holdings with symbols found; save holdings before refreshing market data.")
+
+    start_date = payload.start_date
+    end_date = payload.end_date
+    service = get_market_refresh_service()
+    refresh_result = await asyncio.to_thread(
+        service.refresh_sync,
+        symbols=symbols,
+        profile="portfolio_default",
+        sources=payload.sources,
+        force=False,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    quotes = service.store.list_quotes(symbols)
+    refresh_result["summary"] = {
+        "updated_holdings": len(quotes),
+        "skipped_holdings": max(0, len(symbols) - len(quotes)),
+        "symbols": symbols,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+    return _build_portfolio_review(load_state(), limit=200, market_refresh=refresh_result)
+
+
+@app.post(
+    "/portfolio/analysis-sessions",
+    response_model=PortfolioAnalysisSessionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def start_portfolio_analysis_session(payload: PortfolioAnalysisSessionRequest):
+    """Create and immediately queue a background research session for holdings."""
+    from src.portfolio.analysis import (
+        PORTFOLIO_ANALYSIS_SOURCE,
+        build_analysis_prompt,
+        build_analysis_title,
+        current_market_analysis_time,
+        find_holding,
+        resolve_market_analysis_phase,
+    )
+    from src.portfolio.state import load_state, normalize_symbol
+
+    state = load_state()
+    holding = None
+    normalized_symbol: Optional[str] = None
+    if payload.scope == "holding":
+        if not payload.symbol or not payload.symbol.strip():
+            raise HTTPException(status_code=400, detail="symbol is required for holding analysis")
+        normalized_symbol = normalize_symbol(payload.symbol).upper()
+        holding = find_holding(state.holdings, normalized_symbol)
+        if holding is None:
+            raise HTTPException(status_code=404, detail="Holding symbol was not found in the current portfolio")
+    elif not state.holdings:
+        raise HTTPException(status_code=400, detail="No holdings found; save holdings before starting a portfolio report")
+
+    service = _get_session_service()
+    dispatcher = _get_session_dispatcher()
+    if service is None or dispatcher is None:
+        raise HTTPException(status_code=501, detail="Session runtime not enabled")
+
+    analysis_now = current_market_analysis_time()
+    analysis_phase = resolve_market_analysis_phase(analysis_now) if payload.scope == "market" else None
+    title = build_analysis_title(payload.scope, holding, now=analysis_now, market_phase=analysis_phase)
+    prompt = build_analysis_prompt(payload.scope, holding, now=analysis_now, market_phase=analysis_phase)
+    analysis_config: Dict[str, Any] = {
+        "scope": payload.scope,
+        "symbol": normalized_symbol,
+        "research_only": True,
+    }
+    source_metadata: Dict[str, Any] = {"scope": payload.scope, "symbol": normalized_symbol}
+    if analysis_phase is not None:
+        analysis_config["analysis_phase"] = analysis_phase
+        source_metadata["analysis_phase"] = analysis_phase
+    session = service.create_session(
+        title=title,
+        config={"portfolio_analysis": analysis_config},
+    )
+    try:
+        result = await dispatcher.submit(
+            session_id=session.session_id,
+            content=prompt,
+            source=PORTFOLIO_ANALYSIS_SOURCE,
+            source_metadata=source_metadata,
+            include_shell_tools=False,
+        )
+        job = dispatcher.store.get(result["job_id"])
+        if job is None:
+            raise RuntimeError("Portfolio analysis job was not persisted")
+        job.source_metadata["queue_position"] = result.get("queue_position")
+        return _portfolio_analysis_job_response(job)
+    except Exception as exc:  # noqa: BLE001 - remove an orphan session on every enqueue failure
+        try:
+            service.delete_session(session.session_id)
+        except Exception:  # noqa: BLE001 - preserve the original enqueue error
+            logger.exception("Failed to remove orphan portfolio analysis session %s", session.session_id)
+        logger.warning("Portfolio analysis session enqueue failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Failed to start portfolio analysis session") from exc
+
+
+@app.get(
+    "/portfolio/analysis-sessions/{analysis_id}",
+    response_model=PortfolioAnalysisSessionResponse,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def get_portfolio_analysis_session(analysis_id: str):
+    """Return the current state of a portfolio-originated analysis job."""
+    _validate_path_param(analysis_id, "analysis_id")
+    dispatcher = _get_session_dispatcher()
+    if dispatcher is None:
+        raise HTTPException(status_code=501, detail="Session runtime not enabled")
+    job = dispatcher.store.get(analysis_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Portfolio analysis session not found")
+    return _portfolio_analysis_job_response(job)
+
+
+@app.post(
+    "/market-cache/refresh",
+    response_model=MarketCacheRefreshAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def start_market_cache_refresh(payload: MarketCacheRefreshRequest):
+    """Start a deduplicated background refresh and return its persisted run."""
+    from src.market_cache import get_market_refresh_service
+    from src.portfolio.state import load_state
+
+    symbols = payload.symbols or [
+        str(row.get("symbol") or row.get("code") or "").strip().upper()
+        for row in load_state().holdings
+        if row.get("symbol") or row.get("code")
+    ]
+    if not symbols:
+        raise HTTPException(status_code=400, detail="No holdings with symbols found; save holdings before refreshing market data.")
+    try:
+        run, deduplicated = get_market_refresh_service().create_refresh(
+            symbols=symbols,
+            profile=payload.profile,
+            sources=payload.sources,
+            force=payload.force,
+            start_date=payload.start_date,
+            end_date=payload.end_date,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not deduplicated:
+        _schedule_market_refresh(run["run_id"])
+    return MarketCacheRefreshAccepted(
+        status="accepted",
+        run_id=run["run_id"],
+        deduplicated=deduplicated,
+        run=run,
+    )
+
+
+@app.get(
+    "/market-cache/runs/{run_id}",
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def get_market_cache_run(run_id: str):
+    from src.market_cache import get_market_refresh_service
+
+    run = get_market_refresh_service().store.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Market-cache refresh run not found")
+    return run
+
+
+@app.get("/market-cache/quotes", dependencies=[Depends(require_local_or_auth)])
+async def get_market_cache_quotes(symbols: Optional[str] = Query(None)):
+    from src.market_cache import get_market_refresh_service
+
+    parsed = [value.strip().upper() for value in symbols.split(",") if value.strip()] if symbols else None
+    return {"status": "ok", "quotes": get_market_refresh_service().store.list_quotes(parsed)}
+
+
+@app.get("/market-cache/coverage", dependencies=[Depends(require_local_or_auth)])
+async def get_market_cache_coverage(symbols: Optional[str] = Query(None)):
+    from src.market_cache import get_market_refresh_service
+
+    parsed = [value.strip().upper() for value in symbols.split(",") if value.strip()] if symbols else None
+    return {"status": "ok", "coverage": get_market_refresh_service().store.list_coverage(parsed)}
+
+
+@app.get("/market-cache/bars", dependencies=[Depends(require_local_or_auth)])
+async def get_market_cache_bars(
+    symbol: str = Query(...),
+    interval: str = Query("1D"),
+    adjustment: str = Query("raw"),
+    view: str = Query("consensus", pattern="^(consensus|source)$"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    limit: int = Query(2000, ge=1, le=20_000),
+):
+    from src.market_cache import get_market_refresh_service
+
+    if interval not in {"1m", "5m", "1D"}:
+        raise HTTPException(status_code=400, detail="interval must be one of 1m, 5m, 1D")
+    if adjustment not in {"raw", "qfq"}:
+        raise HTTPException(status_code=400, detail="adjustment must be raw or qfq")
+    bars = get_market_refresh_service().store.query_bars(
+        symbol=symbol,
+        interval=interval,
+        adjustment=adjustment,
+        view=view,
+        start=start_date,
+        end=end_date,
+        limit=limit,
+    )
+    return {"status": "ok", "symbol": symbol.upper(), "interval": interval, "adjustment": adjustment, "view": view, "bars": bars}
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Liveness probe."""
@@ -1770,6 +2358,8 @@ async def api_info():
 # ============================================================================
 
 _session_service = None
+_session_dispatcher = None
+_feishu_bot = None
 _goal_store = None
 
 
@@ -1802,6 +2392,40 @@ def _get_session_service():
         runs_dir=RUNS_DIR,
     )
     return _session_service
+
+
+def _get_session_dispatcher():
+    """Return the shared persistent dispatcher for API and external channels."""
+    global _session_dispatcher
+    service = _get_session_service()
+    if service is None:
+        return None
+    if _session_dispatcher is None:
+        from src.session.dispatcher import SessionDispatcher
+
+        raw = os.getenv("AGENT_MAX_CONCURRENT_SESSIONS", "4")
+        try:
+            max_concurrency = int(raw)
+        except ValueError:
+            max_concurrency = 4
+        _session_dispatcher = SessionDispatcher(service, max_concurrency=max_concurrency)
+    return _session_dispatcher
+
+
+def _get_feishu_bot():
+    """Return the optional Feishu long-connection channel."""
+    global _feishu_bot
+    from src.channels.feishu import FeishuBot
+
+    if not FeishuBot.enabled():
+        return None
+    if _feishu_bot is None:
+        dispatcher = _get_session_dispatcher()
+        service = _get_session_service()
+        if dispatcher is None or service is None:
+            raise RuntimeError("Feishu bot requires ENABLE_SESSION_RUNTIME=true")
+        _feishu_bot = FeishuBot(service, dispatcher)
+    return _feishu_bot
 
 
 def _get_goal_store():
@@ -1871,6 +2495,38 @@ async def get_session(session_id: str):
     session = svc.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    return SessionResponse(
+        session_id=session.session_id,
+        title=session.title,
+        status=session.status.value,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+        last_attempt_id=session.last_attempt_id,
+    )
+
+
+@app.post(
+    "/sessions/{session_id}/fork",
+    response_model=SessionResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_auth)],
+)
+async def fork_session(session_id: str, request: ForkSessionRequest):
+    """Fork a chat session from the beginning through a selected message."""
+    _validate_path_param(session_id, "session_id")
+    svc = _get_session_service()
+    if not svc:
+        raise HTTPException(status_code=501, detail="Session runtime not enabled")
+    try:
+        session = svc.fork_session(
+            session_id=session_id,
+            after_message_id=request.after_message_id,
+            title=request.title,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return SessionResponse(
         session_id=session.session_id,
         title=session.title,
@@ -2121,13 +2777,14 @@ async def update_session(session_id: str, req: UpdateSessionRequest):
 async def send_message(session_id: str, payload: SendMessageRequest, http_request: Request):
     """Send a user message and start the agent loop (natural language strategy)."""
     _validate_path_param(session_id, "session_id")
-    svc = _get_session_service()
-    if not svc:
+    dispatcher = _get_session_dispatcher()
+    if not dispatcher:
         raise HTTPException(status_code=501, detail="Session runtime not enabled")
     try:
-        result = await svc.send_message(
+        result = await dispatcher.submit(
             session_id=session_id,
             content=payload.content,
+            source="api",
             include_shell_tools=_shell_tools_enabled_for_request(http_request),
         )
         return result
@@ -2135,17 +2792,39 @@ async def send_message(session_id: str, payload: SendMessageRequest, http_reques
         raise HTTPException(status_code=404, detail=str(exc))
 
 
+@app.patch("/sessions/{session_id}/messages/{message_id}", dependencies=[Depends(require_auth)])
+async def edit_message(session_id: str, message_id: str, payload: EditMessageRequest, http_request: Request):
+    """Edit the latest user message, prune the interrupted response, and rerun the agent."""
+    _validate_path_param(session_id, "session_id")
+    _validate_path_param(message_id, "message_id")
+    svc = _get_session_service()
+    if not svc:
+        raise HTTPException(status_code=501, detail="Session runtime not enabled")
+    try:
+        return await svc.edit_user_message(
+            session_id=session_id,
+            message_id=message_id,
+            content=payload.content,
+            rerun=payload.rerun,
+            include_shell_tools=_shell_tools_enabled_for_request(http_request),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/sessions/{session_id}/cancel", dependencies=[Depends(require_auth)])
 async def cancel_session(session_id: str):
     """Cancel the in-flight agent loop for this session."""
     _validate_path_param(session_id, "session_id")
-    svc = _get_session_service()
-    if not svc:
+    dispatcher = _get_session_dispatcher()
+    if not dispatcher:
         raise HTTPException(status_code=501, detail="Session runtime not enabled")
-    cancelled = svc.cancel_current(session_id)
-    if not cancelled:
+    result = await dispatcher.cancel_session(session_id)
+    if not result["running"] and not result["queued"]:
         return {"status": "no_active_loop"}
-    return {"status": "cancelled"}
+    return result
 
 
 @app.get("/sessions/{session_id}/messages", response_model=List[MessageResponse], dependencies=[Depends(require_auth)])
