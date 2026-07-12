@@ -13,6 +13,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from src.data_layer import get_unified_data_service
+from src.data_layer.prewarm import get_data_prewarm_scheduler
 
 
 class DataContextRequest(BaseModel):
@@ -95,3 +96,15 @@ def register_data_routes(app: FastAPI, require_local_or_auth) -> None:
             return await asyncio.to_thread(get_unified_data_service().prewarm, phase=payload.phase)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/data/prewarm/status", dependencies=[Depends(require_local_or_auth)])
+    async def get_data_prewarm_status():
+        return get_data_prewarm_scheduler().status()
+
+    @app.on_event("startup")
+    async def start_data_prewarm_scheduler() -> None:
+        await get_data_prewarm_scheduler().start()
+
+    @app.on_event("shutdown")
+    async def stop_data_prewarm_scheduler() -> None:
+        await get_data_prewarm_scheduler().stop()

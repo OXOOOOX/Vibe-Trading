@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+import asyncio
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from src.data_layer.service import UnifiedDataService
 from src.data_layer.store import DataControlStore, ResearchCacheStore
 from src.market_cache.service import MarketRefreshService
 from src.market_cache.storage import MarketCacheStore
+from src.data_layer.prewarm import DataPrewarmScheduler
 from src.tools import build_registry
 
 
@@ -118,3 +121,27 @@ def test_registry_can_hide_low_level_data_tools_without_hiding_the_facade() -> N
     assert "get_data_context" in registry.tool_names
     assert "get_market_data" not in registry.tool_names
     assert "verified_market_data" not in registry.tool_names
+
+
+def test_prewarm_runs_each_market_calendar_slot_once() -> None:
+    calls: list[str] = []
+
+    class _Service:
+        def prewarm(self, *, phase):
+            calls.append(phase)
+            return {"status": "live", "request_id": "prewarm-1"}
+
+    class _Calendar:
+        mode = "exchange_calendar"
+
+        @staticmethod
+        def is_trading_day(value):
+            return True
+
+    scheduler = DataPrewarmScheduler(lambda: _Service(), calendar=_Calendar())
+    now = datetime(2026, 7, 13, 9, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+    first = asyncio.run(scheduler.run_due_once(now))
+    second = asyncio.run(scheduler.run_due_once(now))
+    assert [record["phase"] for record in first] == ["premarket"]
+    assert second == []
+    assert calls == ["premarket"]

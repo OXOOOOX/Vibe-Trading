@@ -23,6 +23,7 @@ export interface WatchlistEntry { symbol: string; added_at: string; note: string
 export interface CoverageRow { symbol: string; actual_source: string; interval: string; actual_adjustment: string; min_bar_time: string; max_bar_time: string; row_count: number; last_success_at: string }
 export interface SourceHealth { source: string; consecutive_failures: number; circuit_open: boolean; circuit_open_until: string | null; last_status: string; last_latency_ms: number | null; last_error: string | null; updated_at: string }
 export interface StorageEntry { kind: string; path: string; bytes: number }
+export interface PrewarmStatus { enabled: boolean; running: boolean; timezone: string; calendar_mode: string; slots: { phase: string; time: string }[]; last_run: { status?: string; at?: string } | null }
 
 export const dataApi = {
   coverage: () => request<{ status: string; coverage: CoverageRow[]; watchlist: WatchlistEntry[]; retention: Record<string, unknown> }>("/data/coverage"),
@@ -32,4 +33,5 @@ export const dataApi = {
   addWatchlist: (symbol: string, note?: string) => request<{ status: string; entry: WatchlistEntry }>("/data/watchlist", { method: "POST", body: JSON.stringify({ symbol, note: note || null }) }),
   removeWatchlist: (symbol: string) => request<{ status: string; deleted: string }>(`/data/watchlist/${encodeURIComponent(symbol)}`, { method: "DELETE" }),
   prewarm: (phase: "premarket" | "intraday" = "premarket") => request<{ status: DataStatus; request_id?: string }>("/data/prewarm", { method: "POST", body: JSON.stringify({ phase }) }),
+  prewarmStatus: () => request<PrewarmStatus>("/data/prewarm/status"),
 };

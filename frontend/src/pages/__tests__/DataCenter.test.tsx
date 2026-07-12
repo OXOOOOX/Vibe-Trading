@@ -6,7 +6,7 @@ import { dataApi } from "@/lib/dataApi";
 vi.mock("@/lib/dataApi", () => ({
   dataApi: {
     coverage: vi.fn(), sources: vi.fn(), storage: vi.fn(), watchlist: vi.fn(),
-    addWatchlist: vi.fn(), removeWatchlist: vi.fn(), prewarm: vi.fn(),
+    addWatchlist: vi.fn(), removeWatchlist: vi.fn(), prewarm: vi.fn(), prewarmStatus: vi.fn(),
   },
 }));
 
@@ -19,6 +19,7 @@ describe("DataCenter", () => {
     vi.mocked(dataApi.watchlist).mockResolvedValue({ status: "ok", watchlist: [] });
     vi.mocked(dataApi.addWatchlist).mockResolvedValue({ status: "ok", entry: { symbol: "510300.SH", note: null, added_at: "2026-07-13T00:00:00Z" } });
     vi.mocked(dataApi.prewarm).mockResolvedValue({ status: "live" });
+    vi.mocked(dataApi.prewarmStatus).mockResolvedValue({ enabled: true, running: true, timezone: "Asia/Shanghai", calendar_mode: "exchange_calendar", slots: [{ phase: "premarket", time: "09:10" }], last_run: null });
   });
 
   it("shows status coverage and supports adding a manual prewarm symbol", async () => {

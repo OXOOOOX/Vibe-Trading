@@ -6,5 +6,6 @@ research agent is allowed to receive.
 """
 
 from .service import UnifiedDataService, get_unified_data_service
+from .prewarm import DataPrewarmScheduler, get_data_prewarm_scheduler
 
-__all__ = ["UnifiedDataService", "get_unified_data_service"]
+__all__ = ["UnifiedDataService", "get_unified_data_service", "DataPrewarmScheduler", "get_data_prewarm_scheduler"]
