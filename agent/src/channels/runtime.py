@@ -38,6 +38,7 @@ class ChannelRuntime:
         bus: MessageBus,
         session_service: Any,
         manager: ChannelManager | None,
+        dispatcher: Any | None = None,
         session_map_path: Path | None = None,
         reply_timeout_s: float = 600.0,
         poll_interval_s: float = 0.25,
@@ -45,6 +46,7 @@ class ChannelRuntime:
         self.bus = bus
         self.session_service = session_service
         self.manager = manager
+        self.dispatcher = dispatcher
         self.config = ChannelRuntimeConfig(
             reply_timeout_s=reply_timeout_s,
             poll_interval_s=poll_interval_s,
@@ -114,7 +116,10 @@ class ChannelRuntime:
                         channel=msg.channel,
                         chat_id=msg.chat_id,
                         content=reply,
-                        metadata={PAIRING_COMMAND_META_KEY: True},
+                        metadata=self._response_metadata(
+                            msg,
+                            **{PAIRING_COMMAND_META_KEY: True},
+                        ),
                     )
                 )
                 return
@@ -130,17 +135,46 @@ class ChannelRuntime:
                         channel=msg.channel,
                         chat_id=msg.chat_id,
                         content=reply,
-                        metadata={"_channel_runtime": True, "session_reset": True},
+                        metadata=self._response_metadata(
+                            msg,
+                            _channel_runtime=True,
+                            session_reset=True,
+                        ),
                     )
                 )
                 return
 
+            if self._is_status_command(msg.content):
+                await self._publish_status(msg)
+                return
+
+            if self._is_cancel_command(msg.content):
+                await self._cancel_session(msg)
+                return
+
+            if self._is_sessions_command(msg.content):
+                await self._publish_sessions(msg)
+                return
+
             session_id = self._session_for(msg)
-            result = await self.session_service.send_message(
-                session_id,
-                msg.content,
-                include_shell_tools=False,
-            )
+            if self.dispatcher is not None:
+                result = await self.dispatcher.submit(
+                    session_id,
+                    msg.content,
+                    source=msg.channel,
+                    source_metadata={
+                        "channel_session_key": msg.session_key,
+                        "channel_chat_id": msg.chat_id,
+                        **dict(msg.metadata or {}),
+                    },
+                    include_shell_tools=False,
+                )
+            else:
+                result = await self.session_service.send_message(
+                    session_id,
+                    msg.content,
+                    include_shell_tools=False,
+                )
             attempt_id = result.get("attempt_id") if isinstance(result, dict) else None
             reply = await self._wait_for_reply(session_id, attempt_id)
             await self.bus.publish_outbound(
@@ -148,11 +182,12 @@ class ChannelRuntime:
                     channel=msg.channel,
                     chat_id=msg.chat_id,
                     content=reply.content,
-                    metadata={
-                        "_channel_runtime": True,
-                        "attempt_id": attempt_id,
-                        "session_id": session_id,
-                    },
+                    metadata=self._response_metadata(
+                        msg,
+                        _channel_runtime=True,
+                        attempt_id=attempt_id,
+                        session_id=session_id,
+                    ),
                 )
             )
         except asyncio.CancelledError:
@@ -164,7 +199,11 @@ class ChannelRuntime:
                     channel=msg.channel,
                     chat_id=msg.chat_id,
                     content=f"Channel runtime error: {type(exc).__name__}: {exc}",
-                    metadata={"_channel_runtime": True, "error": True},
+                    metadata=self._response_metadata(
+                        msg,
+                        _channel_runtime=True,
+                        error=True,
+                    ),
                 )
             )
 
@@ -172,15 +211,131 @@ class ChannelRuntime:
         key = msg.session_key
         existing = self._session_map.get(key)
         if existing:
+            self._ensure_channel_policy(existing, msg)
             return existing
         session = self.session_service.create_session(
             title=f"{msg.channel}:{msg.chat_id}",
-            config={"channel": msg.channel, "channel_chat_id": msg.chat_id},
+            config={
+                "channel": msg.channel,
+                "channel_chat_id": msg.chat_id,
+                "channel_session_key": key,
+                "channel_policy": {
+                    "research_only": True,
+                    "allow_shell_tools": False,
+                    "allow_trading_tools": False,
+                },
+            },
         )
         session_id = _session_id(session)
         self._session_map[key] = session_id
         self._save_session_map()
         return session_id
+
+    def _ensure_channel_policy(self, session_id: str, msg: InboundMessage) -> None:
+        """Upgrade persisted channel sessions to the enforced research policy."""
+        get_session = getattr(self.session_service, "get_session", None)
+        if not callable(get_session):
+            return
+        session = get_session(session_id)
+        if session is None:
+            return
+        config = dict(getattr(session, "config", {}) or {})
+        policy = dict(config.get("channel_policy") or {})
+        expected = {
+            "research_only": True,
+            "allow_shell_tools": False,
+            "allow_trading_tools": False,
+        }
+        if policy == expected:
+            return
+        config.update(
+            {
+                "channel": msg.channel,
+                "channel_chat_id": msg.chat_id,
+                "channel_session_key": msg.session_key,
+                "channel_policy": expected,
+            }
+        )
+        session.config = config
+        store = getattr(self.session_service, "store", None)
+        update_session = getattr(store, "update_session", None)
+        if callable(update_session):
+            update_session(session)
+
+    async def _publish_status(self, msg: InboundMessage) -> None:
+        session_id = self._session_map.get(msg.session_key)
+        if not session_id:
+            content = "No active session for this chat or topic."
+        else:
+            session = self.session_service.get_session(session_id)
+            attempt = None
+            store = getattr(self.session_service, "store", None)
+            if session is not None and getattr(session, "last_attempt_id", None) and store is not None:
+                attempt = store.get_attempt(session_id, session.last_attempt_id)
+            status = getattr(getattr(attempt, "status", None), "value", None) or "idle"
+            content = f"Session {session_id}\nStatus: {status}"
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=content,
+                metadata=self._response_metadata(msg, _channel_runtime=True, session_status=True),
+            )
+        )
+
+    async def _cancel_session(self, msg: InboundMessage) -> None:
+        session_id = self._session_map.get(msg.session_key)
+        if not session_id:
+            content = "No active session for this chat or topic."
+        elif self.dispatcher is None:
+            running = bool(self.session_service.cancel_current(session_id))
+            content = "Cancellation requested." if running else "No queued or running task."
+        else:
+            result = await self.dispatcher.cancel_session(session_id)
+            running = bool(result.get("running"))
+            queued = int(result.get("queued", 0))
+            content = (
+                f"Cancellation requested: running={int(running)}, queued={queued}."
+                if running or queued
+                else "No queued or running task."
+            )
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=content,
+                metadata=self._response_metadata(msg, _channel_runtime=True, session_cancel=True),
+            )
+        )
+
+    async def _publish_sessions(self, msg: InboundMessage) -> None:
+        prefix = f"{msg.channel}:{msg.chat_id}"
+        rows = [
+            (key, session_id)
+            for key, session_id in self._session_map.items()
+            if key == prefix or key.startswith(prefix + ":")
+        ]
+        if not rows:
+            content = "No sessions for this chat."
+        else:
+            lines = ["Sessions for this chat:"]
+            for key, session_id in rows[-10:]:
+                topic = key[len(prefix):].lstrip(":") or "default"
+                lines.append(f"- {session_id} ({topic})")
+            content = "\n".join(lines)
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=content,
+                metadata=self._response_metadata(msg, _channel_runtime=True, session_list=True),
+            )
+        )
+
+    @staticmethod
+    def _response_metadata(msg: InboundMessage, **updates: Any) -> dict[str, Any]:
+        """Keep adapter routing metadata on every runtime response."""
+        return {**dict(msg.metadata or {}), **updates}
 
     async def _wait_for_reply(self, session_id: str, attempt_id: str | None) -> Message:
         deadline = time.monotonic() + self.config.reply_timeout_s
@@ -246,6 +401,18 @@ class ChannelRuntime:
     def _is_new_session_command(content: str) -> bool:
         """Check if the message is a session reset command (/new, /reset, /newsession)."""
         return content.strip().lower() in ("/new", "/reset", "/newsession")
+
+    @staticmethod
+    def _is_status_command(content: str) -> bool:
+        return content.strip().lower() in ("/status", "status")
+
+    @staticmethod
+    def _is_cancel_command(content: str) -> bool:
+        return content.strip().lower() in ("/cancel", "cancel")
+
+    @staticmethod
+    def _is_sessions_command(content: str) -> bool:
+        return content.strip().lower() in ("/sessions", "sessions")
 
 
 def _session_id(session: Session | dict[str, Any] | Any) -> str:

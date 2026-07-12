@@ -71,6 +71,43 @@ class FakeSessionService:
         return list(self.messages.get(session_id, []))
 
 
+class FakeDispatcher:
+    """Record channel submissions while reusing the fake service reply path."""
+
+    def __init__(self, service: FakeSessionService) -> None:
+        self.service = service
+        self.submitted: list[dict[str, Any]] = []
+        self.cancelled: list[str] = []
+
+    async def submit(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        source: str,
+        source_metadata: dict[str, Any],
+        include_shell_tools: bool,
+    ) -> dict[str, str]:
+        self.submitted.append(
+            {
+                "session_id": session_id,
+                "content": content,
+                "source": source,
+                "source_metadata": source_metadata,
+                "include_shell_tools": include_shell_tools,
+            }
+        )
+        return await self.service.send_message(
+            session_id,
+            content,
+            include_shell_tools=include_shell_tools,
+        )
+
+    async def cancel_session(self, session_id: str) -> dict[str, Any]:
+        self.cancelled.append(session_id)
+        return {"status": "cancelled", "running": True, "queued": 2}
+
+
 def test_channel_manager_can_construct_websocket_with_default_gateway() -> None:
     bus = MessageBus()
     manager = ChannelManager(
@@ -283,6 +320,85 @@ def test_channel_runtime_routes_inbound_to_session_and_outbound(tmp_path: Path) 
                 "session_id": "session-1",
             },
         )
+
+    asyncio.run(scenario())
+
+
+def test_channel_runtime_uses_dispatcher_research_policy_and_preserves_routing_metadata(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        from src.channels.runtime import ChannelRuntime
+
+        bus = MessageBus()
+        service = FakeSessionService()
+        dispatcher = FakeDispatcher(service)
+        runtime = ChannelRuntime(
+            bus=bus,
+            session_service=service,
+            manager=None,
+            dispatcher=dispatcher,
+            session_map_path=tmp_path / "channel_sessions.json",
+            reply_timeout_s=1,
+            poll_interval_s=0.01,
+        )
+        await runtime.start(start_manager=False)
+        try:
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="user-1",
+                    chat_id="chat-1",
+                    content="research this portfolio",
+                    metadata={"message_id": "m-1", "root_id": "root-1", "thread_id": "thread-1"},
+                    session_key_override="feishu:chat-1:root-1",
+                )
+            )
+            outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="user-1",
+                    chat_id="chat-1",
+                    content="/cancel",
+                    metadata={"message_id": "m-2", "root_id": "root-1"},
+                    session_key_override="feishu:chat-1:root-1",
+                )
+            )
+            cancelled = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+        finally:
+            await runtime.stop()
+
+        assert service.created[0].config["channel_policy"] == {
+            "research_only": True,
+            "allow_shell_tools": False,
+            "allow_trading_tools": False,
+        }
+        assert dispatcher.submitted == [
+            {
+                "session_id": "session-1",
+                "content": "research this portfolio",
+                "source": "feishu",
+                "source_metadata": {
+                    "channel_session_key": "feishu:chat-1:root-1",
+                    "channel_chat_id": "chat-1",
+                    "message_id": "m-1",
+                    "root_id": "root-1",
+                    "thread_id": "thread-1",
+                },
+                "include_shell_tools": False,
+            }
+        ]
+        assert outbound.metadata["message_id"] == "m-1"
+        assert outbound.metadata["root_id"] == "root-1"
+        assert outbound.metadata["thread_id"] == "thread-1"
+        assert outbound.metadata["session_id"] == "session-1"
+        assert dispatcher.cancelled == ["session-1"]
+        assert cancelled.metadata["message_id"] == "m-2"
+        assert cancelled.metadata["session_cancel"] is True
+        assert "running=1" in cancelled.content
+        assert "queued=2" in cancelled.content
 
     asyncio.run(scenario())
 

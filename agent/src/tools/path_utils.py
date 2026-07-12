@@ -114,6 +114,11 @@ def _allowed_file_roots() -> list[Path]:
     return roots
 
 
+def allowed_file_roots() -> list[Path]:
+    """Return the public, resolved allowlist for channel and tool integrations."""
+    return _allowed_file_roots()
+
+
 def _allowed_run_roots() -> list[Path]:
     """Return all roots allowed for run_dir-based tools."""
     raw = os.getenv(_ALLOWED_RUN_ROOTS_ENV, "")

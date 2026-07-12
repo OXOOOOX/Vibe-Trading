@@ -97,6 +97,7 @@ include = ["src*", "backtest*", "cli*"]
 [project.optional-dependencies]
 feishu = [
     "lark-oapi>=1.7.1,<2",
+    "qrcode>=7.4.2",
 ]
 ibkr = [
     "ib_async>=2.0",
@@ -118,10 +119,6 @@ dingtalk = [
 ]
 discord = [
     "discord.py>=2.4.0",
-]
-feishu = [
-    "lark-oapi>=1.4.0",
-    "qrcode>=7.4.2",
 ]
 matrix = [
     "aiohttp>=3.9.0",

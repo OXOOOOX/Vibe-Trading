@@ -1,8 +1,27 @@
 import i18n from "@/i18n";
 import { useEffect, useMemo, useState, type FormEvent } from "react";
-import { Database, KeyRound, Loader2, RotateCcw, Save, Server, SlidersHorizontal } from "lucide-react";
+import {
+  Database,
+  KeyRound,
+  Loader2,
+  MessageSquareMore,
+  Play,
+  RefreshCw,
+  RotateCcw,
+  Save,
+  Server,
+  SlidersHorizontal,
+  Square,
+} from "lucide-react";
 import { toast } from "sonner";
-import { api, isAuthRequiredError, type DataSourceSettings, type LLMProviderOption, type LLMSettings } from "@/lib/api";
+import {
+  api,
+  isAuthRequiredError,
+  type ChannelRuntimeStatus,
+  type DataSourceSettings,
+  type LLMProviderOption,
+  type LLMSettings,
+} from "@/lib/api";
 import { getApiAuthKey, setApiAuthKey } from "@/lib/apiAuth";
 
 interface LLMFormState {
@@ -36,6 +55,8 @@ export function Settings() {
 
   const [settings, setSettings] = useState<LLMSettings | null>(null);
   const [dataSettings, setDataSettings] = useState<DataSourceSettings | null>(null);
+  const [channelStatus, setChannelStatus] = useState<ChannelRuntimeStatus | null>(null);
+  const [channelLoadError, setChannelLoadError] = useState<string | null>(null);
   const [form, setForm] = useState<LLMFormState | null>(null);
   const [apiKey, setApiKey] = useState("");
   const [localApiKey, setLocalApiKeyState] = useState(() => getApiAuthKey());
@@ -45,16 +66,29 @@ export function Settings() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [dataSaving, setDataSaving] = useState(false);
+  const [channelRefreshing, setChannelRefreshing] = useState(false);
+  const [channelAction, setChannelAction] = useState<"start" | "stop" | null>(null);
   const [settingsLoadError, setSettingsLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
-    Promise.all([api.getLLMSettings(), api.getDataSourceSettings()])
-      .then(([llmData, dataSourceData]) => {
+    Promise.all([
+      api.getLLMSettings(),
+      api.getDataSourceSettings(),
+      api.getChannelStatus()
+        .then((status) => ({ status, error: null }))
+        .catch((error: unknown) => ({
+          status: null,
+          error: error instanceof Error ? error.message : "Unknown error",
+        })),
+    ])
+      .then(([llmData, dataSourceData, channelResult]) => {
         if (!alive) return;
         setSettings(llmData);
         setForm(toForm(llmData));
         setDataSettings(dataSourceData);
+        setChannelStatus(channelResult.status);
+        setChannelLoadError(channelResult.error);
         setSettingsLoadError(null);
       })
       .catch((error) => {
@@ -72,6 +106,43 @@ export function Settings() {
       });
     return () => { alive = false; };
   }, []);
+
+  const refreshChannelStatus = async () => {
+    setChannelRefreshing(true);
+    try {
+      setChannelStatus(await api.getChannelStatus());
+      setChannelLoadError(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      setChannelLoadError(message);
+      toast.error(`${i18n.t("settings.channels.refreshFailed")}: ${message}`);
+    } finally {
+      setChannelRefreshing(false);
+    }
+  };
+
+  const setChannelsRunning = async (action: "start" | "stop") => {
+    setChannelAction(action);
+    try {
+      const updated = action === "start" ? await api.startChannels() : await api.stopChannels();
+      setChannelStatus(updated);
+      setChannelLoadError(null);
+      toast.success(
+        action === "start"
+          ? i18n.t("settings.channels.started")
+          : i18n.t("settings.channels.stoppedToast"),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      toast.error(
+        `${i18n.t(
+          action === "start" ? "settings.channels.startFailed" : "settings.channels.stopFailed",
+        )}: ${message}`,
+      );
+    } finally {
+      setChannelAction(null);
+    }
+  };
 
   const providers = settings?.providers ?? [];
   const selectedProvider = useMemo<LLMProviderOption | undefined>(
@@ -218,6 +289,11 @@ export function Settings() {
   const tushareStatus = dataSettings.tushare_token_configured
     ? "Configured"
     : "Leave blank to keep the current token";
+  const channelRows = Object.entries(channelStatus?.channels ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  const channelEnabledCount = channelRows.filter(([, item]) => item.enabled).length;
+  const channelLoadedCount = channelRows.filter(([, item]) => item.loaded).length;
+  const channelUnavailableCount = channelRows.filter(([, item]) => item.available === false).length;
+  const channelBusy = channelRefreshing || channelAction !== null;
 
   return (
     <div className="mx-auto max-w-5xl space-y-6 p-6">
@@ -227,6 +303,117 @@ export function Settings() {
       </div>
 
       {localApiAccessSection}
+
+      <section className="rounded-lg border bg-card p-5 shadow-sm">
+        <div className="mb-5 flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <MessageSquareMore className="h-4 w-4 text-primary" />
+              <h2 className="text-base font-semibold">{i18n.t("settings.channels.title")}</h2>
+            </div>
+            <p className="max-w-3xl text-sm text-muted-foreground">
+              {i18n.t("settings.channels.description")}
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={refreshChannelStatus}
+              disabled={channelBusy}
+              className="inline-flex items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {channelRefreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              {i18n.t("settings.channels.refresh")}
+            </button>
+            <button
+              type="button"
+              onClick={() => setChannelsRunning("start")}
+              disabled={channelBusy}
+              className="inline-flex items-center justify-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {channelAction === "start" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+              {i18n.t("settings.channels.start")}
+            </button>
+            <button
+              type="button"
+              onClick={() => setChannelsRunning("stop")}
+              disabled={channelBusy}
+              className="inline-flex items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {channelAction === "stop" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-4 w-4" />}
+              {i18n.t("settings.channels.stop")}
+            </button>
+          </div>
+        </div>
+
+        {channelLoadError && !channelStatus ? (
+          <div className="rounded-md border border-warning/30 bg-warning/5 px-4 py-3 text-sm">
+            <div className="font-medium text-foreground">{i18n.t("settings.channels.unavailable")}</div>
+            <div className="mt-1 break-words text-xs text-muted-foreground">{channelLoadError}</div>
+          </div>
+        ) : (
+          <>
+            <div className="mb-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <div className="rounded-md border bg-muted/20 px-3 py-2">
+                <div className="text-xs text-muted-foreground">{i18n.t("settings.channels.runtime")}</div>
+                <div className="text-sm font-medium">
+                  {channelStatus?.running ? i18n.t("settings.channels.running") : i18n.t("settings.channels.stopped")}
+                </div>
+              </div>
+              <div className="rounded-md border bg-muted/20 px-3 py-2">
+                <div className="text-xs text-muted-foreground">{i18n.t("settings.channels.enabled")}</div>
+                <div className="text-sm font-medium">{channelEnabledCount}</div>
+              </div>
+              <div className="rounded-md border bg-muted/20 px-3 py-2">
+                <div className="text-xs text-muted-foreground">{i18n.t("settings.channels.loaded")}</div>
+                <div className="text-sm font-medium">{channelLoadedCount}</div>
+              </div>
+              <div className="rounded-md border bg-muted/20 px-3 py-2">
+                <div className="text-xs text-muted-foreground">{i18n.t("settings.channels.unavailable")}</div>
+                <div className="text-sm font-medium">{channelUnavailableCount}</div>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto rounded-md border">
+              <table className="min-w-full text-sm">
+                <thead className="bg-muted/40 text-xs text-muted-foreground">
+                  <tr>
+                    <th className="px-3 py-2 text-left font-medium">{i18n.t("settings.channels.channel")}</th>
+                    <th className="px-3 py-2 text-left font-medium">{i18n.t("settings.channels.state")}</th>
+                    <th className="px-3 py-2 text-left font-medium">{i18n.t("settings.channels.recovery")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {channelRows.map(([name, item]) => (
+                    <tr key={name} className="border-t">
+                      <td className="px-3 py-2 align-top">
+                        <div className="font-medium">{item.display_name || name}</div>
+                        <div className="text-xs text-muted-foreground">{name}</div>
+                      </td>
+                      <td className="px-3 py-2 align-top">
+                        <div className="flex flex-wrap gap-1.5">
+                          <span className={`rounded-full px-2 py-0.5 text-xs ${item.enabled ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground"}`}>
+                            {item.enabled ? i18n.t("settings.channels.enabled") : i18n.t("settings.channels.disabled")}
+                          </span>
+                          <span className={`rounded-full px-2 py-0.5 text-xs ${item.loaded ? "bg-success/10 text-success" : "bg-muted text-muted-foreground"}`}>
+                            {item.loaded ? i18n.t("settings.channels.loaded") : i18n.t("settings.channels.notLoaded")}
+                          </span>
+                          <span className={`rounded-full px-2 py-0.5 text-xs ${item.running ? "bg-success/10 text-success" : "bg-muted text-muted-foreground"}`}>
+                            {item.running ? i18n.t("settings.channels.running") : i18n.t("settings.channels.stopped")}
+                          </span>
+                        </div>
+                      </td>
+                      <td className="max-w-md px-3 py-2 align-top text-xs text-muted-foreground">
+                        {item.install_hint || item.error || i18n.t("settings.channels.noRecovery")}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+      </section>
 
       <div className="space-y-2">
         <h2 className="text-lg font-semibold tracking-tight">{"LLM Settings"}</h2>

@@ -54,6 +54,25 @@ def load_agent_config(config_path: Path | None = None) -> AgentConfig:
         return AgentConfig()
 
 
+def save_agent_config(config: AgentConfig, config_path: Path | None = None) -> Path:
+    """Atomically persist validated structured config using its active format."""
+    path = get_config_path(config_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = config.model_dump(mode="json", by_alias=True, exclude_none=True)
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    elif suffix in {".yaml", ".yml"}:
+        if yaml is None:
+            raise ValueError("YAML config is not available because PyYAML is missing")
+        text = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
+    else:
+        raise ValueError(f"Unsupported config file format: {suffix or '<none>'}")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+    return path
+
 def merge_agent_config_overrides(
     config: AgentConfig,
     overrides: Mapping[str, Any] | None,

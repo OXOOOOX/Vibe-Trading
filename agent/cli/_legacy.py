@@ -2947,6 +2947,10 @@ def cmd_channels_login(channel_name: str, *, force: bool = False) -> int:
         console.print("[green]WebSocket channel does not require interactive login.[/green]")
         console.print("[dim]Configure channels.websocket in ~/.vibe-trading/agent.json, then run `vibe-trading channels start`.[/dim]")
         return EXIT_SUCCESS
+    if not section and channel_name == "feishu":
+        from src.channels.feishu import FeishuChannel
+
+        section = FeishuChannel.default_config()
     if not section:
         console.print(f"[red]No config found for channel '{channel_name}'.[/red]")
         console.print("[dim]Add it under channels.<name> in ~/.vibe-trading/agent.json, then retry.[/dim]")

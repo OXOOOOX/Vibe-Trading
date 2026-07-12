@@ -40,6 +40,7 @@ def _client(
     monkeypatch.setattr(api_server, "_channel_runtime", None)
     monkeypatch.setattr(api_server, "_channel_bus", None)
     monkeypatch.setattr(api_server, "_channel_manager", None)
+    monkeypatch.setattr(api_server, "_session_dispatcher", None)
     monkeypatch.setattr(api_server, "_get_session_service", lambda: FakeSessionService())
     monkeypatch.setattr(channel_config, "load_channels_config", lambda: dict(config))
     monkeypatch.setattr(pairing_store, "_store_path", lambda: tmp_path / "pairing.json")

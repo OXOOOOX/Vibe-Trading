@@ -41,6 +41,66 @@ _PORTFOLIO_ANALYSIS_TOOL_NAMES = [
     "pattern",
 ]
 
+# Remote chat channels are intentionally limited to research and backtesting.
+# This is an actual registry allowlist, not a prompt-only promise: broker,
+# order, mandate, shell, swarm, and generic file-write tools never enter the
+# AgentLoop for sessions created by ChannelRuntime.
+_CHANNEL_RESEARCH_TOOL_NAMES = [
+    "load_skill",
+    "portfolio_state",
+    "verified_market_data",
+    "get_market_data",
+    "get_stock_news",
+    "web_search",
+    "read_url",
+    "read_document",
+    "read_file",
+    "get_stock_profile",
+    "get_sector_info",
+    "get_financial_statements",
+    "get_fund_flow",
+    "get_northbound_flow",
+    "get_margin_trading",
+    "get_block_trades",
+    "get_dragon_tiger",
+    "get_shareholder_count",
+    "get_lockup_expiry",
+    "get_macro_series",
+    "iwencai_search",
+    "screen_market",
+    "get_options_chain",
+    "options_pricing",
+    "get_research_reports",
+    "get_sec_filings",
+    "search_symbol",
+    "pattern",
+    "backtest",
+    "alpha_zoo",
+    "alpha_bench",
+    "alpha_compare",
+    "factor_analysis",
+    "run_research_autopilot",
+    "generate_backtest_config",
+    "scaffold_signal_engine",
+    "link_autopilot_backtest",
+    "create_hypothesis",
+    "update_hypothesis",
+    "link_backtest",
+    "search_hypotheses",
+    "start_research_goal",
+    "update_research_goal_status",
+    "get_research_goal",
+    "add_goal_evidence",
+    "extract_shadow_strategy",
+    "run_shadow_backtest",
+    "render_shadow_report",
+    "scan_shadow_signals",
+    "analyze_trade_journal",
+    "remember",
+    "session_search",
+    "publish_obsidian_note",
+]
+
 from src.session.events import EventBus
 from src.session.models import (
     Attempt,
@@ -448,7 +508,13 @@ class SessionService:
             self.event_bus.emit(session_id, "mcp.warning", {"attempt_id": attempt_id, "message": msg})
 
         portfolio_analysis = dict((session_config or {}).get("portfolio_analysis") or {})
-        if portfolio_analysis.get("research_only"):
+        channel_policy = dict((session_config or {}).get("channel_policy") or {})
+        if channel_policy.get("research_only"):
+            registry = await loop.run_in_executor(
+                _AGENT_EXECUTOR,
+                lambda: build_filtered_registry(_CHANNEL_RESEARCH_TOOL_NAMES, include_shell_tools=False),
+            )
+        elif portfolio_analysis.get("research_only"):
             registry = await loop.run_in_executor(
                 _AGENT_EXECUTOR,
                 lambda: build_filtered_registry(_PORTFOLIO_ANALYSIS_TOOL_NAMES, include_shell_tools=False),

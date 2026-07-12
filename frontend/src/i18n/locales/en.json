@@ -214,7 +214,31 @@
     "loaderAvailable": "Loader available",
     "noProjectLoader": "No project loader",
     "pythonPackageInstalled": "Python package installed",
-    "pythonPackageNotInstalled": "Python package not installed"
+    "pythonPackageNotInstalled": "Python package not installed",
+    "channels": {
+      "title": "IM Channels",
+      "description": "Connect chat adapters to the same queued, research-only session runtime used by the Web UI.",
+      "runtime": "Runtime",
+      "running": "Running",
+      "stopped": "Stopped",
+      "enabled": "Enabled",
+      "disabled": "Disabled",
+      "loaded": "Loaded",
+      "notLoaded": "Not loaded",
+      "unavailable": "Unavailable",
+      "channel": "Channel",
+      "state": "State",
+      "recovery": "Recovery",
+      "noRecovery": "Ready",
+      "refresh": "Refresh",
+      "start": "Start channels",
+      "stop": "Stop channels",
+      "started": "IM channels started",
+      "stoppedToast": "IM channels stopped",
+      "refreshFailed": "Failed to refresh IM channels",
+      "startFailed": "Failed to start IM channels",
+      "stopFailed": "Failed to stop IM channels"
+    }
   },
   "agent": {
     "connectionLostReconnect": "Connection lost, reconnecting…",

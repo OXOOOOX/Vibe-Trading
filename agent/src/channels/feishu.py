@@ -15,7 +15,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
@@ -24,9 +24,7 @@ from rich.text import Text
 from src.channels.bus.events import OutboundMessage
 from src.channels.bus.queue import MessageBus
 from src.channels.base import BaseChannel
-from src.channels.utils import get_media_dir
-from pydantic import BaseModel
-from src.channels.utils import safe_filename
+from src.channels.utils import get_media_dir, safe_filename
 # logging_bridge not needed (using stdlib logging)
 
 if TYPE_CHECKING:
@@ -34,6 +32,11 @@ if TYPE_CHECKING:
 
 FEISHU_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 _LOGIN_CONSOLE = Console()
+
+
+def _to_camel(name: str) -> str:
+    head, *tail = name.split("_")
+    return head + "".join(part.capitalize() for part in tail)
 
 
 def _load_lark_runtime() -> tuple[Any, str, str]:
@@ -341,6 +344,8 @@ def _extract_post_text(content_json: dict) -> str:
 class FeishuConfig(BaseModel):
     """Feishu/Lark channel configuration using WebSocket long connection."""
 
+    model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
+
     enabled: bool = False
     app_id: str = ""
     app_secret: str = ""
@@ -644,14 +649,17 @@ class FeishuChannel(BaseChannel):
         self.config.app_secret = result["app_secret"]
         self.config.domain = result.get("domain", "feishu")
 
-        # Write credentials back to config
-        # VT-TODO: persist feishu credentials via VT config system
-        try:
-            from src.config.loader import load_agent_config
-            # Credentials stored in-memory on self.config; persist via VT config
-            # when channel config persistence is wired up.
-        except Exception:
-            pass
+        # Persist the validated adapter section so restart and auto-start use
+        # the credentials obtained by QR onboarding.
+        from src.config.loader import load_agent_config, save_agent_config
+        from src.config.schema import AgentConfig
+
+        config = load_agent_config()
+        payload = config.model_dump(mode="json", by_alias=True, exclude_none=True)
+        channels = dict(payload.get("channels") or {})
+        channels["feishu"] = self.config.model_dump(mode="json", by_alias=True)
+        payload["channels"] = channels
+        save_agent_config(AgentConfig.model_validate(payload))
 
         _LOGIN_CONSOLE.print("\n[green]Feishu/Lark login complete.[/green]")
         _LOGIN_CONSOLE.print(f"App ID: {escape(result['app_id'])}")

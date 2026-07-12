@@ -128,4 +128,15 @@ describe("Settings IM channels panel", () => {
 
     await waitFor(() => expect(apiMock.startChannels).toHaveBeenCalledTimes(1));
   });
+
+  it("keeps core settings usable when channel status is unavailable", async () => {
+    apiMock.getChannelStatus.mockRejectedValueOnce(new Error("channel runtime unavailable"));
+
+    render(<Settings />);
+
+    expect(await screen.findByText("IM Channels")).toBeInTheDocument();
+    expect(screen.getByText("channel runtime unavailable")).toBeInTheDocument();
+    expect(screen.getByText("Connection")).toBeInTheDocument();
+    expect(screen.queryByText("Settings are unavailable")).not.toBeInTheDocument();
+  });
 });

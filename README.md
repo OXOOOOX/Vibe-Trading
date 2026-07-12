@@ -750,28 +750,43 @@ vibe-trading run -p "Summarize the key risks and beats/misses from this earnings
 
 ## 🌐 API Server
 
-### Feishu bot (home-server remote access)
+### IM channels and Feishu (home-server remote access)
 
-Vibe-Trading can receive research and backtest questions from a Feishu self-built app bot over the official long connection. The API remains bound to localhost; the bot only needs outbound internet access.
+Vibe-Trading routes Feishu and 15 other IM adapters through the same persistent session runtime used by the Web UI. Feishu uses the official long connection, so the API can remain bound to localhost and needs only outbound internet access.
 
 ```bash
 pip install "vibe-trading-ai[feishu]"
 ```
 
-Configure the app credentials and explicit chat/user allowlists in `agent/.env`, then restart `vibe-trading serve`:
+Create `~/.vibe-trading/agent.json` with an explicit sender allowlist:
 
-```dotenv
-FEISHU_BOT_ENABLED=1
-FEISHU_APP_ID=cli_xxx
-FEISHU_APP_SECRET=xxx
-FEISHU_ALLOWED_CHAT_IDS=oc_xxx
-FEISHU_OPERATOR_OPEN_IDS=ou_xxx
+```json
+{
+  "channels": {
+    "replyTimeoutS": 600,
+    "feishu": {
+      "enabled": true,
+      "appId": "cli_xxx",
+      "appSecret": "xxx",
+      "allowFrom": ["ou_xxx"],
+      "groupPolicy": "mention",
+      "topicIsolation": true,
+      "streaming": true
+    }
+  }
+}
 ```
 
-Enable the bot capability, subscribe to `im.message.receive_v1`, grant group `@bot` message read and bot-message send permissions, and select long connection in the Feishu developer console. In group chats, each top-level `@bot` message creates a Vibe-Trading session; replies inside that Feishu topic continue it. Different topics can run concurrently, while messages in one topic are queued in order. Commands are `/status`, `/cancel`, `/sessions`, and `/help`. The channel intentionally exposes research and backtesting only—live-trading controls are not available through Feishu.
+Alternatively, start with `{"channels":{"feishu":{"enabled":true}}}` and run `vibe-trading channels login feishu`; successful QR onboarding persists the credentials in the same config file.
+
+Enable the bot capability, subscribe to `im.message.receive_v1`, grant group `@bot` message read and bot-message send permissions, and select long connection in the Feishu developer console. Each topic is an isolated Vibe-Trading Session. Different topics can run concurrently, while messages in one topic are persisted and executed FIFO through the shared Dispatcher. Commands include `/status`, `/cancel`, `/sessions`, `/new`, and `/reset`.
+
+Remote channels use a code-level research/backtest tool allowlist. Broker selection, account/order tools, mandate controls, live orders, Swarm, Shell, and generic write/edit tools are absent from the channel Agent registry.
 
 ```bash
 vibe-trading serve --port 8899
+vibe-trading channels status
+vibe-trading channels start
 ```
 
 | Method | Endpoint | Description |
@@ -794,6 +809,9 @@ vibe-trading serve --port 8899
 | `PUT` | `/settings/llm` | Update local LLM settings |
 | `GET` | `/settings/data-sources` | Read local data source settings |
 | `PUT` | `/settings/data-sources` | Update local data source settings |
+| `GET` | `/channels/status` | Inspect IM runtime and adapters |
+| `POST` | `/channels/start` | Start configured IM adapters |
+| `POST` | `/channels/stop` | Stop configured IM adapters |
 | `POST` | `/scheduled-runs` | Create a scheduled research job (interval-ms or cron) |
 | `GET` | `/scheduled-runs` | List scheduled jobs |
 | `DELETE` | `/scheduled-runs/{job_id}` | Cancel a scheduled job |

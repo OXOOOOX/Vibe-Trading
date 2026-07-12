@@ -569,6 +569,13 @@ class LiveStatusResponse(BaseModel):
     brokers: List[LiveBrokerStatus]
 
 
+class ChannelPairingCommandRequest(BaseModel):
+    """Pairing command executed through the IM control surface."""
+
+    channel: str = Field(..., min_length=1, max_length=64)
+    command: str = Field("list", max_length=500)
+
+
 
 # ============================================================================
 # FastAPI Application
@@ -749,16 +756,14 @@ async def _run_startup_preflight() -> None:
     dispatcher = _get_session_dispatcher()
     if dispatcher is not None:
         dispatcher.start()
-    bot = _get_feishu_bot()
-    if bot is not None:
-        bot.start()
+    if _env_flag_enabled("VIBE_TRADING_CHANNELS_AUTO_START"):
+        await _start_channel_runtime()
 
 
 @app.on_event("shutdown")
 async def _stop_scheduled_research_on_shutdown() -> None:
     """Stop channel, message-dispatch, and scheduled workers on shutdown."""
-    if _feishu_bot is not None:
-        await _feishu_bot.stop()
+    await _stop_channel_runtime()
     if _session_dispatcher is not None:
         await _session_dispatcher.stop()
     await _stop_scheduled_research_executor()
@@ -2271,6 +2276,38 @@ async def health_check():
     )
 
 
+@app.get("/channels/status", dependencies=[Depends(require_auth)])
+async def channels_status():
+    """Return IM channel runtime, queue, and adapter status."""
+    return _get_channel_runtime().status()
+
+
+@app.post("/channels/start", dependencies=[Depends(require_auth)])
+async def channels_start():
+    """Start configured IM channel adapters."""
+    runtime = await _start_channel_runtime()
+    return {"status": "started", **runtime.status()}
+
+
+@app.post("/channels/stop", dependencies=[Depends(require_auth)])
+async def channels_stop():
+    """Stop configured IM channel adapters."""
+    runtime = _get_channel_runtime()
+    await runtime.stop()
+    return {"status": "stopped", **runtime.status()}
+
+
+@app.post("/channels/pairing/command", dependencies=[Depends(require_auth)])
+async def channels_pairing_command(payload: ChannelPairingCommandRequest):
+    """Run a pairing command against the shared pairing store."""
+    from src.channels.pairing import handle_pairing_command
+
+    return {
+        "channel": payload.channel,
+        "reply": handle_pairing_command(payload.channel, payload.command),
+    }
+
+
 @app.get("/correlation")
 async def get_correlation_matrix(
     codes: str = Query(..., description="Comma-separated asset codes, e.g. BTC-USDT,ETH-USDT,SPY"),
@@ -2359,7 +2396,9 @@ async def api_info():
 
 _session_service = None
 _session_dispatcher = None
-_feishu_bot = None
+_channel_runtime = None
+_channel_bus = None
+_channel_manager = None
 _goal_store = None
 
 
@@ -2412,20 +2451,49 @@ def _get_session_dispatcher():
     return _session_dispatcher
 
 
-def _get_feishu_bot():
-    """Return the optional Feishu long-connection channel."""
-    global _feishu_bot
-    from src.channels.feishu import FeishuBot
+def _get_channel_runtime():
+    """Lazy-init the official IM runtime with the persistent dispatcher."""
+    global _channel_runtime, _channel_bus, _channel_manager
+    if _channel_runtime is not None:
+        return _channel_runtime
 
-    if not FeishuBot.enabled():
-        return None
-    if _feishu_bot is None:
-        dispatcher = _get_session_dispatcher()
-        service = _get_session_service()
-        if dispatcher is None or service is None:
-            raise RuntimeError("Feishu bot requires ENABLE_SESSION_RUNTIME=true")
-        _feishu_bot = FeishuBot(service, dispatcher)
-    return _feishu_bot
+    from src.channels.bus.queue import MessageBus
+    from src.channels.config import load_channels_config
+    from src.channels.manager import ChannelManager
+    from src.channels.runtime import ChannelRuntime
+
+    service = _get_session_service()
+    dispatcher = _get_session_dispatcher()
+    if service is None or dispatcher is None:
+        raise HTTPException(status_code=501, detail="Session runtime not enabled")
+
+    _channel_bus = MessageBus()
+    config = load_channels_config()
+    _channel_manager = ChannelManager(config, _channel_bus, session_service=service)
+    _channel_runtime = ChannelRuntime(
+        bus=_channel_bus,
+        session_service=service,
+        manager=_channel_manager,
+        dispatcher=dispatcher,
+        reply_timeout_s=float(config.get("reply_timeout_s", 600.0)),
+    )
+    return _channel_runtime
+
+
+async def _start_channel_runtime():
+    """Start the official channel runtime and configured adapters."""
+    dispatcher = _get_session_dispatcher()
+    if dispatcher is not None:
+        dispatcher.start()
+    runtime = _get_channel_runtime()
+    await runtime.start(start_manager=True)
+    return runtime
+
+
+async def _stop_channel_runtime() -> None:
+    """Stop the channel runtime when it was initialized."""
+    if _channel_runtime is not None:
+        await _channel_runtime.stop()
 
 
 def _get_goal_store():
