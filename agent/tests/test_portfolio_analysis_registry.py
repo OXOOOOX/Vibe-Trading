@@ -9,11 +9,10 @@ def test_portfolio_analysis_registry_excludes_order_execution_tools() -> None:
     assert {
         "portfolio_state",
         "publish_obsidian_note",
-        "verified_market_data",
-        "get_market_data",
-        "get_stock_news",
+        "get_data_context",
         "web_search",
     } <= allowed
+    assert not {"verified_market_data", "get_market_data", "get_stock_news"} & allowed
     assert not {"trading_place_order", "trading_cancel_order", "trading_account", "run_swarm", "write_file"} & allowed
     assert not any(name.startswith("trading_") for name in allowed)
 
@@ -23,8 +22,7 @@ def test_channel_research_registry_allows_backtests_but_excludes_remote_controls
 
     assert {
         "portfolio_state",
-        "verified_market_data",
-        "get_market_data",
+        "get_data_context",
         "backtest",
         "alpha_bench",
         "factor_analysis",
@@ -34,6 +32,7 @@ def test_channel_research_registry_allows_backtests_but_excludes_remote_controls
         "financial_rigor",
         "report_audit",
     } <= allowed
+    assert not {"verified_market_data", "get_market_data", "get_stock_news"} & allowed
     forbidden = {
         "trading_connections",
         "trading_select_connection",

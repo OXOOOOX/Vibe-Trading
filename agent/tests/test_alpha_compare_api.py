@@ -175,10 +175,11 @@ def test_stream_emits_result_then_done() -> None:
         progress={"n_done": 2, "n_total": 2, "current_alpha_id": "alpha101_2"},
         result=dict(_OK_ENVELOPE),
     )
-    with _client() as client:
-        r = client.get("/alpha/compare/dddd4444/stream")
-        assert r.status_code == 200
-        text = r.text
+    # Do not enter the application lifespan here: this is a route-level test,
+    # and startup may connect configured external channels such as Feishu.
+    r = _client().get("/alpha/compare/dddd4444/stream")
+    assert r.status_code == 200
+    text = r.text
     assert "event: result" in text
     assert "event: done" in text
     assert "ranking" in text

@@ -26,21 +26,32 @@ from src.tools.mcp import _build_token_store
 pytestmark = pytest.mark.unit
 
 
-def test_build_token_store_creates_dir_0700(tmp_path: Path) -> None:
+def test_build_token_store_creates_dir_0700(tmp_path: Path, monkeypatch) -> None:
     cache = tmp_path / "oauth"
     assert not cache.exists()
+    chmod_calls: list[tuple[Path, int]] = []
+    real_chmod = os.chmod
+
+    def _recording_chmod(path: str | os.PathLike[str], mode: int) -> None:
+        chmod_calls.append((Path(path), mode))
+        real_chmod(path, mode)
+
+    monkeypatch.setattr(os, "chmod", _recording_chmod)
 
     _build_token_store(str(cache))
 
     assert cache.is_dir()
-    mode = stat.S_IMODE(os.stat(cache).st_mode)
-    assert mode == 0o700, f"expected owner-only 0700, got {oct(mode)}"
+    assert chmod_calls[-1] == (cache, 0o700)
+    if os.name != "nt":
+        mode = stat.S_IMODE(os.stat(cache).st_mode)
+        assert mode == 0o700, f"expected owner-only 0700, got {oct(mode)}"
 
 
 def test_build_token_store_expands_user(monkeypatch, tmp_path: Path) -> None:
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
 
     _build_token_store("~/.vibe-trading/live/robinhood/oauth")
 
@@ -53,7 +64,9 @@ def test_build_token_store_idempotent_on_existing_dir(tmp_path: Path) -> None:
     _build_token_store(str(cache))
     # Second call must not raise on an already-existing directory.
     _build_token_store(str(cache))
-    assert stat.S_IMODE(os.stat(cache).st_mode) == 0o700
+    assert cache.is_dir()
+    if os.name != "nt":
+        assert stat.S_IMODE(os.stat(cache).st_mode) == 0o700
 
 
 def test_token_persists_across_store_instances(tmp_path: Path) -> None:

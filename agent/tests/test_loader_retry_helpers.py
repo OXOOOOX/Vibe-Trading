@@ -221,6 +221,7 @@ def test_loader_cache_disabled_by_default_bypasses_home(tmp_path, monkeypatch):
     monkeypatch.delenv(LOADER_CACHE_ENV, raising=False)
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     calls = {"count": 0}
     frame = _cache_frame()
 
@@ -285,6 +286,7 @@ def test_loader_cache_happy_path_writes_then_reuses(
 ):
     monkeypatch.setenv(LOADER_CACHE_ENV, "1")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     calls = {"count": 0}
     frame = _cache_frame()
 
@@ -317,6 +319,7 @@ def test_loader_cache_corrupt_entry_falls_back_to_live_fetch(
 ):
     monkeypatch.setenv(LOADER_CACHE_ENV, "true")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     kwargs = {
         "source": "tushare",
         "symbol": "000001.SZ",
@@ -352,6 +355,7 @@ def test_tushare_daily_fetch_uses_opt_in_cache_for_bars_and_fields(
 ):
     monkeypatch.setenv(LOADER_CACHE_ENV, "yes")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("TUSHARE_TOKEN", "test-token")
 
     class _FakeApi:
@@ -414,6 +418,7 @@ def test_loader_cache_skips_unsettled_today_range(tmp_path, monkeypatch):
     """A range ending today must never be cached: its last bar is still forming."""
     monkeypatch.setenv(LOADER_CACHE_ENV, "1")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     today = dt.date.today().isoformat()
     start = (dt.date.today() - dt.timedelta(days=5)).isoformat()
     kwargs = {
@@ -437,6 +442,7 @@ def test_loader_cache_real_duckdb_round_trip(tmp_path, monkeypatch):
     pytest.importorskip("duckdb")
     monkeypatch.setenv(LOADER_CACHE_ENV, "1")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     frame = _cache_frame()
     kwargs = {
         "source": "yfinance",
@@ -463,6 +469,7 @@ def test_yfinance_loader_serves_second_fetch_from_cache(tmp_path, monkeypatch, f
     """A batch loader (yfinance) must skip its bulk download on a full cache hit."""
     monkeypatch.setenv(LOADER_CACHE_ENV, "1")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     import backtest.loaders.yfinance_loader as yfl
 
     calls = {"n": 0}
