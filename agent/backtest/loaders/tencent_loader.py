@@ -52,6 +52,7 @@ class DataLoader:
         interval: str = "1D",
         fields: Optional[List[str]] = None,
         adjustment: str = "qfq",
+        request_timeout_s: float | None = None,
     ) -> Dict[str, pd.DataFrame]:
         validate_date_range(start_date, end_date)
         if interval not in {"1D", "1m", "5m"}:
@@ -71,7 +72,9 @@ class DataLoader:
                     start_date=start_date,
                     end_date=end_date,
                     fields=[f"adjustment:{adjustment}"],
-                    fetch=lambda code=code: self._fetch_one(code, start_date, end_date, adjustment, interval),
+                    fetch=lambda code=code: self._fetch_one(
+                        code, start_date, end_date, adjustment, interval, request_timeout_s
+                    ),
                 )
                 if df is not None and not df.empty:
                     result[code] = df
@@ -81,6 +84,7 @@ class DataLoader:
 
     def _fetch_one(
         self, code: str, start_date: str, end_date: str, adjustment: str = "qfq", interval: str = "1D",
+        request_timeout_s: float | None = None,
     ) -> Optional[pd.DataFrame]:
         if not _is_a_share(code):
             return None
@@ -97,7 +101,7 @@ class DataLoader:
             return None
 
         if interval in {"1m", "5m"}:
-            return self._fetch_intraday(tencent_code, start_date, end_date, interval)
+            return self._fetch_intraday(tencent_code, start_date, end_date, interval, request_timeout_s)
 
         adjustment_token = "qfq" if adjustment == "qfq" else ""
         url = f"{_BASE_URL}?param={tencent_code},day,{start_date},{end_date},1000,{adjustment_token}"
@@ -107,7 +111,7 @@ class DataLoader:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Referer": "https://web.ifzq.gtimg.cn/",
         })
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=_request_timeout(request_timeout_s)) as resp:
             raw = resp.read().decode("utf-8")
 
         data = json.loads(raw)
@@ -153,6 +157,7 @@ class DataLoader:
     @staticmethod
     def _fetch_intraday(
         tencent_code: str, start_date: str, end_date: str, interval: str,
+        request_timeout_s: float | None = None,
     ) -> Optional[pd.DataFrame]:
         import urllib.parse
         import urllib.request
@@ -162,7 +167,7 @@ class DataLoader:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Referer": "https://gu.qq.com/",
         })
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(request, timeout=_request_timeout(request_timeout_s)) as response:
             payload = json.loads(response.read().decode("utf-8"))
 
         instrument = (payload.get("data") or {}).get(tencent_code) or {}
@@ -215,3 +220,8 @@ class DataLoader:
         })
         output.index.name = "trade_date"
         return output
+
+
+def _request_timeout(request_timeout_s: float | None) -> float:
+    """Clamp a caller-provided live-refresh budget to a safe socket timeout."""
+    return max(1.0, min(float(request_timeout_s or 15.0), 15.0))

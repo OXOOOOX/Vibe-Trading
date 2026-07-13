@@ -85,31 +85,161 @@ def test_update_portfolio_holdings_rejects_unparseable_text_without_overwrite(tm
     assert [row["symbol"] for row in review["portfolio_state"]["holdings"]] == ["588870.SH", "159842.SZ"]
 
 
-def test_record_portfolio_trade_prepends_recent_trade(tmp_path, monkeypatch) -> None:
+def test_record_portfolio_trade_updates_holdings_and_prepends_recent_trade(tmp_path, monkeypatch) -> None:
     client = _client(tmp_path, monkeypatch)
+    seeded = client.post(
+        "/portfolio/holdings",
+        json={"raw_text": "科创50指 588870 2100 1.975\n券商ETF 159842 1300 0.750"},
+    )
+    assert seeded.status_code == 200
 
     first = client.post(
         "/portfolio/trades",
-        json={"code": "588870", "side": "buy", "quantity": 1000, "price": 2.1, "trade_date": "2026-07-01"},
+        json={"code": "588870", "symbol": "588870.SH", "name": "科创50指", "side": "buy", "quantity": 1000, "price": 2.1, "trade_date": "2026-07-01"},
     )
     second = client.post(
         "/portfolio/trades",
-        json={"symbol": "159842", "side": "sell", "quantity": 500, "price": 1.1, "trade_date": "2026-07-02"},
+        json={"code": "159842", "symbol": "159842.SZ", "name": "券商ETF", "side": "sell", "quantity": 500, "price": 1.1, "trade_date": "2026-07-02"},
     )
 
     assert first.status_code == 200
     assert second.status_code == 200
-    trades = second.json()["portfolio_state"]["recent_trades"]
+    state = second.json()["portfolio_state"]
+    trades = state["recent_trades"]
     assert trades[0]["symbol"] == "159842.SZ"
     assert trades[1]["symbol"] == "588870.SH"
+    assert trades[0]["applied_to_holdings"] is True
+    assert state["holdings"][0]["quantity"] == 3100
+    assert round(state["holdings"][0]["cost_price"], 6) == round((2100 * 1.975 + 1000 * 2.1) / 3100, 6)
+    assert state["holdings"][1]["quantity"] == 800
+    assert state["holdings"][1]["cost_price"] == 0.75
 
 
-def test_record_portfolio_trade_requires_symbol_or_code(tmp_path, monkeypatch) -> None:
+def test_record_portfolio_trade_creates_and_closes_holding(tmp_path, monkeypatch) -> None:
     client = _client(tmp_path, monkeypatch)
 
-    response = client.post("/portfolio/trades", json={"side": "buy", "quantity": 100})
+    bought = client.post(
+        "/portfolio/trades",
+        json={"code": "513120", "symbol": "513120.SH", "name": "HK创新药", "side": "buy", "quantity": 2000, "price": 1.178},
+    )
+    assert bought.status_code == 200
+    holding = bought.json()["portfolio_state"]["holdings"][0]
+    assert holding["symbol"] == "513120.SH"
+    assert holding["quantity"] == 2000
+    assert holding["cost_price"] == 1.178
+
+    sold = client.post(
+        "/portfolio/trades",
+        json={"code": "513120", "symbol": "513120.SH", "name": "HK创新药", "side": "sell", "quantity": 2000, "price": 1.2},
+    )
+    assert sold.status_code == 200
+    assert sold.json()["portfolio_state"]["holdings"] == []
+
+
+def test_record_portfolio_trade_rejects_oversell_without_recording_trade(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    assert client.post("/portfolio/holdings", json={"raw_text": "科创50指 588870 100 1.975"}).status_code == 200
+
+    response = client.post(
+        "/portfolio/trades",
+        json={"code": "588870", "symbol": "588870.SH", "name": "科创50指", "side": "sell", "quantity": 101, "price": 2.1},
+    )
 
     assert response.status_code == 400
+    state = client.get("/portfolio/review").json()["portfolio_state"]
+    assert state["holdings"][0]["quantity"] == 100
+    assert state["recent_trades"] == []
+
+
+def test_record_portfolio_trade_requires_complete_resolved_security(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+
+    response = client.post(
+        "/portfolio/trades",
+        json={"code": "588", "side": "buy", "quantity": 100, "price": 2.1},
+    )
+
+    assert response.status_code == 422
+
+
+def test_lookup_portfolio_security_returns_exact_network_match(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    from src.tools import symbol_search_tool
+
+    monkeypatch.setattr(
+        symbol_search_tool,
+        "lookup_exact_ashare",
+        lambda code: ({"symbol": "588870.SH", "name": "科创50ETF汇添富", "market": "cn", "source": "eastmoney"}, "ok"),
+    )
+
+    response = client.get("/portfolio/security-lookup?code=588870")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "code": "588870",
+        "symbol": "588870.SH",
+        "name": "科创50ETF汇添富",
+        "market": "cn",
+        "source": "eastmoney",
+    }
+
+
+def test_edit_portfolio_holding_updates_quantity_cost_and_derived_values(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    assert client.post("/portfolio/holdings", json={"raw_text": "科创50指 588870 100 1.975"}).status_code == 200
+
+    from src.portfolio.state import load_state, save_state
+
+    state = load_state()
+    state.holdings[0]["last_price"] = 2.1
+    save_state(state)
+    response = client.patch(
+        "/portfolio/holdings/588870.SH",
+        json={"quantity": 250, "cost_price": 2.0},
+    )
+
+    assert response.status_code == 200
+    holding = response.json()["portfolio_state"]["holdings"][0]
+    assert holding["quantity"] == 250
+    assert holding["cost_price"] == 2.0
+    assert holding["market_value"] == 525.0
+    assert round(holding["pnl"], 2) == 25.0
+
+
+def test_delete_portfolio_trade_does_not_reverse_holding_change(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    assert client.post("/portfolio/holdings", json={"raw_text": "科创50指 588870 100 1.975"}).status_code == 200
+    recorded = client.post(
+        "/portfolio/trades",
+        json={"code": "588870", "symbol": "588870.SH", "name": "科创50指", "side": "buy", "quantity": 50, "price": 2.1},
+    )
+    trade_id = recorded.json()["portfolio_state"]["recent_trades"][0]["trade_id"]
+    assert recorded.json()["portfolio_state"]["holdings"][0]["quantity"] == 150
+
+    deleted = client.delete(f"/portfolio/trades/{trade_id}")
+
+    assert deleted.status_code == 200
+    state = deleted.json()["portfolio_state"]
+    assert state["recent_trades"] == []
+    assert state["holdings"][0]["quantity"] == 150
+
+
+def test_delete_legacy_trade_without_stored_id(tmp_path, monkeypatch) -> None:
+    state_path = tmp_path / "portfolio_state.json"
+    state_path.write_text(json.dumps({
+        "holdings": [{"code": "588870", "symbol": "588870.SH", "name": "科创50指", "quantity": 150, "cost_price": 2.0}],
+        "recent_trades": [{"code": "588870", "symbol": "588870.SH", "name": "科创50指", "side": "buy", "quantity": 50, "price": 2.1, "recorded_at": "2026-07-12T13:00:00Z"}],
+        "cash": None,
+        "cash_currency": "CNY",
+    }, ensure_ascii=False), encoding="utf-8")
+    client = _client(tmp_path, monkeypatch)
+    trade_id = client.get("/portfolio/review").json()["portfolio_state"]["recent_trades"][0]["trade_id"]
+
+    deleted = client.delete(f"/portfolio/trades/{trade_id}")
+
+    assert deleted.status_code == 200
+    assert deleted.json()["portfolio_state"]["recent_trades"] == []
+    assert deleted.json()["portfolio_state"]["holdings"][0]["quantity"] == 150
 
 
 def test_refresh_portfolio_market_data_updates_holdings_and_cache(tmp_path, monkeypatch) -> None:

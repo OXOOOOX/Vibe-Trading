@@ -135,6 +135,13 @@ describe("Portfolio market cache", () => {
     localStorage.clear();
     vi.restoreAllMocks();
     vi.spyOn(api, "getPortfolioReview").mockResolvedValue(review);
+    vi.spyOn(api, "lookupPortfolioSecurity").mockResolvedValue({
+      code: "588870",
+      symbol: "588870.SH",
+      name: "科创50ETF汇添富",
+      market: "cn",
+      source: "eastmoney",
+    });
   });
 
   it("renders layered cache metadata and source details in Chinese", async () => {
@@ -149,6 +156,118 @@ describe("Portfolio market cache", () => {
     expect(screen.getByText("实际来源")).toBeInTheDocument();
     expect(screen.getAllByText("eastmoney").length).toBeGreaterThan(0);
     expect(screen.getByText("10,000 share")).toBeInTheDocument();
+  });
+
+  it("updates the holdings matrix with the trade response", async () => {
+    const updatedReview: PortfolioReview = {
+      ...review,
+      portfolio_state: {
+        ...review.portfolio_state,
+        holdings: [{ ...review.portfolio_state.holdings[0], quantity: 2200, cost_price: 1.9806818181818182 }],
+        recent_trades: [{
+          trade_id: "trade-1",
+          code: "588870",
+          symbol: "588870.SH",
+          name: "科创50ETF汇添富",
+          side: "buy",
+          quantity: 100,
+          price: 2.1,
+          applied_to_holdings: true,
+          recorded_at: "2026-07-12T13:00:00Z",
+        }],
+      },
+    };
+    vi.spyOn(api, "recordPortfolioTrade").mockResolvedValue(updatedReview);
+    const user = userEvent.setup();
+    render(<Portfolio />, { wrapper: MemoryRouter });
+
+    await user.type(await screen.findByLabelText("6位证券代码"), "588870");
+    await waitFor(() => expect(screen.getByLabelText("自动补全的证券名称")).toHaveValue("科创50ETF汇添富"));
+    expect(screen.getByLabelText("自动补全的证券标识")).toHaveValue("588870.SH");
+    await user.type(screen.getByPlaceholderText("数量"), "100");
+    await user.type(screen.getByPlaceholderText("价格"), "2.1");
+    await user.click(screen.getByRole("button", { name: "保存交易" }));
+
+    expect(api.recordPortfolioTrade).toHaveBeenCalledWith(expect.objectContaining({
+      code: "588870",
+      symbol: "588870.SH",
+      name: "科创50ETF汇添富",
+      side: "buy",
+      quantity: 100,
+      price: 2.1,
+    }));
+    expect(api.lookupPortfolioSecurity).toHaveBeenCalledWith("588870", expect.any(AbortSignal));
+    await waitFor(() => {
+      const holdingRow = within(screen.getByRole("table", { name: "持仓矩阵" })).getByText("科创50指").closest("tr");
+      expect(holdingRow).not.toBeNull();
+      expect(within(holdingRow as HTMLTableRowElement).getByText("2,200")).toBeInTheDocument();
+    });
+    expect(within(screen.getByRole("table", { name: "最近交易记录" })).getByText("买入")).toBeInTheDocument();
+  });
+
+  it("edits current holding quantity and cost inline", async () => {
+    const updatedReview: PortfolioReview = {
+      ...review,
+      portfolio_state: {
+        ...review.portfolio_state,
+        holdings: [{ ...review.portfolio_state.holdings[0], quantity: 3000, cost_price: 2.05 }],
+      },
+    };
+    vi.spyOn(api, "editPortfolioHolding").mockResolvedValue(updatedReview);
+    const user = userEvent.setup();
+    render(<Portfolio />, { wrapper: MemoryRouter });
+
+    await user.click(await screen.findByRole("button", { name: "编辑 588870.SH 持仓" }));
+    const quantityInput = screen.getByLabelText("588870.SH 当前持有股数");
+    const costInput = screen.getByLabelText("588870.SH 当前成本价");
+    await user.clear(quantityInput);
+    await user.type(quantityInput, "3000");
+    await user.clear(costInput);
+    await user.type(costInput, "2.05");
+    await user.click(screen.getByRole("button", { name: "保存 588870.SH 持仓修改" }));
+
+    expect(api.editPortfolioHolding).toHaveBeenCalledWith("588870.SH", { quantity: 3000, cost_price: 2.05 });
+    await waitFor(() => expect(screen.queryByLabelText("588870.SH 当前持有股数")).not.toBeInTheDocument());
+    const holdingRow = within(screen.getByRole("table", { name: "持仓矩阵" })).getByText("科创50指").closest("tr");
+    expect(within(holdingRow as HTMLTableRowElement).getByText("3,000")).toBeInTheDocument();
+    expect(within(holdingRow as HTMLTableRowElement).getByText("2.05")).toBeInTheDocument();
+  });
+
+  it("deletes one trade record without changing the holding returned by the API", async () => {
+    const tradeReview: PortfolioReview = {
+      ...review,
+      portfolio_state: {
+        ...review.portfolio_state,
+        holdings: [{ ...review.portfolio_state.holdings[0], quantity: 2200 }],
+        recent_trades: [{
+          trade_id: "trade-delete-1",
+          code: "588870",
+          symbol: "588870.SH",
+          name: "科创50ETF汇添富",
+          side: "buy",
+          quantity: 100,
+          price: 2.1,
+          trade_date: "2026-07-12",
+          recorded_at: "2026-07-12T13:00:00Z",
+        }],
+      },
+    };
+    vi.mocked(api.getPortfolioReview).mockResolvedValue(tradeReview);
+    vi.spyOn(api, "deletePortfolioTrade").mockResolvedValue({
+      ...tradeReview,
+      portfolio_state: { ...tradeReview.portfolio_state, recent_trades: [] },
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const user = userEvent.setup();
+    render(<Portfolio />, { wrapper: MemoryRouter });
+
+    await user.click(await screen.findByRole("button", { name: "删除交易 588870.SH 2026-07-12" }));
+
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("不会撤销它已经造成的持仓变化"));
+    expect(api.deletePortfolioTrade).toHaveBeenCalledWith("trade-delete-1");
+    await waitFor(() => expect(within(screen.getByRole("table", { name: "最近交易记录" })).getByText("暂无最近交易记录。")).toBeInTheDocument());
+    const holdingRow = within(screen.getByRole("table", { name: "持仓矩阵" })).getByText("科创50指").closest("tr");
+    expect(within(holdingRow as HTMLTableRowElement).getByText("2,200")).toBeInTheDocument();
   });
 
   it("uses red for gains and green for losses in the holdings matrix", async () => {

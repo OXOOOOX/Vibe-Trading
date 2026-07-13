@@ -429,6 +429,11 @@ class SessionService:
             else:
                 attempt.mark_failed(error=result.get("reason", "unknown"))
             attempt.run_dir = result.get("run_dir")
+            # AgentLoop already records an event stream on disk, but retain the
+            # compact ReAct trace on the Attempt as well so completed sessions
+            # remain diagnosable through the session API after SSE replay ages
+            # out.
+            attempt.react_trace = list(result.get("react_trace") or [])
 
             self.store.update_attempt(attempt)
             reply_metadata = {}

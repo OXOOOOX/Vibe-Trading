@@ -11,6 +11,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -229,16 +230,33 @@ class UpdatePortfolioHoldingsRequest(BaseModel):
 
 
 class RecordPortfolioTradeRequest(BaseModel):
-    """Persist one recent trade into structured portfolio state."""
+    """Persist one complete, resolved A-share trade into structured portfolio state."""
 
-    code: Optional[str] = Field(None, max_length=64)
-    symbol: Optional[str] = Field(None, max_length=64)
-    name: Optional[str] = Field(None, max_length=200)
-    side: str = Field(..., min_length=1, max_length=16)
-    quantity: Optional[float] = None
-    price: Optional[float] = None
+    code: str = Field(..., pattern=r"^\d{6}$")
+    symbol: str = Field(..., min_length=8, max_length=16)
+    name: str = Field(..., min_length=1, max_length=200)
+    side: Literal["buy", "sell"]
+    quantity: float = Field(..., gt=0)
+    price: float = Field(..., gt=0)
     trade_date: Optional[str] = Field(None, max_length=64)
     notes: Optional[str] = Field(None, max_length=1000)
+
+
+class EditPortfolioHoldingRequest(BaseModel):
+    """Manually correct current holding quantity and/or cost price."""
+
+    quantity: Optional[float] = Field(None, gt=0)
+    cost_price: Optional[float] = Field(None, gt=0)
+
+
+class PortfolioSecurityLookupResponse(BaseModel):
+    """One exact, network-resolved A-share security."""
+
+    code: str
+    symbol: str
+    name: str
+    market: str
+    source: str
 
 
 class PortfolioMarketRefreshRequest(BaseModel):
@@ -1987,6 +2005,31 @@ async def update_data_source_settings(payload: UpdateDataSourceSettingsRequest):
 
 
 @app.get(
+    "/portfolio/security-lookup",
+    response_model=PortfolioSecurityLookupResponse,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def lookup_portfolio_security(code: str = Query(..., pattern=r"^\d{6}$")):
+    """Resolve one complete six-digit A-share code through live symbol search."""
+    from src.portfolio.state import normalize_symbol
+    from src.tools.symbol_search_tool import lookup_exact_ashare
+
+    exact, source_status = await asyncio.to_thread(lookup_exact_ashare, code)
+    if source_status != "ok":
+        raise HTTPException(status_code=503, detail="证券联网查询暂不可用，请稍后重试。")
+    expected_symbol = normalize_symbol(code)
+    if exact is None:
+        raise HTTPException(status_code=404, detail=f"未找到证券代码 {code}，请检查后重试。")
+    return PortfolioSecurityLookupResponse(
+        code=code,
+        symbol=expected_symbol,
+        name=str(exact["name"]).strip(),
+        market=str(exact.get("market") or "cn"),
+        source=str(exact.get("source") or "symbol_search"),
+    )
+
+
+@app.get(
     "/portfolio/review",
     response_model=PortfolioReviewResponse,
     dependencies=[Depends(require_local_or_auth)],
@@ -2018,19 +2061,54 @@ async def update_portfolio_holdings(payload: UpdatePortfolioHoldingsRequest):
     return _build_portfolio_review(state)
 
 
+@app.patch(
+    "/portfolio/holdings/{symbol}",
+    response_model=PortfolioReviewResponse,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def edit_portfolio_holding(symbol: str, payload: EditPortfolioHoldingRequest):
+    """Correct current holding quantity or cost without changing trade history."""
+    from src.portfolio.state import edit_holding
+
+    if payload.quantity is None and payload.cost_price is None:
+        raise HTTPException(status_code=400, detail="quantity or cost_price is required")
+    try:
+        state = edit_holding(symbol=symbol, quantity=payload.quantity, cost_price=payload.cost_price)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _build_portfolio_review(state)
+
+
 @app.post(
     "/portfolio/trades",
     response_model=PortfolioReviewResponse,
     dependencies=[Depends(require_local_or_auth)],
 )
 async def record_portfolio_trade(payload: RecordPortfolioTradeRequest):
-    """Persist one recent trade, then return the refreshed review snapshot."""
+    """Persist one trade, apply it to holdings, then return the refreshed snapshot."""
     from src.portfolio.state import record_trade
 
     trade = payload.model_dump(exclude_none=True)
-    if not (trade.get("symbol") or trade.get("code")):
-        raise HTTPException(status_code=400, detail="symbol or code is required")
-    state = record_trade(trade=trade)
+    try:
+        state = record_trade(trade=trade)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _build_portfolio_review(state)
+
+
+@app.delete(
+    "/portfolio/trades/{trade_id}",
+    response_model=PortfolioReviewResponse,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def delete_portfolio_trade(trade_id: str):
+    """Delete one trade record without reverting its holding adjustment."""
+    from src.portfolio.state import delete_trade
+
+    try:
+        state = delete_trade(trade_id=trade_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return _build_portfolio_review(state)
 
 
@@ -4635,6 +4713,12 @@ def serve_main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else 2
+
+    # Some Windows registry configurations map .js to text/plain, which makes
+    # browsers reject Vite's ES modules. Pin the web-standard MIME types before
+    # Starlette's StaticFiles starts serving the production bundle.
+    mimetypes.add_type("application/javascript", ".js")
+    mimetypes.add_type("application/javascript", ".mjs")
 
     frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
     frontend_root = Path(__file__).resolve().parent.parent / "frontend"

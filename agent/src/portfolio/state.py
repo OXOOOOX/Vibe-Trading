@@ -7,10 +7,12 @@ holdings, cash, and recent trades.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import tempfile
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -172,9 +174,12 @@ class PortfolioState:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "PortfolioState":
+        recent_trades = [dict(item) for item in (payload.get("recent_trades") or [])]
+        for index, trade in enumerate(recent_trades):
+            trade.setdefault("trade_id", _legacy_trade_id(trade, index))
         return cls(
             holdings=list(payload.get("holdings") or []),
-            recent_trades=list(payload.get("recent_trades") or []),
+            recent_trades=recent_trades,
             cash=_number(payload.get("cash")),
             cash_currency=str(payload.get("cash_currency") or "CNY"),
             updated_at=payload.get("updated_at"),
@@ -188,6 +193,13 @@ class PortfolioState:
             "cash_currency": self.cash_currency,
             "updated_at": self.updated_at,
         }
+
+
+def _legacy_trade_id(trade: dict[str, Any], index: int) -> str:
+    """Return a stable id for trade rows created before ids were introduced."""
+    payload = {key: value for key, value in trade.items() if key != "trade_id"}
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return f"legacy-{index}-{hashlib.sha256(encoded).hexdigest()[:16]}"
 
 
 def load_state(path: Path | None = None) -> PortfolioState:
@@ -238,12 +250,187 @@ def update_holdings(
     return state
 
 
+def _recalculate_holding_totals(holding: dict[str, Any]) -> None:
+    """Keep derived holding values consistent after a quantity/cost change."""
+    quantity = _number(holding.get("quantity"))
+    cost_price = _number(holding.get("cost_price"))
+    last_price = _number(holding.get("last_price"))
+    if quantity is None or last_price is None:
+        holding["market_value"] = None
+        holding["pnl"] = None
+        holding["pnl_pct"] = None
+        return
+
+    holding["market_value"] = quantity * last_price
+    if cost_price is None:
+        holding["pnl"] = None
+        holding["pnl_pct"] = None
+        return
+
+    holding["pnl"] = quantity * (last_price - cost_price)
+    holding["pnl_pct"] = ((last_price - cost_price) / cost_price * 100.0) if cost_price else None
+
+
+def edit_holding(
+    *,
+    symbol: str,
+    quantity: float | None = None,
+    cost_price: float | None = None,
+    path: Path | None = None,
+) -> PortfolioState:
+    """Manually correct the current quantity and/or cost without creating a trade."""
+    normalized_symbol = normalize_symbol(symbol)
+    if not normalized_symbol:
+        raise ValueError("Holding requires a symbol.")
+    if quantity is None and cost_price is None:
+        raise ValueError("Provide quantity or cost price to update.")
+
+    next_quantity = _number(quantity) if quantity is not None else None
+    next_cost = _number(cost_price) if cost_price is not None else None
+    if next_quantity is not None and next_quantity <= 0:
+        raise ValueError("Holding quantity must be greater than zero.")
+    if next_cost is not None and next_cost <= 0:
+        raise ValueError("Holding cost price must be greater than zero.")
+
+    state = load_state(path)
+    holding = next(
+        (
+            item
+            for item in state.holdings
+            if normalize_symbol(str(item.get("symbol") or item.get("code") or "")) == normalized_symbol
+        ),
+        None,
+    )
+    if holding is None:
+        raise ValueError(f"Holding {normalized_symbol} was not found.")
+
+    if next_quantity is not None:
+        holding["quantity"] = next_quantity
+    if next_cost is not None:
+        holding["cost_price"] = next_cost
+    holding["updated_at"] = _now()
+    holding["manual_adjustment_at"] = holding["updated_at"]
+    _recalculate_holding_totals(holding)
+    save_state(state, path)
+    return state
+
+
+def delete_trade(*, trade_id: str, path: Path | None = None) -> PortfolioState:
+    """Delete one journal row without reversing its already-applied holding change."""
+    target = str(trade_id or "").strip()
+    if not target:
+        raise ValueError("Trade id is required.")
+
+    state = load_state(path)
+    index = next(
+        (index for index, trade in enumerate(state.recent_trades) if str(trade.get("trade_id") or "") == target),
+        None,
+    )
+    if index is None:
+        raise ValueError(f"Trade {target} was not found.")
+    state.recent_trades.pop(index)
+    save_state(state, path)
+    return state
+
+
 def record_trade(*, trade: dict[str, Any], path: Path | None = None) -> PortfolioState:
     state = load_state(path)
     entry = dict(trade)
-    symbol = entry.get("symbol") or entry.get("code") or ""
-    entry["symbol"] = normalize_symbol(str(symbol))
+    code = str(entry.get("code") or "").strip()
+    name = str(entry.get("name") or "").strip()
+    symbol = str(entry.get("symbol") or "").strip()
+    if not re.fullmatch(r"\d{6}", code):
+        raise ValueError("Trade requires a complete 6-digit security code.")
+    if not name:
+        raise ValueError("Trade requires a security name.")
+    if not symbol:
+        raise ValueError("Trade requires a complete security symbol.")
+    normalized_symbol = normalize_symbol(str(symbol))
+    if normalized_symbol != normalize_symbol(code):
+        raise ValueError("Trade symbol does not match the 6-digit security code.")
+
+    side_aliases = {"buy": "buy", "买": "buy", "买入": "buy", "sell": "sell", "卖": "sell", "卖出": "sell"}
+    side = side_aliases.get(str(entry.get("side") or "").strip().lower())
+    if side is None:
+        raise ValueError("Trade side must be buy or sell.")
+
+    quantity = _number(entry.get("quantity"))
+    price = _number(entry.get("price"))
+    if quantity is None or quantity <= 0:
+        raise ValueError("Trade quantity must be greater than zero.")
+    if price is None or price <= 0:
+        raise ValueError("Trade price must be greater than zero.")
+
+    entry["trade_id"] = str(entry.get("trade_id") or uuid.uuid4().hex)
+    entry["code"] = code
+    entry["name"] = name
+    entry["symbol"] = normalized_symbol
+    entry["side"] = side
+    entry["quantity"] = quantity
+    entry["price"] = price
     entry.setdefault("recorded_at", _now())
+
+    holding_index = next(
+        (
+            index
+            for index, holding in enumerate(state.holdings)
+            if normalize_symbol(str(holding.get("symbol") or holding.get("code") or "")) == normalized_symbol
+        ),
+        None,
+    )
+
+    if side == "buy":
+        if holding_index is None:
+            holding = {
+                "name": entry.get("name") or normalized_symbol,
+                "code": str(entry.get("code") or normalized_symbol).split(".")[0],
+                "symbol": normalized_symbol,
+                "quantity": quantity,
+                "cost_price": price,
+                "last_price": None,
+                "market_value": None,
+                "pnl": None,
+                "pnl_pct": None,
+                "market_status": "unresolved",
+                "source": "recorded_trade",
+                "updated_at": _now(),
+            }
+            state.holdings.append(holding)
+        else:
+            holding = state.holdings[holding_index]
+            current_quantity = _number(holding.get("quantity")) or 0.0
+            current_cost = _number(holding.get("cost_price"))
+            next_quantity = current_quantity + quantity
+            holding["quantity"] = next_quantity
+            holding["cost_price"] = (
+                ((current_quantity * current_cost) + (quantity * price)) / next_quantity
+                if current_cost is not None and current_quantity > 0
+                else price
+            )
+            if entry.get("name") and not holding.get("name"):
+                holding["name"] = entry["name"]
+            holding["updated_at"] = _now()
+            holding["last_trade_at"] = entry["recorded_at"]
+            _recalculate_holding_totals(holding)
+    else:
+        if holding_index is None:
+            raise ValueError(f"Cannot sell {normalized_symbol}: it is not in current holdings.")
+        holding = state.holdings[holding_index]
+        current_quantity = _number(holding.get("quantity")) or 0.0
+        if quantity > current_quantity:
+            raise ValueError(
+                f"Cannot sell {quantity:g} of {normalized_symbol}: current holding is {current_quantity:g}."
+            )
+        next_quantity = current_quantity - quantity
+        if next_quantity <= 1e-12:
+            state.holdings.pop(holding_index)
+        else:
+            holding["quantity"] = next_quantity
+            holding["updated_at"] = _now()
+            holding["last_trade_at"] = entry["recorded_at"]
+            _recalculate_holding_totals(holding)
+
+    entry["applied_to_holdings"] = True
     state.recent_trades.insert(0, entry)
     state.recent_trades = state.recent_trades[:200]
     save_state(state, path)

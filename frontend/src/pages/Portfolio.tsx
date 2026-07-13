@@ -7,14 +7,18 @@ import {
   Bot,
   BriefcaseBusiness,
   ChartCandlestick,
+  Check,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
   ChevronsUpDown,
   Database,
   Loader2,
+  Pencil,
   RefreshCw,
   Save,
+  Trash2,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -24,6 +28,7 @@ import {
   type MarketCacheRun,
   type PortfolioHolding,
   type PortfolioReview,
+  type PortfolioTrade,
   type VerifiedMarketCacheRow,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -98,13 +103,19 @@ function createEmptyTradeForm() {
     code: "",
     symbol: "",
     name: "",
-    side: "buy",
+    side: "buy" as "buy" | "sell",
     quantity: "",
     price: "",
     trade_date: todayDateString(),
     notes: "",
   };
 }
+
+type TradeLookupState = {
+  status: "idle" | "loading" | "resolved" | "error";
+  code?: string;
+  message?: string;
+};
 
 function fmtNumber(value: unknown, digits = 3): string {
   if (typeof value !== "number" || !Number.isFinite(value)) return "-";
@@ -251,7 +262,9 @@ export function Portfolio() {
   const [savingHoldings, setSavingHoldings] = useState(false);
   const [tradeForm, setTradeForm] = useState(createEmptyTradeForm);
   const [savingTrade, setSavingTrade] = useState(false);
+  const [tradeLookup, setTradeLookup] = useState<TradeLookupState>({ status: "idle" });
   const [tradeSuggestionsOpen, setTradeSuggestionsOpen] = useState(false);
+  const [deletingTradeId, setDeletingTradeId] = useState<string | null>(null);
   const [expandedCachePath, setExpandedCachePath] = useState<string | null>(null);
   const [chartCacheGroup, setChartCacheGroup] = useState<CacheGroup | null>(null);
   const [analysisRuns, setAnalysisRuns] = useState<Record<string, PortfolioAnalysisSession>>(loadSavedAnalysisRuns);
@@ -280,6 +293,47 @@ export function Portfolio() {
   useEffect(() => {
     void loadReview("initial");
   }, [loadReview]);
+
+  useEffect(() => {
+    const code = tradeForm.code.trim();
+    if (!/^\d{6}$/.test(code)) {
+      setTradeLookup({ status: "idle" });
+      setTradeForm((current) => (
+        current.symbol || current.name ? { ...current, symbol: "", name: "" } : current
+      ));
+      return;
+    }
+
+    const controller = new AbortController();
+    let cancelled = false;
+    setTradeLookup({ status: "loading", code });
+    void api.lookupPortfolioSecurity(code, controller.signal)
+      .then((security) => {
+        if (cancelled) return;
+        setTradeForm((current) => (
+          current.code.trim() === code
+            ? { ...current, code: security.code, symbol: security.symbol, name: security.name }
+            : current
+        ));
+        setTradeSuggestionsOpen(false);
+        setTradeLookup({ status: "resolved", code, message: `${security.name} · ${security.symbol}` });
+      })
+      .catch((error) => {
+        if (cancelled || (error instanceof Error && error.name === "AbortError")) return;
+        setTradeForm((current) => (
+          current.code.trim() === code ? { ...current, symbol: "", name: "" } : current
+        ));
+        setTradeLookup({
+          status: "error",
+          code,
+          message: error instanceof Error ? error.message : "未找到该证券，请检查代码。",
+        });
+      });
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [tradeForm.code]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setAnalysisClock(Date.now()), 60_000);
@@ -507,32 +561,82 @@ export function Portfolio() {
 
   const saveTrade = async (event: FormEvent) => {
     event.preventDefault();
-    if (!tradeForm.code.trim() && !tradeForm.symbol.trim()) {
-      toast.error("请输入代码或证券标识。");
+    const code = tradeForm.code.trim();
+    if (!/^\d{6}$/.test(code)) {
+      toast.error("请输入完整的 6 位证券代码。");
+      return;
+    }
+    if (tradeLookup.status === "loading") {
+      toast.error("证券信息正在补全，请稍候。");
+      return;
+    }
+    if (!tradeForm.symbol.trim() || !tradeForm.name.trim()) {
+      toast.error("证券代码尚未成功匹配名称，不能提交。");
+      return;
+    }
+    const quantity = Number(tradeForm.quantity);
+    const price = Number(tradeForm.price);
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      toast.error("请输入大于 0 的交易数量。");
+      return;
+    }
+    if (!Number.isFinite(price) || price <= 0) {
+      toast.error("请输入大于 0 的交易价格。");
       return;
     }
     setSavingTrade(true);
     try {
-      const holdings = review?.portfolio_state.holdings || [];
-      const exactHolding = findExactHolding(holdings, tradeForm.symbol.trim() || tradeForm.code.trim());
       const payload = await api.recordPortfolioTrade({
-        code: tradeForm.code.trim() || (exactHolding ? holdingCode(exactHolding) : undefined),
-        symbol: tradeForm.symbol.trim() || (exactHolding ? holdingSymbol(exactHolding) : undefined),
-        name: tradeForm.name.trim() || (exactHolding?.name ? String(exactHolding.name) : undefined),
+        code,
+        symbol: tradeForm.symbol.trim(),
+        name: tradeForm.name.trim(),
         side: tradeForm.side,
-        quantity: tradeForm.quantity.trim() ? Number(tradeForm.quantity) : undefined,
-        price: tradeForm.price.trim() ? Number(tradeForm.price) : undefined,
+        quantity,
+        price,
         trade_date: tradeForm.trade_date.trim() || undefined,
         notes: tradeForm.notes.trim() || undefined,
       });
       setReview(payload);
       setTradeForm(createEmptyTradeForm());
+      setTradeLookup({ status: "idle" });
       setTradeSuggestionsOpen(false);
-      toast.success("交易已记录。");
+      toast.success("交易已记录，持仓已同步。");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "记录交易失败");
     } finally {
       setSavingTrade(false);
+    }
+  };
+
+  const updateHolding = async (symbol: string, quantity: number, costPrice: number) => {
+    try {
+      const payload = await api.editPortfolioHolding(symbol, { quantity, cost_price: costPrice });
+      setReview(payload);
+      toast.success(`${symbol} 的持有股数和成本已更新。`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "更新持仓失败");
+      throw error;
+    }
+  };
+
+  const removeTrade = async (trade: PortfolioTrade) => {
+    const tradeId = String(trade.trade_id || "");
+    if (!tradeId) {
+      toast.error("该交易记录缺少标识，无法删除。");
+      return;
+    }
+    const symbol = String(trade.symbol || trade.code || "该证券");
+    if (!window.confirm(`确认删除 ${symbol} 的这条交易记录？\n\n只删除记录，不会撤销它已经造成的持仓变化。`)) return;
+
+    setDeletingTradeId(tradeId);
+    try {
+      const payload = await api.deletePortfolioTrade(tradeId);
+      setReview(payload);
+      toast.success("交易记录已删除，持仓未回滚。");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "删除交易记录失败");
+    } finally {
+      setDeletingTradeId(null);
     }
   };
 
@@ -659,18 +763,27 @@ export function Portfolio() {
                   <div className="grid grid-cols-2 gap-2">
                     <div className={`relative ${tradeSuggestionsOpen && tradeSuggestions.length > 0 ? "z-30" : ""}`}>
                       <input
-                        className="relative z-30 w-full rounded-md border bg-background px-3 py-2 text-sm"
+                        className="relative z-30 w-full rounded-md border bg-background px-3 py-2 pr-9 text-sm"
                         placeholder="代码，如 588870 或 588"
+                        aria-label="6位证券代码"
+                        inputMode="numeric"
+                        maxLength={6}
                         value={tradeForm.code}
                         onFocus={() => setTradeSuggestionsOpen(true)}
                         onChange={(e) => {
-                          setTradeForm((s) => ({ ...s, code: e.target.value }));
+                          const code = e.target.value.replace(/\D/g, "").slice(0, 6);
+                          setTradeForm((s) => ({ ...s, code, symbol: "", name: "" }));
                           setTradeSuggestionsOpen(true);
                         }}
                         onKeyDown={(e) => {
                           if (e.key === "Escape") setTradeSuggestionsOpen(false);
                         }}
                       />
+                      {tradeLookup.status === "loading" ? (
+                        <Loader2 aria-label="正在联网补全证券信息" className="absolute right-3 top-2.5 z-40 h-4 w-4 animate-spin text-muted-foreground" />
+                      ) : tradeLookup.status === "resolved" ? (
+                        <Check aria-label="证券信息已补全" className="absolute right-3 top-2.5 z-40 h-4 w-4 text-emerald-500" />
+                      ) : null}
                       {tradeSuggestionsOpen && tradeSuggestions.length > 0 ? (
                         <>
                           <button
@@ -697,16 +810,27 @@ export function Portfolio() {
                         </>
                       ) : null}
                     </div>
-                    <input className="rounded-md border bg-background px-3 py-2 text-sm" placeholder="证券标识" value={tradeForm.symbol} onChange={(e) => setTradeForm((s) => ({ ...s, symbol: e.target.value }))} />
+                    <input className="rounded-md border bg-muted/30 px-3 py-2 text-sm" readOnly aria-label="自动补全的证券标识" placeholder="证券标识（自动补全）" value={tradeForm.symbol} />
                   </div>
-                  <input className="rounded-md border bg-background px-3 py-2 text-sm" placeholder="名称" value={tradeForm.name} onChange={(e) => setTradeForm((s) => ({ ...s, name: e.target.value }))} />
+                  <input className="rounded-md border bg-muted/30 px-3 py-2 text-sm" readOnly aria-label="自动补全的证券名称" placeholder="名称（自动补全）" value={tradeForm.name} />
+                  {tradeLookup.status !== "idle" ? (
+                    <p
+                      className={cn(
+                        "text-xs",
+                        tradeLookup.status === "error" ? "text-destructive" : "text-muted-foreground",
+                      )}
+                      aria-live="polite"
+                    >
+                      {tradeLookup.status === "loading" ? "正在联网识别证券…" : tradeLookup.message}
+                    </p>
+                  ) : null}
                   <div className="grid grid-cols-3 gap-2">
-                    <select className="rounded-md border bg-background px-3 py-2 text-sm" value={tradeForm.side} onChange={(e) => setTradeForm((s) => ({ ...s, side: e.target.value }))}>
+                    <select className="rounded-md border bg-background px-3 py-2 text-sm" value={tradeForm.side} onChange={(e) => setTradeForm((s) => ({ ...s, side: e.target.value as "buy" | "sell" }))}>
                       <option value="buy">买入</option>
                       <option value="sell">卖出</option>
                     </select>
-                    <input className="rounded-md border bg-background px-3 py-2 text-sm" inputMode="decimal" placeholder="数量" value={tradeForm.quantity} onChange={(e) => setTradeForm((s) => ({ ...s, quantity: e.target.value }))} />
-                    <input className="rounded-md border bg-background px-3 py-2 text-sm" inputMode="decimal" placeholder="价格" value={tradeForm.price} onChange={(e) => setTradeForm((s) => ({ ...s, price: e.target.value }))} />
+                    <input className="rounded-md border bg-background px-3 py-2 text-sm" type="number" min="0" step="any" required inputMode="decimal" placeholder="数量" value={tradeForm.quantity} onChange={(e) => setTradeForm((s) => ({ ...s, quantity: e.target.value }))} />
+                    <input className="rounded-md border bg-background px-3 py-2 text-sm" type="number" min="0" step="any" required inputMode="decimal" placeholder="价格" value={tradeForm.price} onChange={(e) => setTradeForm((s) => ({ ...s, price: e.target.value }))} />
                   </div>
                   <div className="grid grid-cols-[1fr_auto] gap-2">
                     <input
@@ -736,8 +860,8 @@ export function Portfolio() {
                     </div>
                   </div>
                   <textarea className="rounded-md border bg-background px-3 py-2 text-sm" rows={2} placeholder="备注" value={tradeForm.notes} onChange={(e) => setTradeForm((s) => ({ ...s, notes: e.target.value }))} />
-                  <button type="submit" disabled={savingTrade} className="inline-flex items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50">
-                    {savingTrade ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                  <button type="submit" disabled={savingTrade || tradeLookup.status === "loading"} className="inline-flex items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50">
+                    {savingTrade || tradeLookup.status === "loading" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
                     保存交易
                   </button>
                 </div>
@@ -750,8 +874,9 @@ export function Portfolio() {
               startingAnalysisKey={startingAnalysisKey}
               onStart={(holding) => void startAnalysis("holding", holding)}
               onOpen={openAnalysis}
+              onUpdate={updateHolding}
             />
-            <TradesTable review={review} />
+            <TradesTable review={review} deletingTradeId={deletingTradeId} onDelete={(trade) => void removeTrade(trade)} />
             <CacheTable
               review={review}
               expandedCachePath={expandedCachePath}
@@ -865,15 +990,21 @@ function HoldingsTable({
   startingAnalysisKey,
   onStart,
   onOpen,
+  onUpdate,
 }: {
   review: PortfolioReview | null;
   analysisRuns: Record<string, PortfolioAnalysisSession>;
   startingAnalysisKey: string | null;
   onStart: (holding: PortfolioHolding) => void;
   onOpen: (run: PortfolioAnalysisSession) => void;
+  onUpdate: (symbol: string, quantity: number, costPrice: number) => Promise<void>;
 }) {
   const holdings = review?.portfolio_state.holdings || [];
   const [sort, setSort] = useState<HoldingSort | null>(null);
+  const [editingSymbol, setEditingSymbol] = useState<string | null>(null);
+  const [draftQuantity, setDraftQuantity] = useState("");
+  const [draftCostPrice, setDraftCostPrice] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
   const sortedHoldings = useMemo(() => {
     if (!sort) return holdings;
     return holdings
@@ -887,6 +1018,39 @@ function HoldingsTable({
       if (!current || current.key !== key) return { key, direction: "asc" };
       return { key, direction: current.direction === "asc" ? "desc" : "asc" };
     });
+  };
+
+  const beginEdit = (holding: PortfolioHolding) => {
+    const symbol = holdingSymbol(holding);
+    if (!symbol) return;
+    setEditingSymbol(symbol);
+    setDraftQuantity(typeof holding.quantity === "number" ? String(holding.quantity) : "");
+    setDraftCostPrice(typeof holding.cost_price === "number" ? String(holding.cost_price) : "");
+  };
+
+  const cancelEdit = () => {
+    setEditingSymbol(null);
+    setDraftQuantity("");
+    setDraftCostPrice("");
+  };
+
+  const saveEdit = async () => {
+    if (!editingSymbol) return;
+    const quantity = Number(draftQuantity);
+    const costPrice = Number(draftCostPrice);
+    if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(costPrice) || costPrice <= 0) {
+      toast.error("持有股数和成本价都必须大于 0。");
+      return;
+    }
+    setSavingEdit(true);
+    try {
+      await onUpdate(editingSymbol, quantity, costPrice);
+      cancelEdit();
+    } catch {
+      // Parent displays the API error; keep the row open for correction.
+    } finally {
+      setSavingEdit(false);
+    }
   };
 
   return (
@@ -904,19 +1068,46 @@ function HoldingsTable({
                   onSort={toggleSort}
                 />
               ))}
-              <th scope="col" className="px-3 py-2 font-medium">Agent 分析</th>
+              <th scope="col" className="px-3 py-2 font-medium">Agent 分析 / 操作</th>
             </tr>
           </thead>
           <tbody>
             {holdings.length === 0 ? (
               <EmptyRow colSpan={11} text="暂无结构化持仓记录。" />
             ) : (
-              sortedHoldings.map((row, index) => (
-                <tr key={`${row.symbol || row.code || index}`} className="border-t">
+              sortedHoldings.map((row, index) => {
+                const symbol = holdingSymbol(row);
+                const isEditing = editingSymbol === symbol;
+                return (
+                <tr key={`${row.symbol || row.code || index}`} className={cn("border-t", isEditing && "bg-muted/20")}>
                   <td className="px-3 py-2 font-medium">{fmtText(row.name)}</td>
                   <td className="px-3 py-2 font-mono">{fmtText(row.symbol || row.code)}</td>
-                  <td className="px-3 py-2 text-right font-mono">{fmtNumber(row.quantity, 0)}</td>
-                  <td className="px-3 py-2 text-right font-mono">{fmtNumber(row.cost_price)}</td>
+                  <td className="px-3 py-2 text-right font-mono">
+                    {isEditing ? (
+                      <input
+                        aria-label={`${symbol} 当前持有股数`}
+                        className="w-24 rounded border bg-background px-2 py-1 text-right font-mono"
+                        type="number"
+                        min="0"
+                        step="any"
+                        value={draftQuantity}
+                        onChange={(event) => setDraftQuantity(event.target.value)}
+                      />
+                    ) : fmtNumber(row.quantity, 0)}
+                  </td>
+                  <td className="px-3 py-2 text-right font-mono">
+                    {isEditing ? (
+                      <input
+                        aria-label={`${symbol} 当前成本价`}
+                        className="w-24 rounded border bg-background px-2 py-1 text-right font-mono"
+                        type="number"
+                        min="0"
+                        step="any"
+                        value={draftCostPrice}
+                        onChange={(event) => setDraftCostPrice(event.target.value)}
+                      />
+                    ) : fmtNumber(row.cost_price)}
+                  </td>
                   <td className="px-3 py-2 text-right font-mono">{fmtNumber(row.last_price)}</td>
                   <td className="px-3 py-2 text-right font-mono">{fmtNumber(row.market_value, 2)}</td>
                   <td
@@ -934,16 +1125,50 @@ function HoldingsTable({
                   <td className="px-3 py-2"><StatusPill status={String(row.market_status || "unresolved")} /></td>
                   <td className="px-3 py-2 font-mono">{fmtDate(row.market_verified_at)}</td>
                   <td className="px-3 py-2">
+                    <div className="flex items-center gap-1.5">
                     <PortfolioAnalysisButton
-                      run={analysisRuns[analysisTargetKey("holding", holdingSymbol(row))]}
-                      starting={startingAnalysisKey === analysisTargetKey("holding", holdingSymbol(row))}
-                      ariaLabel={`分析 ${holdingSymbol(row) || fmtText(row.name)}`}
+                      run={analysisRuns[analysisTargetKey("holding", symbol)]}
+                      starting={startingAnalysisKey === analysisTargetKey("holding", symbol)}
+                      ariaLabel={`分析 ${symbol || fmtText(row.name)}`}
                       onStart={() => onStart(row)}
                       onOpen={onOpen}
                     />
+                    {isEditing ? (
+                      <>
+                        <button
+                          type="button"
+                          aria-label={`保存 ${symbol} 持仓修改`}
+                          disabled={savingEdit}
+                          onClick={() => void saveEdit()}
+                          className="inline-flex items-center rounded-md border px-2 py-1.5 text-emerald-600 hover:bg-muted disabled:opacity-50"
+                        >
+                          {savingEdit ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`取消 ${symbol} 持仓修改`}
+                          disabled={savingEdit}
+                          onClick={cancelEdit}
+                          className="inline-flex items-center rounded-md border px-2 py-1.5 text-muted-foreground hover:bg-muted disabled:opacity-50"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        aria-label={`编辑 ${symbol} 持仓`}
+                        onClick={() => beginEdit(row)}
+                        className="inline-flex items-center rounded-md border px-2 py-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                    </div>
                   </td>
                 </tr>
-              ))
+                );
+              })
             )}
           </tbody>
         </table>
@@ -1056,13 +1281,21 @@ function PortfolioAnalysisButton({
   );
 }
 
-function TradesTable({ review }: { review: PortfolioReview | null }) {
+function TradesTable({
+  review,
+  deletingTradeId,
+  onDelete,
+}: {
+  review: PortfolioReview | null;
+  deletingTradeId: string | null;
+  onDelete: (trade: PortfolioTrade) => void;
+}) {
   const trades = review?.portfolio_state.recent_trades || [];
   return (
     <section className="grid gap-2">
       <h2 className="text-sm font-semibold">最近交易记录</h2>
       <div className="overflow-auto rounded-md border">
-        <table className="w-full min-w-[760px] text-left text-xs">
+        <table aria-label="最近交易记录" className="w-full min-w-[760px] text-left text-xs">
           <thead className="bg-muted/50 text-[11px] uppercase text-muted-foreground">
             <tr>
               <th className="px-3 py-2 font-medium">证券标识</th>
@@ -1072,14 +1305,15 @@ function TradesTable({ review }: { review: PortfolioReview | null }) {
               <th className="px-3 py-2 font-medium">交易日期</th>
               <th className="px-3 py-2 font-medium">备注</th>
               <th className="px-3 py-2 font-medium">记录时间</th>
+              <th className="px-3 py-2 text-right font-medium">操作</th>
             </tr>
           </thead>
           <tbody>
             {trades.length === 0 ? (
-              <EmptyRow colSpan={7} text="暂无最近交易记录。" />
+              <EmptyRow colSpan={8} text="暂无最近交易记录。" />
             ) : (
               trades.map((row, index) => (
-                <tr key={`${row.symbol || row.code || index}`} className="border-t">
+                <tr key={`${row.recorded_at || row.trade_date || "trade"}-${row.symbol || row.code || index}-${index}`} className="border-t">
                   <td className="px-3 py-2 font-mono">{fmtText(row.symbol || row.code)}</td>
                   <td className="px-3 py-2">{tradeSideLabel(row.side)}</td>
                   <td className="px-3 py-2 text-right font-mono">{fmtNumber(row.quantity, 0)}</td>
@@ -1087,6 +1321,19 @@ function TradesTable({ review }: { review: PortfolioReview | null }) {
                   <td className="px-3 py-2 font-mono">{fmtText(row.trade_date)}</td>
                   <td className="px-3 py-2">{fmtText(row.notes)}</td>
                   <td className="px-3 py-2 font-mono">{fmtDate(row.recorded_at)}</td>
+                  <td className="px-3 py-2 text-right">
+                    <button
+                      type="button"
+                      aria-label={`删除交易 ${fmtText(row.symbol || row.code)} ${fmtText(row.trade_date)}`}
+                      disabled={!row.trade_id || deletingTradeId === row.trade_id}
+                      onClick={() => onDelete(row)}
+                      className="inline-flex items-center rounded-md border px-2 py-1.5 text-destructive hover:bg-destructive/10 disabled:opacity-50"
+                    >
+                      {deletingTradeId === row.trade_id
+                        ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        : <Trash2 className="h-3.5 w-3.5" />}
+                    </button>
+                  </td>
                 </tr>
               ))
             )}

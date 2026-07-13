@@ -42,7 +42,7 @@ class PortfolioStateTool(BaseTool):
             "cash_currency": {"type": "string", "default": "CNY"},
             "trade": {
                 "type": "object",
-                "description": "Recent trade object: symbol/code, side, quantity, price, trade_date, notes.",
+                "description": "Resolved A-share trade: 6-digit code, full symbol, name, side, quantity, price, trade_date, notes.",
             },
         },
         "required": ["action"],

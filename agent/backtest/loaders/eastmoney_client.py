@@ -25,7 +25,7 @@ import logging
 import re
 from typing import Any
 
-from backtest.loaders._http import resolve_min_interval, throttled_get_json
+from backtest.loaders._http import resolve_min_interval, throttled_get, throttled_get_json
 
 logger = logging.getLogger(__name__)
 
@@ -76,12 +76,13 @@ def _min_interval() -> float:
     return resolve_min_interval(_MIN_INTERVAL_ENV, _DEFAULT_MIN_INTERVAL)
 
 
-def get_json(url: str, *, params: dict[str, Any]) -> Any:
+def get_json(url: str, *, params: dict[str, Any], timeout: float = 15.0) -> Any:
     """Issue a throttled Eastmoney GET and decode the body as JSON.
 
     Args:
         url: Fully-qualified Eastmoney endpoint URL.
         params: Query parameters for the request.
+        timeout: Per-request socket timeout in seconds.
 
     Returns:
         The decoded JSON payload (typically a ``dict``).
@@ -97,7 +98,33 @@ def get_json(url: str, *, params: dict[str, Any]) -> Any:
         host_key=_HOST_KEY,
         min_interval=_min_interval(),
         params=params,
+        timeout=timeout,
     )
+
+
+def get_text(
+    url: str,
+    *,
+    params: dict[str, Any],
+    headers: dict[str, str] | None = None,
+    timeout: float = 15.0,
+) -> str:
+    """Issue a throttled Eastmoney GET and return the raw response body.
+
+    Some Eastmoney endpoints always return JSONP, which cannot pass through the
+    JSON-only helper above.  Keeping the transport here ensures those endpoints
+    still share the same session and per-host rate limit as kline requests.
+    """
+    response = throttled_get(
+        url,
+        host_key=_HOST_KEY,
+        min_interval=_min_interval(),
+        params=params,
+        headers=headers,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response.text
 
 
 def _resolve_a_share_secid(code: str, suffix: str) -> str | None:
@@ -271,6 +298,7 @@ def fetch_kline(
     fqt: int = 1,
     beg: str = "0",
     end: str = "20500101",
+    timeout: float = 15.0,
 ) -> list[dict]:
     """Fetch ascending OHLCV bars for one ``secid`` from push2his.
 
@@ -280,6 +308,7 @@ def fetch_kline(
         fqt: Adjustment mode (0 raw, 1 forward-adjusted, 2 back-adjusted).
         beg: Inclusive start date ``YYYYMMDD`` or ``"0"`` for earliest.
         end: Inclusive end date ``YYYYMMDD``.
+        timeout: Per-request socket timeout in seconds.
 
     Returns:
         Ascending list of ``{trade_date, open, high, low, close, volume,
@@ -303,6 +332,7 @@ def fetch_kline(
             "rev": "1",
             "lmt": "1000000",
         },
+        timeout=timeout,
     )
 
     data = payload.get("data") if isinstance(payload, dict) else None

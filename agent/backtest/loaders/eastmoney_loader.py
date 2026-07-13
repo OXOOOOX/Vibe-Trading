@@ -72,6 +72,7 @@ class DataLoader:
         interval: str = "1D",
         fields: Optional[List[str]] = None,
         adjustment: str = "qfq",
+        request_timeout_s: float | None = None,
     ) -> Dict[str, pd.DataFrame]:
         """Fetch OHLCV for each symbol; a single failure never aborts the batch.
 
@@ -107,7 +108,8 @@ class DataLoader:
                     end_date=end_date,
                     fields=[f"adjustment:{adjustment}", *(fields or [])],
                     fetch=lambda code=code: self._fetch_one(
-                        code, start_date, end_date, interval, adjustment, include_amount
+                        code, start_date, end_date, interval, adjustment, include_amount,
+                        request_timeout_s,
                     ),
                 )
                 if df is not None and not df.empty:
@@ -119,6 +121,7 @@ class DataLoader:
     def _fetch_one(
         self, code: str, start_date: str, end_date: str, interval: str,
         adjustment: str = "qfq", include_amount: bool = False,
+        request_timeout_s: float | None = None,
     ) -> Optional[pd.DataFrame]:
         """Resolve one symbol and build its OHLCV frame, or ``None`` on a miss.
 
@@ -141,6 +144,7 @@ class DataLoader:
         if not secid:
             return None
 
+        timeout_s = max(1.0, min(float(request_timeout_s or 20.0), 20.0))
         rows = retry_with_budget(
             lambda: eastmoney_client.fetch_kline(
                 secid,
@@ -148,9 +152,10 @@ class DataLoader:
                 fqt=0 if adjustment == "raw" else 1,
                 beg=_to_compact_date(start_date),
                 end=_to_compact_date(end_date),
+                timeout=timeout_s,
             ),
             transient=requests.RequestException,
-            deadline=time.monotonic() + 20.0,
+            deadline=time.monotonic() + timeout_s,
             label=f"eastmoney {interval} fetch for {code}",
             max_retries=2,
             backoff=(1.0, 2.0),

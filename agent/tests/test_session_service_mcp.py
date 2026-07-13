@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from src.session.events import EventBus
-from src.session.models import Attempt
+from src.session.models import Attempt, AttemptStatus
 from src.session.service import SessionService
 from src.session.store import SessionStore
 
@@ -70,3 +70,31 @@ def test_run_with_agent_keeps_event_loop_responsive_during_registry_build(
     assert result["status"] == "completed"
     assert tick_times, "Expected the event loop ticker to run while registry build was pending"
     assert tick_times[0] < 0.18, f"Registry build blocked the event loop for too long: {tick_times[0]:.3f}s"
+
+
+def test_completed_attempt_persists_react_trace(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("src.session.service.get_shared_index", lambda: _DummyIndex())
+    service = SessionService(
+        store=SessionStore(tmp_path / "sessions"),
+        event_bus=EventBus(),
+        runs_dir=tmp_path / "runs",
+    )
+    session = service.create_session("trace persistence")
+    attempt = Attempt(session_id=session.session_id, prompt="trace this")
+    service.store.create_attempt(attempt)
+
+    async def _fake_run_with_agent(*_args, **_kwargs):
+        return {
+            "status": "success",
+            "content": "done",
+            "run_dir": str(tmp_path / "runs" / "trace-run"),
+            "react_trace": [{"type": "tool_call", "tool": "get_data_context"}],
+        }
+
+    monkeypatch.setattr(service, "_run_with_agent", _fake_run_with_agent)
+    asyncio.run(service._run_attempt(session, attempt))
+
+    persisted = service.store.get_attempt(session.session_id, attempt.attempt_id)
+    assert persisted is not None
+    assert persisted.status == AttemptStatus.COMPLETED
+    assert persisted.react_trace == [{"type": "tool_call", "tool": "get_data_context"}]

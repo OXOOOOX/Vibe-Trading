@@ -9,6 +9,7 @@ import math
 import os
 import statistics
 import tempfile
+import time
 import uuid
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
@@ -94,6 +95,7 @@ def fetch_source_records(
     end_date: str,
     interval: str,
     adjustment: str,
+    request_timeout_s: float | None = None,
 ) -> dict[str, Any]:
     """Fetch one source while preserving the actual fallback loader identity."""
     loader_cls = get_loader(requested_source)
@@ -104,6 +106,8 @@ def fetch_source_records(
         kwargs["fields"] = ["amount"]
     if "adjustment" in inspect.signature(loader.fetch).parameters:
         kwargs["adjustment"] = adjustment
+    if request_timeout_s is not None and "request_timeout_s" in inspect.signature(loader.fetch).parameters:
+        kwargs["request_timeout_s"] = request_timeout_s
     data = loader.fetch([symbol], start_date, end_date, **kwargs)
     frame = data.get(symbol)
     if frame is None:
@@ -210,17 +214,36 @@ class MarketRefreshService:
         assert run is not None
         return run, False
 
-    def refresh_sync(self, **kwargs: Any) -> dict[str, Any]:
+    def refresh_sync(
+        self,
+        *,
+        deadline: float | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Run a refresh synchronously, with optional cooperative cancellation.
+
+        ``deadline`` limits this caller's refresh work without leaving a long
+        sequence of source requests running after an Agent-facing data request
+        has already returned.  In-flight socket calls still finish normally,
+        but no later symbol or source is started once the budget expires.
+        """
         run, deduplicated = self.create_refresh(**kwargs)
         if run["status"] in {"queued", "running"}:
-            self.run_refresh(run["run_id"])
+            self.run_refresh(run["run_id"], deadline=deadline, should_cancel=should_cancel)
         result = self.store.get_run(run["run_id"])
         assert result is not None
         result["deduplicated"] = deduplicated
         result["quotes"] = self.store.list_quotes(result["symbols"])
         return result
 
-    def run_refresh(self, run_id: str) -> dict[str, Any]:
+    def run_refresh(
+        self,
+        run_id: str,
+        *,
+        deadline: float | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         run = self.store.get_run(run_id)
         if not run:
             raise KeyError(run_id)
@@ -229,8 +252,12 @@ class MarketRefreshService:
         config = run["config"]
         self.store.update_run(run_id, status="running", started_at=utc_now(), error=None)
         completed = conflicts = failed = 0
+        interrupted = False
         try:
             for item in run["items"]:
+                if self._should_stop(deadline, should_cancel):
+                    interrupted = True
+                    break
                 symbol = item["symbol"]
                 interval = item["interval"]
                 adjustment = item["adjustment"]
@@ -245,7 +272,12 @@ class MarketRefreshService:
                         force=bool(config.get("force")),
                         explicit_start=config.get("start_date"),
                         explicit_end=config.get("end_date"),
+                        deadline=deadline,
+                        should_cancel=should_cancel,
                     )
+                    if result["status"] == "interrupted":
+                        interrupted = True
+                        break
                     if result["status"] == "conflict":
                         conflicts += 1
                     elif result["status"] == "unresolved":
@@ -264,17 +296,25 @@ class MarketRefreshService:
                     failed_items=failed,
                 )
 
-            for symbol in run["symbols"]:
+            completed_symbols = [
+                item["symbol"] for item in (self.store.get_run(run_id) or {}).get("items", [])
+                if item.get("status") in {"verified", "single_source", "conflict"}
+            ]
+            for symbol in set(completed_symbols):
                 self.store.refresh_latest_quote(symbol)
-            self._update_portfolio(run["symbols"])
-            self._write_compatibility_summaries(run["symbols"])
-            final_status = "completed" if failed == 0 else ("partial" if completed > failed else "failed")
+            if completed_symbols:
+                self._update_portfolio(list(set(completed_symbols)))
+                self._write_compatibility_summaries(list(set(completed_symbols)))
+            final_status = "interrupted" if interrupted else (
+                "completed" if failed == 0 else ("partial" if completed > failed else "failed")
+            )
             self.store.update_run(
                 run_id,
                 status=final_status,
                 completed_at=utc_now(),
                 current_symbol=None,
                 current_source=None,
+                error="refresh deadline reached" if interrupted else None,
             )
         except Exception as exc:  # noqa: BLE001
             self.store.update_run(run_id, status="failed", completed_at=utc_now(), error=str(exc))
@@ -282,6 +322,11 @@ class MarketRefreshService:
         result = self.store.get_run(run_id)
         assert result is not None
         return result
+
+    @staticmethod
+    def _should_stop(deadline: float | None, should_cancel: Callable[[], bool] | None) -> bool:
+        """Return whether a caller-specific refresh budget has expired."""
+        return bool((should_cancel and should_cancel()) or (deadline is not None and time.monotonic() >= deadline))
 
     def _date_window(
         self, interval: str, adjustment: str, explicit_start: str | None, explicit_end: str | None
@@ -305,6 +350,8 @@ class MarketRefreshService:
         force: bool,
         explicit_start: str | None,
         explicit_end: str | None,
+        deadline: float | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         requested_sources = sources or source_candidates(symbol, interval, adjustment)
         start_date, end_date, keep_sessions = self._date_window(
@@ -322,6 +369,13 @@ class MarketRefreshService:
         needs_third_source = False
 
         for index, requested_source in enumerate(requested_sources):
+            if self._should_stop(deadline, should_cancel):
+                message = "refresh deadline reached"
+                self.store.update_item(
+                    run_id, symbol, interval, adjustment,
+                    status="interrupted", message=message, completed_at=utc_now(),
+                )
+                return {"status": "interrupted", "rows_written": rows_written, "actual_sources": actual_sources}
             if index >= 2 and not needs_third_source:
                 break
             self.store.update_run(run_id, current_symbol=symbol, current_source=requested_source)
@@ -343,17 +397,28 @@ class MarketRefreshService:
                         fetch_start = tail_date
 
             try:
+                fetch_kwargs = {
+                    "requested_source": requested_source,
+                    "symbol": symbol,
+                    "start_date": fetch_start,
+                    "end_date": end_date,
+                    "interval": interval,
+                    "adjustment": adjustment,
+                }
+                if deadline is not None:
+                    fetch_kwargs["request_timeout_s"] = max(1.0, min(10.0, deadline - time.monotonic()))
                 probe = self.fetcher(
-                    requested_source=requested_source,
-                    symbol=symbol,
-                    start_date=fetch_start,
-                    end_date=end_date,
-                    interval=interval,
-                    adjustment=adjustment,
+                    **fetch_kwargs,
                 )
             except Exception as exc:  # noqa: BLE001
                 source_errors.append(f"{requested_source}: {exc}")
                 continue
+            if self._should_stop(deadline, should_cancel):
+                self.store.update_item(
+                    run_id, symbol, interval, adjustment,
+                    status="interrupted", message="refresh deadline reached", completed_at=utc_now(),
+                )
+                return {"status": "interrupted", "rows_written": rows_written, "actual_sources": actual_sources}
             actual_source = str(probe["actual_source"])
             actual_adjustment = str(probe["actual_adjustment"])
             if actual_adjustment != adjustment:
@@ -377,14 +442,23 @@ class MarketRefreshService:
                 needs_third_source = price_delta > tolerance
                 if needs_third_source and checkpoint:
                     try:
-                        full_probe = self.fetcher(
-                            requested_source=requested_source,
-                            symbol=symbol,
-                            start_date=start_date,
-                            end_date=end_date,
-                            interval=interval,
-                            adjustment=adjustment,
-                        )
+                        full_fetch_kwargs = {
+                            "requested_source": requested_source,
+                            "symbol": symbol,
+                            "start_date": start_date,
+                            "end_date": end_date,
+                            "interval": interval,
+                            "adjustment": adjustment,
+                        }
+                        if deadline is not None:
+                            full_fetch_kwargs["request_timeout_s"] = max(1.0, min(10.0, deadline - time.monotonic()))
+                        full_probe = self.fetcher(**full_fetch_kwargs)
+                        if self._should_stop(deadline, should_cancel):
+                            self.store.update_item(
+                                run_id, symbol, interval, adjustment,
+                                status="interrupted", message="refresh deadline reached", completed_at=utc_now(),
+                            )
+                            return {"status": "interrupted", "rows_written": rows_written, "actual_sources": actual_sources}
                         normalized = self._normalize_records(
                             full_probe, symbol=symbol, interval=interval, batch_id=run_id,
                             acquisition_mode="conflict_backfill",

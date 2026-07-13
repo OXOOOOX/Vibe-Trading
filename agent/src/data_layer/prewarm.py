@@ -14,7 +14,9 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 _SLOTS: tuple[tuple[str, time], ...] = (
     ("premarket", time(9, 10)),
     ("intraday", time(9, 35)),
-    ("intraday", time(11, 35)),
+    # Have a verified cache ready before the lunch-break analysis, not after it.
+    ("intraday", time(11, 25)),
+    ("intraday", time(13, 5)),
     ("intraday", time(15, 10)),
 )
 

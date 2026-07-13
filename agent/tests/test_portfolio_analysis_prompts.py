@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 from src.portfolio.analysis import (
     build_analysis_prompt,
     build_analysis_title,
+    build_custom_stock_prompt,
     resolve_market_analysis_phase,
 )
 
@@ -19,6 +20,9 @@ def test_market_analysis_is_premarket_before_1130_shanghai() -> None:
     assert "今天的盘前分析" in prompt
     assert "不得引用尚未发生的当日盘中行情" in prompt
     assert "2026-07-13 08:15 Asia/Shanghai" in prompt
+    assert "market.bars_handles[]" in prompt
+    assert "数据受限模式" in prompt
+    assert "不得再对其子集重复请求 context" in prompt
 
 
 def test_market_analysis_switches_to_intraday_at_1130_shanghai() -> None:
@@ -42,3 +46,20 @@ def test_market_analysis_returns_to_next_session_premarket_after_close_or_on_wee
     prompt = build_analysis_prompt("market", now=weekend)
     assert "下一交易日的盘前分析" in prompt
     assert "先核实交易日历" in prompt
+
+
+def test_condition_order_prompts_are_optional_and_trend_gated() -> None:
+    holding = {"name": "招商银行", "symbol": "600036.SH"}
+    prompts = [
+        build_analysis_prompt("holding", holding),
+        build_analysis_prompt("portfolio"),
+        build_analysis_prompt("market", market_phase="premarket"),
+        build_custom_stock_prompt("600036"),
+    ]
+
+    for prompt in prompts:
+        assert "条件单观察建议不是报告必填项" in prompt
+        assert "下降趋势只能讨论风险控制、减仓或退出观察" in prompt
+        assert "结构突破、量价确认" in prompt
+        assert "本次无条件单建议" in prompt
+        assert "不得为了填满表格而编造价位" in prompt

@@ -24,6 +24,15 @@ from rich.text import Text
 from src.channels.bus.events import OutboundMessage
 from src.channels.bus.queue import MessageBus
 from src.channels.base import BaseChannel
+from src.channels.research_sessions import (
+    BOT_MENU_NEW_CONVERSATION,
+    BOT_MENU_REFRESH_REPORT,
+    BOT_MENU_RESEARCH_HUB,
+    RESEARCH_CONTROL_NEW_CONVERSATION,
+    RESEARCH_CONTROL_REFRESH_REPORT,
+    build_research_session_route,
+    warm_market_calendar,
+)
 from src.channels.utils import get_media_dir, safe_filename
 # logging_bridge not needed (using stdlib logging)
 
@@ -76,6 +85,53 @@ MSG_TYPE_MAP = {
     "file": "[file]",
     "sticker": "[sticker]",
 }
+
+_NEW_RESEARCH_PATTERN = re.compile(r"^[\s\u3000]*(?:发起|开始|创建|做)?[\s\u3000]*新的?研究[\s\u3000！!。.]*(?:吧)?[\s\u3000]*$")
+_RESEARCH_FLOW = "new_research"
+_RESEARCH_ACTIONS = {"show_stock_picker", "premarket", "portfolio", "holding", "custom_stock"}
+_DIRECT_RESEARCH_ACTIONS = {
+    "盘前分析": "premarket",
+    "盘前研究": "premarket",
+    "全仓分析": "portfolio",
+    "组合分析": "portfolio",
+    "持仓分析": "portfolio",
+    "个股分析": "show_stock_picker",
+}
+_RESEARCH_CONTROL_TEXT = {
+    "新对话": RESEARCH_CONTROL_NEW_CONVERSATION,
+    "更新报告": RESEARCH_CONTROL_REFRESH_REPORT,
+}
+_PDF_REQUEST_VERBS = ("发送", "发给", "给我", "生成", "导出", "转成", "做成", "保存为")
+_PDF_PREVIOUS_REPORT_MARKERS = ("这份", "这个", "刚才", "刚刚", "上面", "前面", "当前")
+
+
+def _is_new_research_request(text: str) -> bool:
+    """Return whether *text* is the dedicated Feishu research-menu trigger."""
+    normalized = re.sub(r"[\s\u3000！!。.]+", "", str(text or ""))
+    return normalized == "分析菜单" or bool(_NEW_RESEARCH_PATTERN.fullmatch(str(text or "")))
+
+
+def _research_control_action(text: str) -> str | None:
+    normalized = re.sub(r"[\s\u3000！!。.]+", "", str(text or ""))
+    return _RESEARCH_CONTROL_TEXT.get(normalized)
+
+
+def _pdf_delivery_request(text: str) -> tuple[bool, bool]:
+    """Return ``(requested, use_previous_report)`` for explicit PDF asks."""
+    normalized = re.sub(r"\s+", "", str(text or "")).lower()
+    if "pdf" not in normalized or not any(verb in normalized for verb in _PDF_REQUEST_VERBS):
+        return False, False
+    use_previous = any(marker in normalized for marker in _PDF_PREVIOUS_REPORT_MARKERS)
+    return True, use_previous
+
+
+def _plain_text(content: str) -> dict[str, str]:
+    return {"tag": "plain_text", "content": content}
+
+
+def _direct_research_action(text: str) -> str | None:
+    normalized = re.sub(r"[\s\u3000！!。.]", "", str(text or ""))
+    return _DIRECT_RESEARCH_ACTIONS.get(normalized)
 
 
 def _extract_share_card_content(content_json: dict, msg_type: str) -> str:
@@ -601,6 +657,8 @@ class FeishuChannel(BaseChannel):
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
+        self._processed_card_action_ids: OrderedDict[str, None] = OrderedDict()
+        self._processed_bot_menu_event_ids: OrderedDict[str, None] = OrderedDict()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
         self._bot_open_id: str | None = None
@@ -691,6 +749,9 @@ class FeishuChannel(BaseChannel):
 
         self._running = True
         self._loop = asyncio.get_running_loop()
+        calendar_task = asyncio.create_task(asyncio.to_thread(warm_market_calendar))
+        self._background_tasks.add(calendar_task)
+        calendar_task.add_done_callback(self._on_background_task_done)
 
         # Create Lark client for sending messages
         domain = lark_domain if self.config.domain == "lark" else feishu_domain
@@ -706,6 +767,12 @@ class FeishuChannel(BaseChannel):
             self.config.encrypt_key or "",
             self.config.verification_token or "",
         ).register_p2_im_message_receive_v1(self._on_message_sync)
+        builder = self._register_optional_event(
+            builder, "register_p2_card_action_trigger", self._on_card_action_trigger
+        )
+        builder = self._register_optional_event(
+            builder, "register_p2_application_bot_menu_v6", self._on_bot_menu
+        )
         builder = self._register_optional_event(
             builder, "register_p2_im_message_reaction_created_v1", self._on_reaction_created
         )
@@ -921,6 +988,490 @@ class FeishuChannel(BaseChannel):
         if self.config.group_policy == "open":
             return True
         return self._is_bot_mentioned(message)
+
+    @staticmethod
+    def _research_route(
+        *,
+        reply_chat_id: str,
+        chat_type: str,
+        session_key: str | None,
+    ) -> dict[str, str]:
+        base_session_key = session_key or f"feishu:{reply_chat_id}"
+        return {
+            "reply_chat_id": reply_chat_id,
+            "chat_type": chat_type,
+            "base_session_key": base_session_key,
+        }
+
+    @staticmethod
+    def _research_callback(
+        action: str, route: dict[str, str], **extra: str
+    ) -> dict[str, str]:
+        return {"flow": _RESEARCH_FLOW, "action": action, **route, **extra}
+
+    @classmethod
+    def _research_button(
+        cls,
+        text: str,
+        action: str,
+        route: dict[str, str],
+        *,
+        button_type: str = "default",
+        element_id: str | None = None,
+        **extra: str,
+    ) -> dict[str, Any]:
+        button: dict[str, Any] = {
+            "tag": "button",
+            "text": _plain_text(text),
+            "type": button_type,
+            "width": "fill",
+            "behaviors": [
+                {
+                    "type": "callback",
+                    "value": cls._research_callback(action, route, **extra),
+                }
+            ],
+        }
+        if element_id:
+            button["element_id"] = element_id
+        return button
+
+    @classmethod
+    def _build_research_menu_card(
+        cls, *, reply_chat_id: str, chat_type: str, session_key: str | None
+    ) -> dict[str, Any]:
+        """Build the first-stage research chooser card."""
+        route = cls._research_route(
+            reply_chat_id=reply_chat_id,
+            chat_type=chat_type,
+            session_key=session_key,
+        )
+        choices = [
+            ("盘前分析", "premarket", "primary", "research_premarket"),
+            ("个股分析", "show_stock_picker", "default", "research_stock"),
+            ("持仓分析", "portfolio", "default", "research_portfolio"),
+        ]
+        columns = []
+        for label, action, button_type, element_id in choices:
+            button = cls._research_button(
+                label,
+                action,
+                route,
+                button_type=button_type,
+                element_id=element_id,
+            )
+            columns.append(
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [button],
+                }
+            )
+        return {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {
+                "template": "blue",
+                "title": _plain_text("分析菜单"),
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": "点击即可切换或恢复对应专题 Session：已有则续聊，没有则创建。完整研究会发回 PDF，后续可直接发送文字继续讨论。",
+                    },
+                    {
+                        "tag": "column_set",
+                        "flex_mode": "flow",
+                        "horizontal_spacing": "8px",
+                        "columns": columns,
+                    },
+                ]
+            },
+        }
+
+    @classmethod
+    def _build_stock_picker_card(
+        cls,
+        holdings: list[dict[str, Any]],
+        *,
+        reply_chat_id: str,
+        chat_type: str,
+        session_key: str | None,
+    ) -> dict[str, Any]:
+        """Build holding shortcuts plus a six-digit custom-code form."""
+        route = cls._research_route(
+            reply_chat_id=reply_chat_id,
+            chat_type=chat_type,
+            session_key=session_key,
+        )
+        elements: list[dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": "选择当前持仓，或在下方输入新的 6 位证券代码。",
+            }
+        ]
+
+        holding_buttons: list[dict[str, Any]] = []
+        for index, holding in enumerate(holdings[:20]):
+            symbol = str(holding.get("symbol") or holding.get("code") or "").strip().upper()
+            code_match = re.search(r"(?<!\d)(\d{6})(?!\d)", symbol)
+            if not code_match:
+                continue
+            code = code_match.group(1)
+            name = str(holding.get("name") or code).strip()
+            holding_buttons.append(
+                cls._research_button(
+                    f"{name} · {code}",
+                    "holding",
+                    route,
+                    element_id=f"holding_{index}",
+                    symbol=symbol,
+                )
+            )
+
+        for index in range(0, len(holding_buttons), 2):
+            pair = holding_buttons[index : index + 2]
+            elements.append(
+                {
+                    "tag": "column_set",
+                    "flex_mode": "flow",
+                    "horizontal_spacing": "8px",
+                    "columns": [
+                        {
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 1,
+                            "elements": [button],
+                        }
+                        for button in pair
+                    ],
+                }
+            )
+
+        if not holding_buttons:
+            elements.append(
+                {"tag": "markdown", "content": "当前还没有可选择的持仓，请直接输入代码。"}
+            )
+
+        elements.extend(
+            [
+                {"tag": "hr"},
+                {
+                    "tag": "form",
+                    "name": "research_code_form",
+                    "direction": "vertical",
+                    "vertical_spacing": "8px",
+                    "elements": [
+                        {
+                            "tag": "input",
+                            "name": "stock_code",
+                            "input_type": "text",
+                            "required": True,
+                            "placeholder": _plain_text("例如：600036"),
+                        },
+                        {
+                            **cls._research_button(
+                                "分析此代码",
+                                "custom_stock",
+                                route,
+                                button_type="primary",
+                                element_id="custom_stock_submit",
+                            ),
+                            "name": "custom_stock_submit",
+                            "form_action_type": "submit",
+                        },
+                    ],
+                },
+            ]
+        )
+        return {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {
+                "template": "turquoise",
+                "title": _plain_text("选择个股"),
+            },
+            "body": {"elements": elements},
+        }
+
+    async def _send_research_card(
+        self, *, card: dict[str, Any], reply_chat_id: str, chat_type: str
+    ) -> None:
+        if not self._client:
+            raise RuntimeError("Feishu client is not ready")
+        receive_id_type = "chat_id" if chat_type == "group" else "open_id"
+        content = json.dumps(card, ensure_ascii=False)
+        loop = asyncio.get_running_loop()
+        message_id = await loop.run_in_executor(
+            None,
+            self._send_message_sync,
+            receive_id_type,
+            reply_chat_id,
+            "interactive",
+            content,
+        )
+        if not message_id:
+            raise RuntimeError("Feishu rejected the research card")
+
+    async def _send_research_notice(
+        self, *, content: str, reply_chat_id: str, chat_type: str
+    ) -> None:
+        if not self._client:
+            return
+        receive_id_type = "chat_id" if chat_type == "group" else "open_id"
+        body = json.dumps({"text": content}, ensure_ascii=False)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            self._send_message_sync,
+            receive_id_type,
+            reply_chat_id,
+            "text",
+            body,
+        )
+
+    @staticmethod
+    def _custom_stock_prompt(code: str) -> str:
+        from src.portfolio.analysis import build_custom_stock_prompt
+
+        return build_custom_stock_prompt(code)
+
+    @classmethod
+    def _build_research_prompt(cls, payload: dict[str, str]) -> tuple[str, str]:
+        from src.portfolio.analysis import build_analysis_prompt, find_holding
+        from src.portfolio.state import load_state
+
+        action = payload.get("action", "")
+        if action == "premarket":
+            return (
+                build_analysis_prompt("market", market_phase="premarket"),
+                "盘前分析",
+            )
+        if action == "portfolio":
+            return build_analysis_prompt("portfolio"), "持仓分析"
+        if action == "holding":
+            state = load_state()
+            holding = find_holding(state.holdings, payload.get("symbol", ""))
+            if holding is None:
+                raise ValueError("该标的已不在当前持仓，请重新打开“分析菜单”选择。")
+            name = str(holding.get("name") or holding.get("symbol") or "个股")
+            return build_analysis_prompt("holding", holding), f"{name}个股分析"
+        if action == "custom_stock":
+            code = payload.get("code", "")
+            if not re.fullmatch(r"\d{6}", code):
+                raise ValueError("请输入完整的 6 位证券代码。")
+            return cls._custom_stock_prompt(code), f"{code}个股分析"
+        raise ValueError("不支持的研究类型。")
+
+    @staticmethod
+    def _card_action_response(message: str, *, error: bool = False) -> Any:
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse,
+        )
+
+        return P2CardActionTriggerResponse(
+            {
+                "toast": {
+                    "type": "error" if error else "success",
+                    "content": message,
+                }
+            }
+        )
+
+    def _on_bot_menu(self, data: Any) -> None:
+        """Handle the three persistent Feishu bot-menu events without chat bubbles."""
+        event = getattr(data, "event", None)
+        operator = getattr(event, "operator", None)
+        operator_id = getattr(operator, "operator_id", None)
+        sender_id = str(
+            getattr(operator_id, "open_id", "")
+            or getattr(operator, "open_id", "")
+            or ""
+        )
+        event_key = str(getattr(event, "event_key", "") or "")
+        event_id = str(getattr(getattr(data, "header", None), "event_id", "") or "")
+        if event_key not in {
+            BOT_MENU_RESEARCH_HUB,
+            BOT_MENU_NEW_CONVERSATION,
+            BOT_MENU_REFRESH_REPORT,
+        }:
+            return
+        if not sender_id or not self.is_allowed(sender_id):
+            return
+        if event_id and event_id in self._processed_bot_menu_event_ids:
+            return
+        if event_id:
+            self._processed_bot_menu_event_ids[event_id] = None
+            while len(self._processed_bot_menu_event_ids) > 1000:
+                self._processed_bot_menu_event_ids.popitem(last=False)
+        if not self._loop or not self._loop.is_running():
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self._handle_bot_menu_action(sender_id, event_key), self._loop
+        )
+
+        def _log_bot_menu_failure(completed: Any) -> None:
+            try:
+                completed.result()
+            except Exception:
+                self.logger.exception("Error handling Feishu bot menu event")
+
+        future.add_done_callback(_log_bot_menu_failure)
+
+    async def _handle_bot_menu_action(self, sender_id: str, event_key: str) -> None:
+        base_session_key = f"feishu:{sender_id}"
+        if event_key == BOT_MENU_RESEARCH_HUB:
+            await self._send_research_card(
+                card=self._build_research_menu_card(
+                    reply_chat_id=sender_id,
+                    chat_type="p2p",
+                    session_key=base_session_key,
+                ),
+                reply_chat_id=sender_id,
+                chat_type="p2p",
+            )
+            return
+        await self._handle_message(
+            sender_id=sender_id,
+            chat_id=sender_id,
+            content="",
+            metadata={
+                "chat_type": "p2p",
+                "msg_type": "bot_menu",
+                "research_control": event_key,
+                "research_base_session_key": base_session_key,
+            },
+            session_key=base_session_key,
+            is_dm=True,
+        )
+
+    def _on_card_action_trigger(self, data: Any) -> Any:
+        """Acknowledge card callbacks within three seconds and schedule real work."""
+        event = getattr(data, "event", None)
+        operator = getattr(event, "operator", None)
+        action = getattr(event, "action", None)
+        context = getattr(event, "context", None)
+        sender_id = str(getattr(operator, "open_id", "") or "")
+        value = dict(getattr(action, "value", None) or {})
+
+        if value.get("flow") != _RESEARCH_FLOW or value.get("action") not in _RESEARCH_ACTIONS:
+            return self._card_action_response("无法识别这张研究卡片。", error=True)
+        if not sender_id or not self.is_allowed(sender_id):
+            return self._card_action_response("当前账号尚未获得使用权限。", error=True)
+
+        event_id = str(getattr(getattr(data, "header", None), "event_id", "") or "")
+        if event_id and event_id in self._processed_card_action_ids:
+            return self._card_action_response("该操作已经提交。")
+        if event_id:
+            self._processed_card_action_ids[event_id] = None
+            while len(self._processed_card_action_ids) > 1000:
+                self._processed_card_action_ids.popitem(last=False)
+
+        form_value = dict(getattr(action, "form_value", None) or {})
+        if value["action"] == "custom_stock":
+            raw_code = str(form_value.get("stock_code") or "").strip()
+            if not re.fullmatch(r"\d{6}", raw_code):
+                return self._card_action_response("请输入完整的 6 位证券代码。", error=True)
+            value["code"] = raw_code
+
+        chat_type = str(value.get("chat_type") or "p2p")
+        fallback_chat_id = str(getattr(context, "open_chat_id", "") or "")
+        reply_chat_id = str(value.get("reply_chat_id") or "")
+        if not reply_chat_id:
+            reply_chat_id = fallback_chat_id if chat_type == "group" else sender_id
+        value.update(
+            {
+                "sender_id": sender_id,
+                "reply_chat_id": reply_chat_id,
+                "chat_type": chat_type,
+                "source_message_id": str(
+                    getattr(context, "open_message_id", "") or ""
+                ),
+            }
+        )
+
+        if not self._loop or not self._loop.is_running():
+            return self._card_action_response("飞书连接正在启动，请稍后重试。", error=True)
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._handle_research_card_action(value), self._loop
+        )
+
+        def _log_callback_failure(completed: Any) -> None:
+            try:
+                completed.result()
+            except Exception:
+                self.logger.exception("Error handling research card action")
+
+        future.add_done_callback(_log_callback_failure)
+        if value["action"] == "show_stock_picker":
+            return self._card_action_response("正在打开个股选择。")
+        label = {
+            "premarket": "盘前分析",
+            "portfolio": "持仓分析",
+            "holding": "个股分析",
+            "custom_stock": "个股分析",
+        }.get(value["action"], "研究任务")
+        return self._card_action_response(f"已提交{label}。")
+
+    async def _handle_research_card_action(self, payload: dict[str, str]) -> None:
+        reply_chat_id = payload["reply_chat_id"]
+        chat_type = payload["chat_type"]
+        base_session_key = str(
+            payload.get("base_session_key")
+            or payload.get("session_key")
+            or f"feishu:{reply_chat_id}"
+        )
+        try:
+            if payload["action"] == "show_stock_picker":
+                from src.portfolio.state import load_state
+
+                state = load_state()
+                card = self._build_stock_picker_card(
+                    state.holdings,
+                    reply_chat_id=reply_chat_id,
+                    chat_type=chat_type,
+                    session_key=base_session_key,
+                )
+                await self._send_research_card(
+                    card=card,
+                    reply_chat_id=reply_chat_id,
+                    chat_type=chat_type,
+                )
+                return
+
+            prompt, label = self._build_research_prompt(payload)
+            symbol = str(payload.get("symbol") or payload.get("code") or "")
+            route = await asyncio.to_thread(
+                build_research_session_route,
+                base_key=base_session_key,
+                action=payload["action"],
+                symbol=symbol,
+                name=label.removesuffix("个股分析"),
+            )
+            await self._handle_message(
+                sender_id=payload["sender_id"],
+                chat_id=reply_chat_id,
+                content=prompt,
+                metadata={
+                    "message_id": payload.get("source_message_id", ""),
+                    "chat_type": chat_type,
+                    "msg_type": "interactive",
+                    "research_action": payload["action"],
+                    "research_label": route.label,
+                    **route.metadata(),
+                },
+                session_key=route.route_key,
+                is_dm=chat_type == "p2p",
+            )
+        except Exception as exc:
+            await self._send_research_notice(
+                content=f"无法启动研究：{exc}",
+                reply_chat_id=reply_chat_id,
+                chat_type=chat_type,
+            )
 
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> str | None:
         """Sync helper for adding reaction (runs in thread pool)."""
@@ -1966,6 +2517,23 @@ class FeishuChannel(BaseChannel):
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
 
+            if msg.metadata.get("_research_hub"):
+                chat_type = str(msg.metadata.get("chat_type") or "p2p")
+                base_key = str(
+                    msg.metadata.get("research_base_session_key")
+                    or f"feishu:{msg.chat_id}"
+                )
+                await self._send_research_card(
+                    card=self._build_research_menu_card(
+                        reply_chat_id=msg.chat_id,
+                        chat_type=chat_type,
+                        session_key=base_key,
+                    ),
+                    reply_chat_id=msg.chat_id,
+                    chat_type=chat_type,
+                )
+                return
+
             # Handle tool hint messages.  When a streaming card is active for
             # this chat, inline the hint into the card instead of sending a
             # separate message so the user experience stays cohesive.
@@ -2255,20 +2823,108 @@ class FeishuChannel(BaseChannel):
             if not content and not media_paths:
                 return
 
-            # Build session key for conversation isolation.
-            # If topic_isolation is True: each topic gets its own session via root_id/message_id.
-            # If topic_isolation is False: all messages in group share the same session.
-            # Private chat: no override — same behavior as Telegram/Slack.
+            # Ordinary top-level group messages share one chat Session. Only real
+            # Feishu topic/thread messages carry ``thread_id`` and are isolated.
+            # Using ``message_id`` here would incorrectly turn every normal group
+            # message into a brand-new conversation.
             if chat_type == "group":
-                if self.config.topic_isolation:
-                    session_key = f"feishu:{chat_id}:{root_id or message_id}"
+                if self.config.topic_isolation and thread_id:
+                    session_key = f"feishu:{chat_id}:thread:{thread_id}"
                 else:
                     session_key = f"feishu:{chat_id}"
             else:
                 session_key = None
 
-            # Forward to message bus
             reply_to = chat_id if chat_type == "group" else sender_id
+            base_session_key = session_key or f"feishu:{reply_to}"
+            if msg_type == "text" and _is_new_research_request(content):
+                card = self._build_research_menu_card(
+                    reply_chat_id=reply_to,
+                    chat_type=chat_type,
+                    session_key=session_key,
+                )
+                await self._send_research_card(
+                    card=card,
+                    reply_chat_id=reply_to,
+                    chat_type=chat_type,
+                )
+                return
+
+            control_action = (
+                _research_control_action(content) if msg_type == "text" else None
+            )
+            if control_action:
+                await self._handle_message(
+                    sender_id=sender_id,
+                    chat_id=reply_to,
+                    content="",
+                    metadata={
+                        "message_id": message_id,
+                        "chat_type": chat_type,
+                        "msg_type": msg_type,
+                        "parent_id": parent_id,
+                        "root_id": root_id,
+                        "thread_id": thread_id,
+                        "research_control": control_action,
+                        "research_base_session_key": base_session_key,
+                    },
+                    session_key=base_session_key,
+                    is_dm=chat_type == "p2p",
+                )
+                return
+
+            research_metadata: dict[str, Any] = {}
+            pdf_requested, pdf_from_previous = (
+                _pdf_delivery_request(content) if msg_type == "text" else (False, False)
+            )
+            pdf_metadata: dict[str, Any] = {}
+            if pdf_requested:
+                pdf_metadata = {
+                    "pdf_delivery_requested": True,
+                    "pdf_from_previous_report": pdf_from_previous,
+                }
+                if not pdf_from_previous:
+                    content = (
+                        f"{content}\n\n"
+                        "请只输出完整的 Markdown 报告正文；PDF 附件由飞书频道自动生成和发送，"
+                        "不要声称无法发送附件，也不要只返回本地文件路径。"
+                    )
+            outbound_session_key = session_key
+            direct_action = (
+                _direct_research_action(content) if msg_type == "text" else None
+            )
+            if direct_action == "show_stock_picker":
+                from src.portfolio.state import load_state
+
+                card = self._build_stock_picker_card(
+                    load_state().holdings,
+                    reply_chat_id=reply_to,
+                    chat_type=chat_type,
+                    session_key=base_session_key,
+                )
+                await self._send_research_card(
+                    card=card,
+                    reply_chat_id=reply_to,
+                    chat_type=chat_type,
+                )
+                return
+            if direct_action in {"premarket", "portfolio"}:
+                content, label = self._build_research_prompt(
+                    {"action": direct_action}
+                )
+                route = await asyncio.to_thread(
+                    build_research_session_route,
+                    base_key=base_session_key,
+                    action=direct_action,
+                )
+                research_metadata = {
+                    "research_action": direct_action,
+                    "research_label": route.label or label,
+                    **route.metadata(),
+                }
+                outbound_session_key = route.route_key
+
+            # Forward to message bus
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
@@ -2281,8 +2937,10 @@ class FeishuChannel(BaseChannel):
                     "parent_id": parent_id,
                     "root_id": root_id,
                     "thread_id": thread_id,
+                    **pdf_metadata,
+                    **research_metadata,
                 },
-                session_key=session_key,
+                session_key=outbound_session_key,
                 is_dm=chat_type == "p2p",
             )
 

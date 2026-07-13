@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,9 @@ class FakeSessionService:
     def get_session(self, session_id: str) -> Session | None:
         return next((session for session in self.created if session.session_id == session_id), None)
 
+    def list_sessions(self, limit: int = 50) -> list[Session]:
+        return list(reversed(self.created))[:limit]
+
     async def send_message(
         self,
         session_id: str,
@@ -60,7 +64,7 @@ class FakeSessionService:
             Message(
                 session_id=session_id,
                 role="assistant",
-                content=f"agent reply: {content}",
+                content=getattr(self, "reply_content", f"agent reply: {content}"),
                 linked_attempt_id=attempt_id,
             )
         )
@@ -394,6 +398,8 @@ def test_channel_runtime_uses_dispatcher_research_policy_and_preserves_routing_m
         assert outbound.metadata["root_id"] == "root-1"
         assert outbound.metadata["thread_id"] == "thread-1"
         assert outbound.metadata["session_id"] == "session-1"
+        assert outbound.media == []
+        assert outbound.content == "agent reply: research this portfolio"
         assert dispatcher.cancelled == ["session-1"]
         assert cancelled.metadata["message_id"] == "m-2"
         assert cancelled.metadata["session_cancel"] is True
@@ -467,7 +473,7 @@ def test_channel_runtime_new_command_resets_session_and_creates_fresh_one(tmp_pa
                 InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/new")
             )
             reset_reply = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
-            assert "Session reset" in reset_reply.content
+            assert "开启新对话" in reset_reply.content
             assert reset_reply.metadata.get("session_reset") is True
 
             await bus.publish_inbound(
@@ -506,10 +512,10 @@ def test_channel_runtime_new_command_with_no_existing_session(tmp_path: Path) ->
         finally:
             await runtime.stop()
 
-        assert "No active session to reset" in reply.content
+        assert "开启新对话" in reply.content
         assert reply.metadata.get("session_reset") is True
         assert service.sent == []
-        assert len(service.created) == 0
+        assert len(service.created) == 1
 
     asyncio.run(scenario())
 
@@ -539,7 +545,7 @@ def test_channel_runtime_reset_and_newsession_aliases_work(tmp_path: Path) -> No
                 InboundMessage(channel="discord", sender_id="u1", chat_id="c1", content="/reset")
             )
             reply = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
-            assert "Session reset" in reply.content
+            assert "开启新对话" in reply.content
 
             await bus.publish_inbound(
                 InboundMessage(channel="discord", sender_id="u1", chat_id="c1", content="hi again")
@@ -550,9 +556,599 @@ def test_channel_runtime_reset_and_newsession_aliases_work(tmp_path: Path) -> No
                 InboundMessage(channel="discord", sender_id="u1", chat_id="c1", content="/newsession")
             )
             reply2 = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
-            assert "Session reset" in reply2.content
+            assert "开启新对话" in reply2.content
         finally:
             await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_channel_runtime_research_topics_switch_and_resume_for_followups(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        from src.channels.runtime import ChannelRuntime
+        from src.channels.research_sessions import build_research_session_route
+
+        map_path = tmp_path / "channel_sessions.json"
+        bus = MessageBus()
+        service = FakeSessionService()
+        runtime = ChannelRuntime(
+            bus=bus,
+            session_service=service,
+            manager=None,
+            session_map_path=map_path,
+            reply_timeout_s=1,
+            poll_interval_s=0.01,
+        )
+        await runtime.start(start_manager=False)
+        try:
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="c1",
+                    content="old context",
+                )
+            )
+            await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="c1",
+                    content="research A",
+                    metadata={
+                        "research_label": "招商银行个股分析",
+                        **build_research_session_route(
+                            base_key="feishu:c1",
+                            action="holding",
+                            symbol="600036.SH",
+                            name="招商银行",
+                        ).metadata(),
+                    },
+                    session_key_override="feishu:c1:research:symbol:600036.SH",
+                )
+            )
+            first_a = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="c1",
+                    content="follow-up A",
+                )
+            )
+            followup_a = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+
+            route_b = build_research_session_route(
+                base_key="feishu:c1",
+                action="holding",
+                symbol="000651.SZ",
+                name="格力电器",
+            )
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="c1",
+                    content="research B",
+                    metadata={"research_label": route_b.label, **route_b.metadata()},
+                    session_key_override=route_b.route_key,
+                )
+            )
+            first_b = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+
+            route_a = build_research_session_route(
+                base_key="feishu:c1",
+                action="custom_stock",
+                symbol="600036",
+                name="招商银行",
+            )
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="c1",
+                    content="resume A",
+                    metadata={"research_label": route_a.label, **route_a.metadata()},
+                    session_key_override=route_a.route_key,
+                )
+            )
+            resumed_a = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="c1",
+                    content="",
+                    metadata={
+                        "research_control": "new_conversation",
+                        "research_base_session_key": "feishu:c1",
+                    },
+                )
+            )
+            new_a = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="c1",
+                    content="fresh A follow-up",
+                )
+            )
+            fresh_a = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+        finally:
+            await runtime.stop()
+
+        assert service.sent == [
+            ("session-1", "old context"),
+            ("session-2", "research A"),
+            ("session-2", "follow-up A"),
+            ("session-3", "research B"),
+            ("session-2", "resume A"),
+            ("session-4", "fresh A follow-up"),
+        ]
+        assert first_a.metadata["session_id"] == "session-2"
+        assert followup_a.metadata["session_id"] == "session-2"
+        assert first_b.metadata["session_id"] == "session-3"
+        assert resumed_a.metadata["session_id"] == "session-2"
+        assert new_a.metadata["session_id"] == "session-4"
+        assert fresh_a.metadata["session_id"] == "session-4"
+        mapping = json.loads(map_path.read_text(encoding="utf-8"))
+        assert mapping["feishu:c1"] == "session-4"
+        assert mapping["feishu:c1:general"] == "session-1"
+        assert mapping["feishu:c1:research:symbol:600036.SH"] == "session-4"
+        assert mapping["feishu:c1:research:symbol:000651.SZ"] == "session-3"
+
+    asyncio.run(scenario())
+
+
+def test_channel_runtime_refreshes_active_portfolio_report(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        from src.channels import runtime as runtime_module
+        from src.channels.research_sessions import build_research_session_route
+        from src.channels.runtime import ChannelRuntime
+
+        def fake_render(title: str, content: str, target: Path) -> Path:
+            del title, content
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"%PDF-refresh")
+            return target
+
+        monkeypatch.setattr(runtime_module, "_render_research_pdf", fake_render)
+        bus = MessageBus()
+        service = FakeSessionService()
+        runtime = ChannelRuntime(
+            bus=bus,
+            session_service=service,
+            manager=None,
+            session_map_path=tmp_path / "channel_sessions.json",
+            reply_timeout_s=1,
+            poll_interval_s=0.01,
+        )
+        route = build_research_session_route(
+            base_key="feishu:c1", action="portfolio"
+        )
+        await runtime.start(start_manager=False)
+        try:
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="c1",
+                    content="initial portfolio context",
+                    metadata={"research_label": route.label, **route.metadata()},
+                    session_key_override=route.route_key,
+                )
+            )
+            await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="c1",
+                    content="",
+                    metadata={
+                        "research_control": "refresh_report",
+                        "research_base_session_key": "feishu:c1",
+                    },
+                )
+            )
+            refreshed = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+        finally:
+            await runtime.stop()
+
+        assert service.sent[0] == ("session-1", "initial portfolio context")
+        assert service.sent[1][0] == "session-1"
+        assert "生成一份细致的组合报告" in service.sent[1][1]
+        assert refreshed.metadata["delivery_mode"] == "report_pdf"
+        assert refreshed.metadata["research_refresh"] is True
+        assert Path(refreshed.media[0]).read_bytes() == b"%PDF-refresh"
+
+    asyncio.run(scenario())
+
+
+def test_channel_runtime_refresh_from_general_opens_research_hub(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        from src.channels.runtime import ChannelRuntime
+
+        bus = MessageBus()
+        service = FakeSessionService()
+        runtime = ChannelRuntime(
+            bus=bus,
+            session_service=service,
+            manager=None,
+            session_map_path=tmp_path / "channel_sessions.json",
+            reply_timeout_s=1,
+            poll_interval_s=0.01,
+        )
+        await runtime.start(start_manager=False)
+        try:
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="c1",
+                    content="hello",
+                )
+            )
+            await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="c1",
+                    content="",
+                    metadata={
+                        "research_control": "refresh_report",
+                        "research_base_session_key": "feishu:c1",
+                    },
+                )
+            )
+            reply = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+        finally:
+            await runtime.stop()
+
+        assert reply.metadata["_research_hub"] is True
+        assert "请先从分析菜单选择" in reply.content
+        assert service.sent == [("session-1", "hello")]
+
+    asyncio.run(scenario())
+
+
+def test_channel_runtime_rejects_duplicate_refresh_while_topic_is_busy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        from src.channels.research_sessions import build_research_session_route
+        from src.channels.runtime import ChannelRuntime
+
+        bus = MessageBus()
+        service = FakeSessionService()
+        runtime = ChannelRuntime(
+            bus=bus,
+            session_service=service,
+            manager=None,
+            session_map_path=tmp_path / "channel_sessions.json",
+            reply_timeout_s=1,
+            poll_interval_s=0.01,
+        )
+        route = build_research_session_route(
+            base_key="feishu:c1", action="portfolio"
+        )
+        await runtime.start(start_manager=False)
+        try:
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="c1",
+                    content="portfolio",
+                    metadata={"research_label": route.label, **route.metadata()},
+                    session_key_override=route.route_key,
+                )
+            )
+            await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+            monkeypatch.setattr(runtime, "_is_session_busy", lambda _session_id: True)
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="c1",
+                    content="",
+                    metadata={
+                        "research_control": "refresh_report",
+                        "research_base_session_key": "feishu:c1",
+                    },
+                )
+            )
+            reply = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+        finally:
+            await runtime.stop()
+
+        assert "仍在生成" in reply.content
+        assert reply.metadata["refresh_rejected"] is True
+        assert len(service.sent) == 1
+
+    asyncio.run(scenario())
+
+
+def test_channel_runtime_attaches_pdf_to_completed_feishu_research(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        from src.channels import runtime as runtime_module
+        from src.channels.runtime import ChannelRuntime
+
+        def fake_render(title: str, content: str, target: Path) -> Path:
+            assert title == "2026-07-13_军工基金（512680.SH）单标的持仓分析"
+            assert content == service.reply_content
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"%PDF-test")
+            return target
+
+        monkeypatch.setattr(runtime_module, "_render_research_pdf", fake_render)
+        bus = MessageBus()
+        service = FakeSessionService()
+        service.reply_content = (
+            "# 🔍 军工基金（512680.SH）单标的持仓分析\n\n"
+            "报告日期：2026-07-13\n\n## 一、概览\n\n正文"
+        )
+        runtime = ChannelRuntime(
+            bus=bus,
+            session_service=service,
+            manager=None,
+            session_map_path=tmp_path / "channel_sessions.json",
+            reply_timeout_s=1,
+            poll_interval_s=0.01,
+        )
+        await runtime.start(start_manager=False)
+        try:
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="c1",
+                    content="grounded research prompt",
+                    metadata={
+                        "research_action": "premarket",
+                        "research_label": "盘前分析",
+                    },
+                )
+            )
+            outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+        finally:
+            await runtime.stop()
+
+        assert len(outbound.media) == 1
+        pdf_path = Path(outbound.media[0])
+        assert pdf_path.name == "2026-07-13_军工基金（512680.SH）单标的持仓分析.pdf"
+        assert pdf_path.read_bytes() == b"%PDF-test"
+        assert outbound.content == (
+            "✅ 盘前分析已完成\n"
+            "报告：🔍 军工基金（512680.SH）单标的持仓分析\n"
+            "完整正文和表格见 PDF 附件；飞书中仅保留这条简要说明。\n"
+            "后续可直接发送文字，在当前专题 Session 中继续讨论。"
+        )
+        assert "agent reply" not in outbound.content
+        assert outbound.metadata["delivery_mode"] == "report_pdf"
+
+    asyncio.run(scenario())
+
+
+def test_channel_runtime_pdf_report_note_includes_report_title() -> None:
+    from src.channels.runtime import _research_delivery_note
+
+    note = _research_delivery_note(
+        "个股分析",
+        "# 🔍 军工基金（512680.SH）单标的持仓分析\n\n| 项目 | 数值 |",
+    )
+
+    assert note == (
+        "✅ 个股分析已完成\n"
+        "报告：🔍 军工基金（512680.SH）单标的持仓分析\n"
+        "完整正文和表格见 PDF 附件；飞书中仅保留这条简要说明。\n"
+        "后续可直接发送文字，在当前专题 Session 中继续讨论。"
+    )
+
+
+def test_channel_runtime_pdf_filename_uses_date_and_report_title() -> None:
+    from src.channels.runtime import _report_pdf_name
+
+    assert _report_pdf_name(
+        "# 组合分析报告：2026年7月13日\n\n## 一、概览",
+        "持仓分析",
+    ) == "2026-07-13_组合分析报告.pdf"
+
+
+def test_channel_runtime_honors_direct_pdf_delivery_request(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        from src.channels import runtime as runtime_module
+        from src.channels.runtime import ChannelRuntime
+
+        def fake_render(title: str, content: str, target: Path) -> Path:
+            assert title == "2026-07-13_SpaceX (SPCX.US) 深度分析报告"
+            assert content == service.reply_content
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"%PDF-direct")
+            return target
+
+        monkeypatch.setattr(runtime_module, "_render_research_pdf", fake_render)
+        bus = MessageBus()
+        service = FakeSessionService()
+        service.reply_content = (
+            "# SpaceX (SPCX.US) 深度分析报告\n\n"
+            "报告日期：2026-07-13\n\n## 一、概览\n\n完整正文"
+        )
+        runtime = ChannelRuntime(
+            bus=bus,
+            session_service=service,
+            manager=None,
+            session_map_path=tmp_path / "channel_sessions.json",
+            reply_timeout_s=1,
+            poll_interval_s=0.01,
+        )
+        await runtime.start(start_manager=False)
+        try:
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="oc_group",
+                    content="帮我分析 SpaceX，给我 PDF 报告",
+                    metadata={"pdf_delivery_requested": True},
+                )
+            )
+            outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+        finally:
+            await runtime.stop()
+
+        assert outbound.metadata["delivery_mode"] == "report_pdf"
+        assert "SpaceX (SPCX.US) 深度分析报告" in outbound.content
+        assert Path(outbound.media[0]).name == (
+            "2026-07-13_SpaceX (SPCX.US) 深度分析报告.pdf"
+        )
+        assert Path(outbound.media[0]).read_bytes() == b"%PDF-direct"
+
+    asyncio.run(scenario())
+
+
+def test_channel_runtime_sends_latest_chat_report_pdf_without_model_roundtrip(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        from src.channels import runtime as runtime_module
+        from src.channels.runtime import ChannelRuntime
+
+        report = (
+            "# 🔴 SpaceX (SPCX.US) 深度分析报告\n\n"
+            "**日期**: 2026年7月13日\n\n"
+            "## 一、执行摘要\n\n| 项目 | 内容 |\n|---|---|\n| 结论 | 谨慎 |\n\n"
+            "## 二、估值分析\n\n| 情景 | 估值 |\n|---|---|\n| 基准 | 偏高 |\n\n"
+            + ("完整研究正文。" * 100)
+        )
+
+        def fake_render(title: str, content: str, target: Path) -> Path:
+            assert title == "2026-07-13_SpaceX (SPCX.US) 深度分析报告"
+            assert content == report
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"%PDF-previous")
+            return target
+
+        monkeypatch.setattr(runtime_module, "_render_research_pdf", fake_render)
+        bus = MessageBus()
+        service = FakeSessionService()
+        source = service.create_session(
+            title="feishu:oc_group",
+            config={"channel": "feishu", "channel_chat_id": "oc_group"},
+        )
+        service.messages[source.session_id].append(
+            Message(
+                session_id=source.session_id,
+                role="assistant",
+                content=report,
+                created_at="2026-07-13T11:40:00",
+            )
+        )
+        runtime = ChannelRuntime(
+            bus=bus,
+            session_service=service,
+            manager=None,
+            session_map_path=tmp_path / "channel_sessions.json",
+            reply_timeout_s=1,
+            poll_interval_s=0.01,
+        )
+        await runtime.start(start_manager=False)
+        try:
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="oc_group",
+                    content="可以把这份报告的 PDF 发送给我吗？",
+                    metadata={
+                        "pdf_delivery_requested": True,
+                        "pdf_from_previous_report": True,
+                    },
+                )
+            )
+            outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+        finally:
+            await runtime.stop()
+
+        assert service.sent == []
+        assert outbound.metadata["delivery_mode"] == "report_pdf"
+        assert outbound.metadata["report_source_session_id"] == source.session_id
+        assert "SpaceX (SPCX.US) 深度分析报告" in outbound.content
+        assert Path(outbound.media[0]).name == (
+            "2026-07-13_SpaceX (SPCX.US) 深度分析报告.pdf"
+        )
+        assert Path(outbound.media[0]).read_bytes() == b"%PDF-previous"
+
+    asyncio.run(scenario())
+
+def test_channel_runtime_never_sends_full_report_text_when_pdf_render_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        from src.channels import runtime as runtime_module
+        from src.channels.runtime import ChannelRuntime
+
+        def broken_render(title: str, content: str, target: Path) -> Path:
+            del title, content, target
+            raise RuntimeError("renderer unavailable")
+
+        monkeypatch.setattr(runtime_module, "_render_research_pdf", broken_render)
+        bus = MessageBus()
+        service = FakeSessionService()
+        runtime = ChannelRuntime(
+            bus=bus,
+            session_service=service,
+            manager=None,
+            session_map_path=tmp_path / "channel_sessions.json",
+            reply_timeout_s=1,
+            poll_interval_s=0.01,
+        )
+        await runtime.start(start_manager=False)
+        try:
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="u1",
+                    chat_id="c1",
+                    content="grounded research prompt",
+                    metadata={
+                        "research_action": "portfolio",
+                        "research_label": "全仓分析",
+                    },
+                )
+            )
+            outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+        finally:
+            await runtime.stop()
+
+        assert outbound.media == []
+        assert outbound.content == (
+            "⚠️ 全仓分析已完成，但 PDF 生成失败。\n"
+            "为避免在飞书中发送大量表格正文，本次未发送报告内容；请重试生成报告。"
+        )
+        assert "agent reply" not in outbound.content
+        assert "delivery_mode" not in outbound.metadata
 
     asyncio.run(scenario())
 
@@ -621,7 +1217,8 @@ def test_channel_runtime_session_map_persisted_after_reset(tmp_path: Path) -> No
             await asyncio.wait_for(bus.consume_outbound(), timeout=1)
 
             data = json.loads(map_path.read_text(encoding="utf-8"))
-            assert "feishu:c1" not in data
+            assert data["feishu:c1"] == "session-2"
+            assert data["feishu:c1:general"] == "session-2"
         finally:
             await runtime.stop()
 

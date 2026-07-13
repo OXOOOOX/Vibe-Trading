@@ -163,6 +163,25 @@ def _clamp_limit(value: Any) -> int:
     return max(1, min(n, _MAX_LIMIT))
 
 
+def lookup_exact_ashare(code: str) -> tuple[Optional[Dict[str, Any]], str]:
+    """Resolve one complete A-share code through Eastmoney's live suggest API."""
+    normalized_code = str(code or "").strip()
+    if len(normalized_code) != 6 or not normalized_code.isdigit():
+        return None, "code must contain exactly 6 digits"
+    candidates, status = _search_eastmoney(normalized_code)
+    exact = next(
+        (
+            candidate
+            for candidate in candidates
+            if str(candidate.get("symbol") or "").split(".", 1)[0] == normalized_code
+            and candidate.get("market") == "cn"
+            and str(candidate.get("name") or "").strip()
+        ),
+        None,
+    )
+    return exact, status
+
+
 def _search_eastmoney(query: str) -> tuple[List[Dict[str, Any]], str]:
     """Query Eastmoney's suggest endpoint and normalize the candidates.
 

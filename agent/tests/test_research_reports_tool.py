@@ -68,6 +68,7 @@ def test_success_envelope_merges_reports_and_consensus():
     assert payload["market"] == "CN"
     assert payload["source"] == "eastmoney+ths"
     assert payload["data"]["code"] == "600519.SH"
+    assert payload["data"]["source_statuses"] == {"eastmoney": "live", "ths": "live"}
 
     reports = payload["data"]["reports"]
     assert len(reports) == 2
@@ -89,6 +90,8 @@ def test_success_envelope_merges_reports_and_consensus():
 
     # Eastmoney called with the bare numeric code; THS routed to the ths bucket.
     assert mock_em.call_args.kwargs["params"]["code"] == "600519"
+    assert mock_em.call_args.kwargs["params"]["beginTime"] < mock_em.call_args.kwargs["params"]["endTime"]
+    assert mock_em.call_args.kwargs["params"]["beginTime"].count("-") == 2
     assert mock_ths.call_args.kwargs["host_key"] == "ths"
     assert mock_ths.call_args.kwargs["params"]["code"] == "600519"
 
@@ -109,6 +112,8 @@ def test_ths_failure_degrades_consensus_but_keeps_reports():
         out = ResearchReportsTool().execute(code="600519.SH")
     payload = json.loads(out)
     assert payload["ok"] is True
+    assert payload["source"] == "eastmoney"
+    assert payload["data"]["source_statuses"]["ths"] == "unavailable"
     assert len(payload["data"]["reports"]) == 2
     assert payload["data"]["consensus_eps"] == []
 
@@ -120,6 +125,7 @@ def test_ths_non_2xx_degrades_consensus():
         out = ResearchReportsTool().execute(code="600519.SH")
     payload = json.loads(out)
     assert payload["ok"] is True
+    assert payload["source"] == "eastmoney"
     assert payload["data"]["consensus_eps"] == []
 
 

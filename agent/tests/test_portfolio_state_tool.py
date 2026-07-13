@@ -103,10 +103,11 @@ def test_portfolio_state_tool_update_get_and_record_trade(tmp_path, monkeypatch)
     trade_payload = json.loads(
         tool.execute(
             action="record_trade",
-            trade={"code": "588870", "side": "sell", "quantity": 3600, "price": 2.16},
+            trade={"code": "588870", "symbol": "588870.SH", "name": "科创50ETF汇添富", "side": "sell", "quantity": 3600, "price": 2.16},
         )
     )
     assert trade_payload["state"]["recent_trades"][0]["symbol"] == "588870.SH"
+    assert trade_payload["state"]["holdings"][0]["quantity"] == 3700.0
 
     get_payload = json.loads(tool.execute(action="get"))
     assert get_payload["state"]["holdings"][6]["symbol"] == "600036.SH"

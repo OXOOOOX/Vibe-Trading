@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import date, timedelta
 from typing import Any
 
 from backtest.loaders._http import (
@@ -124,6 +125,11 @@ class ResearchReportsTool(BaseTool):
                     "qType": "0",
                     "pageSize": str(limit),
                     "pageNo": "1",
+                    # reportapi now requires an explicit date range.  A rolling
+                    # five-year window preserves the historical cache contract
+                    # while keeping the upstream response bounded.
+                    "beginTime": (date.today() - timedelta(days=365 * 5)).isoformat(),
+                    "endTime": date.today().isoformat(),
                 },
             )
         except Exception as exc:  # noqa: BLE001 - surface any fetch failure as envelope
@@ -132,7 +138,7 @@ class ResearchReportsTool(BaseTool):
         reports = _parse_reports(payload)
 
         # Consensus EPS is best-effort: a THS outage must not sink the reports.
-        consensus_eps = _fetch_consensus_eps(code)
+        consensus_eps, consensus_available = _fetch_consensus_eps(code)
 
         if not reports and not consensus_eps:
             return _error(f"no research coverage found for '{code}'")
@@ -141,11 +147,15 @@ class ResearchReportsTool(BaseTool):
             {
                 "ok": True,
                 "market": "CN",
-                "source": "eastmoney+ths",
+                "source": "eastmoney+ths" if consensus_available else "eastmoney",
                 "data": {
                     "code": code,
                     "reports": reports[:limit],
                     "consensus_eps": consensus_eps,
+                    "source_statuses": {
+                        "eastmoney": "live",
+                        "ths": "live" if consensus_available else "unavailable",
+                    },
                 },
             },
             ensure_ascii=False,
@@ -226,7 +236,7 @@ def _normalize_report(row: Any) -> dict | None:
     }
 
 
-def _fetch_consensus_eps(code: str) -> list[dict]:
+def _fetch_consensus_eps(code: str) -> tuple[list[dict], bool]:
     """Fetch THS consensus (mean) EPS forecast per forward fiscal year.
 
     Best-effort: any network/parse failure is logged and degraded to an empty
@@ -238,8 +248,10 @@ def _fetch_consensus_eps(code: str) -> list[dict]:
         code: A-share symbol such as ``"600519.SH"``.
 
     Returns:
-        A list of ``{fiscal_year, consensus_eps}`` dicts ordered as served,
-        empty when THS returns nothing usable or the request fails.
+        A pair of ``(records, available)``. ``available`` distinguishes a
+        healthy endpoint with no usable estimate from a transport/parse failure,
+        so source health never reports THS as healthy merely because the primary
+        Eastmoney report list succeeded.
     """
     try:
         response = throttled_get(
@@ -259,8 +271,8 @@ def _fetch_consensus_eps(code: str) -> list[dict]:
         payload = response.json()
     except Exception as exc:  # noqa: BLE001 - consensus is best-effort
         logger.warning("ths consensus eps fetch failed for %s: %s", code, exc)
-        return []
-    return _parse_consensus_eps(payload)
+        return [], False
+    return _parse_consensus_eps(payload), True
 
 
 def _parse_consensus_eps(payload: Any) -> list[dict]:

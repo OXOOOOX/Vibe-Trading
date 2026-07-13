@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 import asyncio
+import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import src.data_layer.service as data_service
 from src.data_layer.service import UnifiedDataService
 from src.data_layer.store import DataControlStore, ResearchCacheStore
 from src.market_cache.service import MarketRefreshService
@@ -69,7 +71,7 @@ def test_long_term_history_is_cache_first_and_returns_contiguous_pages(tmp_path,
     assert page["bars"] == sorted(page["bars"], key=lambda row: row["bar_time"])
     calls.clear()
     second = service.get_context(symbols=["588870.SH"], purpose="long_term", lookback_days=20, include=["market"])
-    assert second["market"]["series"][0]["retrieval"]["mode"] == "live"
+    assert second["market"]["series"][0]["retrieval"]["mode"] == "cache"
     assert calls == []  # Existing settled coverage is read, not re-fetched.
 
 
@@ -86,6 +88,35 @@ def test_live_failure_uses_explicit_stale_market_cache_fallback(tmp_path, monkey
     series = result["market"]["series"][0]
     assert series["retrieval"]["mode"] == "stale_cache"
     assert series["retrieval"]["cache_fallback_used"] is True
+
+
+def test_premarket_context_reuses_covered_cache_and_publishes_bar_handles(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VIBE_TRADING_PORTFOLIO_STATE_PATH", str(tmp_path / "portfolio.json"))
+    calls: list[dict] = []
+
+    def fetcher(**kwargs):
+        calls.append(kwargs)
+        return _outcome(kwargs)
+
+    service = _unified(tmp_path, fetcher)
+    first = service.get_context(
+        symbols=["588870.SH"], purpose="premarket", include=["market"], force_live=True
+    )
+    assert calls
+    handle = first["market"]["bars_handles"][0]["handle"]
+    assert handle == first["market"]["series"][0]["handle"]
+    calls.clear()
+
+    cached = service.get_context(symbols=["588870.SH"], purpose="premarket", include=["market"])
+    assert cached["market"]["runs"] == []
+    assert calls == []
+    assert cached["market"]["series"][0]["retrieval"]["mode"] == "cache"
+    try:
+        service.read_bars(cached["request_id"])
+    except KeyError as exc:
+        assert "request_id" in str(exc)
+    else:  # pragma: no cover - the request id must never be a bar handle
+        raise AssertionError("request_id unexpectedly resolved as a bars handle")
 
 
 def test_live_research_is_cached_and_failed_refresh_is_historical_background(tmp_path, monkeypatch) -> None:
@@ -105,6 +136,30 @@ def test_live_research_is_cached_and_failed_refresh_is_historical_background(tmp
     fallback = service.get_context(symbols=["588870.SH"], purpose="long_term", include=["news", "reports"])
     assert fallback["research"]["news"]["items"]["588870.SH"]["mode"] == "historical_background"
     assert fallback["research"]["reports"]["items"]["588870.SH"]["mode"] == "historical_background"
+    health = {item["source"]: item for item in service.control.source_health()}
+    assert health["eastmoney:news"]["last_status"] == "failed"
+    assert health["eastmoney:report"]["last_status"] == "failed"
+
+
+def test_deadline_stops_refresh_after_the_inflight_source_returns(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VIBE_TRADING_PORTFOLIO_STATE_PATH", str(tmp_path / "portfolio.json"))
+    monkeypatch.setattr(data_service, "_LIVE_TIMEOUT_SECONDS", 0.05)
+    calls: list[dict] = []
+
+    def slow_fetcher(**kwargs):
+        calls.append(kwargs)
+        time.sleep(0.03)
+        return _outcome(kwargs)
+
+    service = _unified(tmp_path, slow_fetcher)
+    result = service.get_context(
+        symbols=["588870.SH", "510300.SH"], purpose="latest_price", include=["market"]
+    )
+    assert result["status"] == "partial"
+    time.sleep(0.08)
+    # One source may still be in flight at the deadline, but cancellation stops
+    # the next source/symbol instead of continuing the whole refresh run.
+    assert len(calls) <= 2
 
 
 def test_watchlist_and_source_circuit_policy(tmp_path) -> None:
@@ -146,6 +201,8 @@ def test_prewarm_runs_each_market_calendar_slot_once() -> None:
     now = datetime(2026, 7, 13, 9, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
     first = asyncio.run(scheduler.run_due_once(now))
     second = asyncio.run(scheduler.run_due_once(now))
+    lunch = asyncio.run(scheduler.run_due_once(datetime(2026, 7, 13, 11, 25, tzinfo=ZoneInfo("Asia/Shanghai"))))
     assert [record["phase"] for record in first] == ["premarket"]
     assert second == []
-    assert calls == ["premarket"]
+    assert [record["phase"] for record in lunch] == ["intraday"]
+    assert calls == ["premarket", "intraday"]

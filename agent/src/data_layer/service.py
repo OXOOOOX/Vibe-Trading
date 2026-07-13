@@ -32,9 +32,13 @@ _EVICT_AT_BYTES = int(_SOFT_LIMIT_BYTES * 0.9)
 # cannot downgrade a task to a coarser interval or fewer history bars.
 PROFILES: dict[str, dict[str, Any]] = {
     "latest_price": {"items": [("1m", "raw")], "lookback_days": 2, "live": True},
-    "holding": {"items": [("1m", "raw"), ("5m", "raw"), ("1D", "qfq")], "lookback_days": 250, "live": True},
-    "premarket": {"items": [("1D", "qfq")], "lookback_days": 300, "live": True},
-    "intraday": {"items": [("1m", "raw"), ("5m", "raw"), ("1D", "qfq")], "lookback_days": 300, "live": True},
+    # Analysis sessions are cache-first.  Timed prewarm jobs own live refreshes
+    # so a report never serially re-fetches every holding and spends its entire
+    # data budget waiting on a slow public provider.  ``force_live=True`` keeps
+    # an explicit on-demand refresh available for callers that really need it.
+    "holding": {"items": [("1m", "raw"), ("5m", "raw"), ("1D", "qfq")], "lookback_days": 250, "live": False},
+    "premarket": {"items": [("1D", "qfq")], "lookback_days": 300, "live": False},
+    "intraday": {"items": [("1m", "raw"), ("5m", "raw"), ("1D", "qfq")], "lookback_days": 300, "live": False},
     "long_term": {"items": [("1D", "qfq")], "lookback_days": 750, "live": False},
     "backtest": {"items": [("1D", "qfq")], "lookback_days": 2500, "live": False},
 }
@@ -174,17 +178,23 @@ class UnifiedDataService:
         market: dict[str, Any] = {}
         research: dict[str, Any] = {}
         tasks: list[tuple[str, Any]] = []
+        cancel_event = threading.Event()
         pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="unified-data")
         try:
             if "market" in include:
-                tasks.append(("market", pool.submit(self._market_context, symbols, profile, effective_days, live, started)))
+                tasks.append(("market", pool.submit(self._market_context, symbols, profile, effective_days, live, started, cancel_event)))
             if "fundamentals" in include:
-                tasks.append(("fundamentals", pool.submit(self._research_context, "fundamental", symbols, started)))
+                tasks.append(("fundamentals", pool.submit(self._research_context, "fundamental", symbols, started, cancel_event)))
             if "news" in include:
-                tasks.append(("news", pool.submit(self._research_context, "news", symbols, started)))
+                tasks.append(("news", pool.submit(self._research_context, "news", symbols, started, cancel_event)))
             if "reports" in include:
-                tasks.append(("reports", pool.submit(self._research_context, "report", symbols, started)))
+                tasks.append(("reports", pool.submit(self._research_context, "report", symbols, started, cancel_event)))
             done, _ = wait([task for _, task in tasks], timeout=max(0.1, _LIVE_TIMEOUT_SECONDS - (time.monotonic() - started)))
+            if len(done) != len(tasks):
+                # Every data task checks this before starting another provider or
+                # symbol.  It prevents a timed-out context from continuing its
+                # serial refresh sequence in the background.
+                cancel_event.set()
             for name, task in tasks:
                 try:
                     value = task.result() if task in done else {"status": "partial", "error": "live request deadline reached"}
@@ -195,9 +205,10 @@ class UnifiedDataService:
                 else:
                     research[name] = value
         finally:
+            cancel_event.set()
             # A blocked upstream call must not extend the user-visible request
-            # budget. Running calls may finish their harmless cache write later;
-            # queued work is cancelled.
+            # budget. An in-flight socket may finish, but cooperative tasks do
+            # not begin another source or symbol after this point.
             pool.shutdown(wait=False, cancel_futures=True)
         status = self._overall_status(market, research)
         self.control.log_event(request_id, "context", status, f"purpose={purpose}")
@@ -213,29 +224,40 @@ class UnifiedDataService:
             "research": research,
             "policy": {
                 "historical": "cache_first_fill_gaps",
-                "mutable_tail": "live_first",
+                "mutable_tail": "scheduled_prewarm_cache_first_force_live_on_demand",
                 "price_sensitive": "two_source_quorum_then_third_on_conflict",
                 "news": "live_revalidated_with_historical_background_fallback",
                 "bar_preview": _AGENT_BAR_PREVIEW,
                 "bar_page_size": _BAR_PAGE_SIZE,
+                "reporting_guard": {
+                    "partial_mode": "no_price_or_position_actions",
+                    "confirmed_claim": "direct_source_url_and_timestamp_required",
+                },
             },
         }
 
-    def _market_context(self, symbols: list[str], profile: dict[str, Any], days: int, live: bool, started: float) -> dict[str, Any]:
-        result: dict[str, Any] = {"status": "offline", "series": [], "quotes": [], "runs": []}
+    def _market_context(
+        self,
+        symbols: list[str],
+        profile: dict[str, Any],
+        days: int,
+        live: bool,
+        started: float,
+        cancel_event: threading.Event,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {"status": "offline", "series": [], "bars_handles": [], "quotes": [], "runs": []}
         for interval, adjustment in profile["items"]:
-            if time.monotonic() - started >= _LIVE_TIMEOUT_SECONDS:
+            if cancel_event.is_set() or time.monotonic() - started >= _LIVE_TIMEOUT_SECONDS:
                 result["status"] = "partial"
                 result.setdefault("warnings", []).append("live request deadline reached")
                 break
-            item_live = live or interval in {"1m", "5m"}
+            item_live = live
             target_start = (date.today() - timedelta(days=days)).isoformat()
             cache_complete = self._has_coverage(symbols, interval, adjustment, target_start)
             run: dict[str, Any] | None = None
             # Settled historical data does not refetch merely because it was read.
             # Mutable intraday tails always revalidate, and any coverage gap is filled.
             if item_live or not cache_complete:
-                before = time.monotonic()
                 run = self.market_service.refresh_sync(
                     symbols=symbols,
                     profile="unified_data",
@@ -243,10 +265,14 @@ class UnifiedDataService:
                     start_date=target_start,
                     end_date=date.today().isoformat(),
                     items=[(interval, adjustment)],
+                    deadline=started + _LIVE_TIMEOUT_SECONDS,
+                    should_cancel=cancel_event.is_set,
                 )
-                latency_ms = round((time.monotonic() - before) * 1000, 1)
-                self._record_market_sources(run, latency_ms)
+                self._record_market_sources(run)
                 result["runs"].append({"run_id": run.get("run_id"), "status": run.get("status"), "interval": interval, "adjustment": adjustment})
+                if run.get("status") == "interrupted":
+                    result["status"] = "partial"
+                    result.setdefault("warnings", []).append("market refresh reached its source budget")
             for symbol in symbols:
                 bars = self.market_service.store.query_bars(
                     symbol=symbol, interval=interval, adjustment=adjustment,
@@ -259,10 +285,17 @@ class UnifiedDataService:
                 # Never stride-sample technical bars: this is the latest contiguous window.
                 summary["bars"] = bars[-_AGENT_BAR_PREVIEW:]
                 result["series"].append(summary)
+                result["bars_handles"].append({
+                    "symbol": symbol,
+                    "interval": interval,
+                    "adjustment": adjustment,
+                    "handle": handle,
+                })
         result["quotes"] = self.market_service.store.list_quotes(symbols)
         if result["series"]:
             statuses = {series["retrieval"]["mode"] for series in result["series"]}
-            result["status"] = "live" if statuses <= {"live"} else ("partial" if "offline" in statuses or "stale_cache" in statuses else "live")
+            computed_status = "live" if statuses <= {"live"} else ("partial" if "offline" in statuses or "stale_cache" in statuses else "live")
+            result["status"] = "partial" if result["status"] == "partial" else computed_status
         return result
 
     def _has_coverage(self, symbols: list[str], interval: str, adjustment: str, target_start: str) -> bool:
@@ -289,6 +322,11 @@ class UnifiedDataService:
             mode = "offline"
         elif live_requested and not live_sources:
             mode = "stale_cache"
+        elif not live_requested:
+            # Cache-first profiles deliberately avoid an in-request provider
+            # refresh.  Do not mislabel that read as live merely because the
+            # cached consensus is usable and verified.
+            mode = "cache"
         else:
             mode = "live"
         return {
@@ -310,22 +348,42 @@ class UnifiedDataService:
             },
         }
 
-    def _record_market_sources(self, run: dict[str, Any], latency_ms: float) -> None:
-        for item in run.get("items") or []:
-            sources = item.get("actual_sources") or []
-            for source in sources:
-                self.control.record_source(str(source), succeeded=True, latency_ms=latency_ms)
-            if not sources:
-                for message in [item.get("message") or "market source returned no usable bars"]:
-                    self.control.record_source("market", succeeded=False, latency_ms=latency_ms, error=str(message))
+    def _record_market_sources(self, run: dict[str, Any]) -> None:
+        """Record market-source successes and failures without mislabelling run time.
 
-    def _research_context(self, kind: str, symbols: list[str], started: float) -> dict[str, Any]:
+        A refresh run is serial across symbols, so its total duration is not a
+        single provider's latency.  Persist endpoint health by source instead;
+        the Data Center can then expose an Eastmoney failure even when Tencent
+        later supplied usable bars.
+        """
+        for item in run.get("items") or []:
+            sources = {str(source) for source in item.get("actual_sources") or []}
+            for source in sources:
+                self.control.record_source(f"{source}:market", succeeded=True)
+            requested = [str(source) for source in item.get("requested_sources") or []]
+            attempted = requested[:2]
+            message = str(item.get("message") or "")
+            if len(requested) > 2 and (requested[2] in sources or requested[2] in message):
+                attempted.append(requested[2])
+            for source in attempted:
+                if source in sources:
+                    continue
+                detail = next(
+                    (part.strip() for part in message.split(";") if part.strip().startswith(f"{source}:")),
+                    f"{source} returned no usable bars",
+                )
+                self.control.record_source(f"{source}:market", succeeded=False, error=detail)
+
+    def _research_context(
+        self, kind: str, symbols: list[str], started: float, cancel_event: threading.Event
+    ) -> dict[str, Any]:
         output: dict[str, Any] = {"status": "live", "items": {}}
         for symbol in symbols:
-            if time.monotonic() - started >= _LIVE_TIMEOUT_SECONDS:
+            if cancel_event.is_set() or time.monotonic() - started >= _LIVE_TIMEOUT_SECONDS:
                 output["status"] = "partial"
                 break
             try:
+                before = time.monotonic()
                 if kind == "news":
                     raw = self.news_tool.execute(code=symbol, limit=20)
                 elif kind == "report":
@@ -340,9 +398,12 @@ class UnifiedDataService:
                 if kind == "fundamental":
                     documents = [{"title": "annual indicators", "published_at": data.get("as_of") or data.get("report_date"), "summary": "latest annual indicator payload", "data": data}]
                 source = envelope.get("source")
+                self._record_research_sources(kind, symbol, source, succeeded=True, latency_ms=round((time.monotonic() - before) * 1000, 1))
+                self._record_declared_source_statuses(kind, data.get("source_statuses"))
                 self.research.replace_documents(kind, symbol, [item for item in documents if isinstance(item, dict)], source=str(source) if source else None)
                 output["items"][symbol] = {"mode": "live", "source": source, "documents": self.research.latest(kind, symbol)}
             except Exception as exc:
+                self._record_research_sources(kind, symbol, None, succeeded=False, error=str(exc))
                 cached = self.research.latest(kind, symbol)
                 output["status"] = "partial"
                 output["items"][symbol] = {
@@ -351,6 +412,41 @@ class UnifiedDataService:
                     "warning": "latest live research unavailable; cached material is historical background only" if cached else str(exc),
                 }
         return output
+
+    def _record_research_sources(
+        self,
+        kind: str,
+        symbol: str,
+        source: Any,
+        *,
+        succeeded: bool,
+        latency_ms: float | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Persist endpoint-level health for research adapters."""
+        if isinstance(source, str) and source.strip():
+            providers = [part.strip() for part in source.split("+") if part.strip()]
+        elif kind == "news":
+            providers = ["eastmoney"] if symbol.upper().endswith((".SH", ".SZ", ".BJ")) else ["yahoo"]
+        elif kind == "report":
+            providers = ["eastmoney"]
+        else:
+            providers = ["eastmoney"]
+        for provider in providers:
+            self.control.record_source(
+                f"{provider}:{kind}", succeeded=succeeded, latency_ms=latency_ms, error=error
+            )
+
+    def _record_declared_source_statuses(self, kind: str, statuses: Any) -> None:
+        """Apply a tool's granular provider outcome to endpoint health."""
+        if not isinstance(statuses, dict):
+            return
+        for provider, status in statuses.items():
+            if str(status).lower() in {"live", "ok", "success"}:
+                continue
+            self.control.record_source(
+                f"{provider}:{kind}", succeeded=False, error=f"provider declared {status}"
+            )
 
     @staticmethod
     def _overall_status(market: dict[str, Any], research: dict[str, Any]) -> str:
@@ -364,6 +460,8 @@ class UnifiedDataService:
     def read_bars(self, handle: str, cursor: int = 0) -> dict[str, Any]:
         params = self.control.get_handle(handle)
         if not params:
+            if self.control.get_request(handle) is not None:
+                raise KeyError("received a request_id, not a bars handle; use market.bars_handles[].handle from the context result")
             raise KeyError("unknown or expired data handle")
         bars = self.market_service.store.query_bars(
             symbol=params["symbol"], interval=params["interval"], adjustment=params["adjustment"],
@@ -466,7 +564,12 @@ class UnifiedDataService:
         if not symbols:
             raise ValueError("no holdings or explicit watchlist symbols to prewarm")
         purpose = "intraday" if phase == "intraday" else "premarket"
-        return self.get_context(symbols=symbols, purpose=purpose, include=["market", "news", "reports"])
+        return self.get_context(
+            symbols=symbols,
+            purpose=purpose,
+            include=["market", "news", "reports"],
+            force_live=True,
+        )
 
 
 _service: UnifiedDataService | None = None

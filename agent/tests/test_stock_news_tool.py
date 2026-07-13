@@ -9,6 +9,7 @@ client + tool parsing run fully offline.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -48,6 +49,31 @@ def _em_news_payload() -> dict[str, Any]:
     }
 
 
+def _em_stock_news_payload() -> dict[str, Any]:
+    """Eastmoney's per-security WAP list payload."""
+    return {
+        "code": 1,
+        "data": {
+            "list": [
+                {
+                    "Art_Title": "贵州茅台一季度净利大增",
+                    "Art_Url": "https://finance.eastmoney.com/a/1.html",
+                    "Art_MediaName": "东方财富",
+                    "Art_ShowTime": "2024-04-30 08:00:00",
+                    "Art_Summary": "公司披露一季报，营收同比增长 " * 30,
+                },
+                {
+                    "Art_Title": "白酒板块全线走强",
+                    "Art_Url": "https://finance.eastmoney.com/a/2.html",
+                    "Art_MediaName": "证券时报",
+                    "Art_ShowTime": "2024-04-29 18:30:00",
+                    "Art_Summary": "市场情绪回暖",
+                },
+            ]
+        },
+    }
+
+
 def _yahoo_matches() -> list[dict[str, Any]]:
     """A Yahoo search result list with two instrument matches."""
     return [
@@ -64,6 +90,14 @@ def _yahoo_matches() -> list[dict[str, Any]]:
             "quoteType": "EQUITY",
         },
     ]
+
+
+def _em_jsonp_response(payload: dict[str, Any]) -> SimpleNamespace:
+    """Return the JSONP shape emitted by Eastmoney's search endpoint."""
+    return SimpleNamespace(
+        text=f"jQuery3510({json.dumps(payload, ensure_ascii=False)})",
+        raise_for_status=lambda: None,
+    )
 
 
 class TestHelpers:
@@ -108,7 +142,7 @@ class TestExecuteSuccess:
     def test_a_share_stock_news(self) -> None:
         tool = StockNewsTool()
         with patch.object(
-            eastmoney_client, "throttled_get_json", return_value=_em_news_payload()
+            eastmoney_client, "throttled_get_json", return_value=_em_stock_news_payload()
         ) as http:
             out = json.loads(tool.execute(code="600519.SH", scope="stock", limit=10))
 
@@ -129,7 +163,7 @@ class TestExecuteSuccess:
     def test_global_scope_needs_no_code(self) -> None:
         tool = StockNewsTool()
         with patch.object(
-            eastmoney_client, "throttled_get_json", return_value=_em_news_payload()
+            eastmoney_client, "throttled_get_json", return_value={"code": 1, "data": {"list": _em_stock_news_payload()["data"]["list"]}}
         ):
             out = json.loads(tool.execute(scope="global"))
 
@@ -138,6 +172,18 @@ class TestExecuteSuccess:
         assert out["source"] == "eastmoney"
         assert out["data"]["scope"] == "global"
         assert len(out["data"]["articles"]) == 2
+
+    def test_jsonp_search_is_a_working_stock_news_fallback(self) -> None:
+        tool = StockNewsTool()
+        with patch.object(
+            eastmoney_client, "throttled_get_json", side_effect=RuntimeError("wap unavailable")
+        ), patch.object(
+            eastmoney_client, "throttled_get", return_value=_em_jsonp_response(_em_news_payload())
+        ):
+            out = json.loads(tool.execute(code="600519.SH", limit=1))
+
+        assert out["ok"] is True
+        assert len(out["data"]["articles"]) == 1
 
     def test_us_stock_via_yahoo_returns_matches_not_articles(self) -> None:
         tool = StockNewsTool()
@@ -172,6 +218,18 @@ class TestExecuteSuccess:
 
 
 class TestExecuteError:
+    def test_eastmoney_non_article_jsonp_is_an_error_not_a_healthy_empty_feed(self) -> None:
+        tool = StockNewsTool()
+        with patch.object(
+            eastmoney_client, "throttled_get_json", return_value={"result": {"passportWeb": []}}
+        ), patch.object(
+            eastmoney_client, "throttled_get", return_value=_em_jsonp_response({"result": {"passportWeb": []}})
+        ):
+            out = json.loads(tool.execute(code="600519.SH"))
+
+        assert out["ok"] is False
+        assert "missing cmsArticleWebOld" in out["error"]
+
     def test_missing_code_when_stock_scope(self) -> None:
         out = json.loads(StockNewsTool().execute(scope="stock"))
         assert out["ok"] is False
@@ -192,6 +250,10 @@ class TestExecuteError:
         with patch.object(
             eastmoney_client,
             "throttled_get_json",
+            side_effect=RuntimeError("eastmoney banned"),
+        ), patch.object(
+            eastmoney_client,
+            "throttled_get",
             side_effect=RuntimeError("eastmoney banned"),
         ):
             out = json.loads(tool.execute(code="600519.SH"))

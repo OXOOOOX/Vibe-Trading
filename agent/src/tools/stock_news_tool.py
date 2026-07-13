@@ -2,11 +2,11 @@
 
 Two public, no-auth news surfaces are wrapped behind one BaseTool contract:
 
-* China A-share (and general China-market finance) headlines come from
-  Eastmoney's free ``search-api`` news-list endpoint. Like every Eastmoney
-  surface it rate-limits by source IP, so the request routes through the frozen,
-  IP-throttled :mod:`backtest.loaders.eastmoney_client` rather than touching the
-  host directly.
+* China A-share headlines come from Eastmoney's stock-news list endpoint, with
+  its JSONP search endpoint retained as a fallback. General China-market
+  headlines use Eastmoney's public column feed. Like every Eastmoney surface,
+  requests route through the frozen, IP-throttled
+  :mod:`backtest.loaders.eastmoney_client` rather than touching the host directly.
 * US / HK have no free no-auth article feed here: the frozen
   :func:`backtest.loaders.yahoo_client.search` helper exposes only the search
   endpoint's instrument ``quotes`` (not its ``news`` array), so the tool returns
@@ -37,8 +37,11 @@ from src.agent.tools import BaseTool
 
 logger = logging.getLogger(__name__)
 
-# Eastmoney free news search endpoint (JSON list of CMS articles). It is the
-# same surface the site's search box calls; no auth, IP-throttled.
+# Eastmoney public news endpoints.  The WAP list endpoint is more stable for a
+# resolved security than the search endpoint; the latter remains a JSONP
+# fallback for transient WAP failures.
+_EM_STOCK_NEWS_URL = "https://np-listapi.eastmoney.com/comm/wap/getListInfo"
+_EM_GLOBAL_NEWS_URL = "https://np-listapi.eastmoney.com/comm/web/getNewsByColumns"
 _EM_NEWS_URL = "https://search-api-web.eastmoney.com/search/jsonp"
 
 # A-share / China-market suffixes that route to the Eastmoney news surface.
@@ -142,16 +145,16 @@ def _em_article(raw: dict[str, Any]) -> dict[str, Any]:
         A flat ``{title, url, source, published, snippet}`` record.
     """
     return {
-        "title": _snippet(raw.get("title")),
-        "url": raw.get("url"),
-        "source": raw.get("mediaName"),
-        "published": raw.get("date"),
-        "snippet": _snippet(raw.get("content")),
+        "title": _snippet(raw.get("Art_Title") or raw.get("title")),
+        "url": raw.get("Art_Url") or raw.get("Art_OriginUrl") or raw.get("uniqueUrl") or raw.get("url"),
+        "source": raw.get("Art_MediaName") or raw.get("mediaName"),
+        "published": raw.get("Art_ShowTime") or raw.get("showTime") or raw.get("date"),
+        "snippet": _snippet(raw.get("Art_Summary") or raw.get("summary") or raw.get("content")),
     }
 
 
-def _fetch_eastmoney_news(query: str, limit: int) -> list[dict[str, Any]]:
-    """Fetch China-market news headlines for a query from Eastmoney.
+def _fetch_eastmoney_search_news(query: str, limit: int) -> list[dict[str, Any]]:
+    """Fetch China-market news through Eastmoney's JSONP search fallback.
 
     Args:
         query: Free-text search term (bare code or keyword).
@@ -172,13 +175,22 @@ def _fetch_eastmoney_news(query: str, limit: int) -> list[dict[str, Any]]:
             "type": ["cmsArticleWebOld"],
             "client": "web",
             "clientType": "web",
-            "param": {"cmsArticleWebOld": {"searchScope": "default", "sort": "default", "pageIndex": 1, "pageSize": limit}},
+            "clientVersion": "curr",
+            "param": {"cmsArticleWebOld": {
+                "searchScope": "default", "sort": "default", "pageIndex": 1,
+                "pageSize": limit, "preTag": "<em>", "postTag": "</em>",
+            }},
         },
         ensure_ascii=False,
     )
-    payload = eastmoney_client.get_json(
+    # This endpoint returns JSONP even when ``cb`` is blank.  Using the generic
+    # JSON helper therefore fails before the tool gets a chance to unwrap it.
+    # Keep the request inside the shared Eastmoney throttle, but parse the raw
+    # text here with the endpoint-specific JSONP decoder below.
+    payload = eastmoney_client.get_text(
         _EM_NEWS_URL,
         params={"cb": "", "param": param, "_": "0"},
+        headers={"Referer": f"https://so.eastmoney.com/news/s?keyword={query}"},
     )
     decoded = _decode_jsonp(payload)
     if not isinstance(decoded, dict):
@@ -188,8 +200,57 @@ def _fetch_eastmoney_news(query: str, limit: int) -> list[dict[str, Any]]:
         return []
     articles = result.get("cmsArticleWebOld")
     if not isinstance(articles, list):
-        return []
+        # Eastmoney's IP-level risk control can return a successful JSONP
+        # envelope containing only unrelated passport data.  Treat that as an
+        # upstream failure, not a healthy empty news feed, so the unified layer
+        # keeps cached material clearly labelled and the Agent can use web
+        # search/read_url for a visible fallback.
+        keys = ", ".join(sorted(str(key) for key in result)) or "none"
+        raise RuntimeError(f"eastmoney news response missing cmsArticleWebOld (result keys: {keys})")
     return [_em_article(a) for a in articles if isinstance(a, dict)][:limit]
+
+
+def _fetch_eastmoney_stock_news(code: str, limit: int) -> list[dict[str, Any]]:
+    """Fetch one A-share's news from Eastmoney's stable stock list endpoint."""
+    secid = eastmoney_client.resolve_secid(code)
+    if not secid:
+        raise ValueError(f"could not resolve Eastmoney security id for {code}")
+    try:
+        payload = eastmoney_client.get_json(
+            _EM_STOCK_NEWS_URL,
+            params={
+                "client": "wap", "type": "1", "mTypeAndCode": secid,
+                "pageSize": str(limit), "pageIndex": "1",
+            },
+        )
+        rows = ((payload or {}).get("data") or {}).get("list") if isinstance(payload, dict) else None
+        if isinstance(rows, list):
+            return [_em_article(row) for row in rows if isinstance(row, dict)][:limit]
+        raise RuntimeError("eastmoney stock news response missing data.list")
+    except Exception as primary_error:
+        # The old endpoint is occasionally the only one available from a given
+        # network.  Its JSONP decoding is deliberately kept covered and bounded.
+        try:
+            return _fetch_eastmoney_search_news(_bare_query(code), limit)
+        except Exception as fallback_error:
+            raise RuntimeError(
+                f"stock news list failed ({primary_error}); JSONP fallback failed ({fallback_error})"
+            ) from fallback_error
+
+
+def _fetch_eastmoney_global_news(limit: int) -> list[dict[str, Any]]:
+    """Fetch broad China-market finance headlines from Eastmoney's column feed."""
+    payload = eastmoney_client.get_json(
+        _EM_GLOBAL_NEWS_URL,
+        params={
+            "client": "web", "biz": "web_news_col", "column": "350",
+            "pageSize": str(limit), "page": "1", "req_trace": "vibe-trading",
+        },
+    )
+    rows = ((payload or {}).get("data") or {}).get("list") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise RuntimeError("eastmoney global news response missing data.list")
+    return [_em_article(row) for row in rows if isinstance(row, dict)][:limit]
 
 
 def _yahoo_match(raw: dict[str, Any]) -> dict[str, Any]:
@@ -314,7 +375,7 @@ class StockNewsTool(BaseTool):
             A success or error JSON envelope.
         """
         try:
-            articles = _fetch_eastmoney_news(_GLOBAL_QUERY, limit)
+            articles = _fetch_eastmoney_global_news(limit)
         except Exception as exc:  # noqa: BLE001 - surface any fetch failure as envelope
             logger.warning("global news fetch failed: %s", exc)
             return self._error(f"eastmoney news fetch failed: {exc}")
@@ -351,7 +412,7 @@ class StockNewsTool(BaseTool):
     def _stock_via_eastmoney(self, code: str, query: str, limit: int) -> str:
         """Fetch A-share headlines from Eastmoney for one code."""
         try:
-            articles = _fetch_eastmoney_news(query, limit)
+            articles = _fetch_eastmoney_stock_news(code, limit)
         except Exception as exc:  # noqa: BLE001 - surface any fetch failure as envelope
             logger.warning("eastmoney news fetch failed for %s: %s", code, exc)
             return self._error(f"eastmoney news fetch failed: {exc}")

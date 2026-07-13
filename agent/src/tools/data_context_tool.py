@@ -18,8 +18,9 @@ class DataContextTool(BaseTool):
         "latest prices, news, and research reports. Select a purpose; the system enforces the "
         "minimum interval/history, keeps settled history cache-first, revalidates "
         "mutable prices and news live-first, and labels quorum/conflict/stale "
-        "fallback explicitly. Returned bars are the latest 120 contiguous bars; "
-        "use action='bars' and the returned handle for full contiguous pages."
+        "fallback explicitly. Returned bars are the latest 120 contiguous bars. "
+        "For full contiguous pages, copy a handle from market.bars_handles[] "
+        "(never use request_id) and call action='bars'."
     )
     repeatable = True
     is_readonly = False  # A live request may refresh the local continuity cache.

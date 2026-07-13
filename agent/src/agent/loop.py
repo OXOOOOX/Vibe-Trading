@@ -37,6 +37,12 @@ from src.goal.context import (
     goal_progress_tuple,
 )
 from src.providers.chat import ChatLLM, ProviderStreamError
+from src.portfolio.answer_guard import (
+    build_portfolio_conflict_fallback,
+    build_portfolio_correction_prompt,
+    compact_portfolio_tool_result,
+    find_portfolio_answer_conflict,
+)
 from src.tools.background_tools import get_background_manager
 from src.tools.redaction import redact_payload
 from src.tools.swarm_tool import extract_explicit_preset_name
@@ -547,6 +553,7 @@ class AgentLoop:
         llm_usage_summary = _new_llm_usage_summary(self.llm)
         goal_continuations = 0
         goal_last_progress: tuple[int, int] | None = None
+        portfolio_guard_retries = 0
         wrap_up_at = max(1, int(self.max_iterations * 0.8))
 
         try:
@@ -746,6 +753,60 @@ class AgentLoop:
                             }
                         )
                         break
+
+                    portfolio_conflict = find_portfolio_answer_conflict(
+                        messages, final_content
+                    )
+                    if portfolio_conflict is not None:
+                        can_retry = (
+                            portfolio_guard_retries == 0
+                            and iteration < self.max_iterations
+                        )
+                        trace.write(
+                            {
+                                "type": "portfolio_answer_conflict",
+                                "iter": current_iter,
+                                "matched_text": portfolio_conflict.matched_text,
+                                "holdings_count": len(portfolio_conflict.holdings),
+                                "action": "retry" if can_retry else "fallback",
+                            }
+                        )
+                        react_trace.append(
+                            {
+                                "type": "portfolio_answer_conflict",
+                                "matched_text": portfolio_conflict.matched_text,
+                                "holdings_count": len(portfolio_conflict.holdings),
+                                "action": "retry" if can_retry else "fallback",
+                            }
+                        )
+                        if can_retry:
+                            trace.write_text_entry(
+                                {
+                                    "type": "portfolio_conflicting_draft",
+                                    "iter": current_iter,
+                                },
+                                field="content",
+                                value=final_content,
+                                offload_kind=f"portfolio-conflicting-draft-{current_iter}",
+                            )
+                            messages.append(
+                                {"role": "assistant", "content": final_content}
+                            )
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": build_portfolio_correction_prompt(
+                                        portfolio_conflict
+                                    ),
+                                }
+                            )
+                            portfolio_guard_retries += 1
+                            final_content = ""
+                            continue
+                        final_content = build_portfolio_conflict_fallback(
+                            portfolio_conflict
+                        )
+
                     should_continue_goal = False
                     continuation_snapshot = None
                     if active_goal_id and session_id and GOAL_MAX_CONTINUATIONS > 0:
@@ -1315,7 +1376,11 @@ class AgentLoop:
             self._called_ok.add(tc.name)
 
         status = "ok" if success else "error"
-        truncated = result[:TOOL_RESULT_LIMIT]
+        truncated = (
+            compact_portfolio_tool_result(result, limit=TOOL_RESULT_LIMIT)
+            if tc.name == "portfolio_state"
+            else result[:TOOL_RESULT_LIMIT]
+        )
         messages.append(context.format_tool_result(tc.id, tc.name, truncated))
 
         trace_result = _redact_trace_result(result)

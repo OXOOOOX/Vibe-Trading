@@ -174,9 +174,16 @@ export const api = {
     }),
   getPortfolioReview: (limit?: number) =>
     request<PortfolioReview>(`/portfolio/review${limit ? `?limit=${encodeURIComponent(String(limit))}` : ""}`),
+  lookupPortfolioSecurity: (code: string, signal?: AbortSignal) =>
+    request<PortfolioSecurityLookup>(`/portfolio/security-lookup?code=${encodeURIComponent(code)}`, { signal }),
   updatePortfolioHoldings: (body: UpdatePortfolioHoldingsRequest) =>
     request<PortfolioReview>("/portfolio/holdings", {
       method: "POST",
+      body: JSON.stringify(body),
+    }),
+  editPortfolioHolding: (symbol: string, body: EditPortfolioHoldingRequest) =>
+    request<PortfolioReview>(`/portfolio/holdings/${encodeURIComponent(symbol)}`, {
+      method: "PATCH",
       body: JSON.stringify(body),
     }),
   recordPortfolioTrade: (body: RecordPortfolioTradeRequest) =>
@@ -184,6 +191,8 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  deletePortfolioTrade: (tradeId: string) =>
+    request<PortfolioReview>(`/portfolio/trades/${encodeURIComponent(tradeId)}`, { method: "DELETE" }),
   refreshPortfolioMarketData: (body: PortfolioMarketRefreshRequest = {}) =>
     request<PortfolioReview>("/portfolio/refresh-market-data", {
       method: "POST",
@@ -399,14 +408,27 @@ export interface UpdatePortfolioHoldingsRequest {
 }
 
 export interface RecordPortfolioTradeRequest {
-  code?: string;
-  symbol?: string;
-  name?: string;
-  side: string;
-  quantity?: number | null;
-  price?: number | null;
+  code: string;
+  symbol: string;
+  name: string;
+  side: "buy" | "sell";
+  quantity: number;
+  price: number;
   trade_date?: string;
   notes?: string;
+}
+
+export interface EditPortfolioHoldingRequest {
+  quantity?: number;
+  cost_price?: number;
+}
+
+export interface PortfolioSecurityLookup {
+  code: string;
+  symbol: string;
+  name: string;
+  market: string;
+  source: string;
 }
 
 export interface PortfolioMarketRefreshRequest {
@@ -549,10 +571,23 @@ export interface PortfolioHolding {
 
 export interface PortfolioStateSnapshot {
   holdings: PortfolioHolding[];
-  recent_trades: Array<Record<string, unknown>>;
+  recent_trades: PortfolioTrade[];
   cash?: number | null;
   cash_currency?: string;
   updated_at?: string | null;
+}
+
+export interface PortfolioTrade extends Record<string, unknown> {
+  trade_id: string;
+  code?: string;
+  symbol?: string;
+  name?: string;
+  side?: string;
+  quantity?: number | null;
+  price?: number | null;
+  trade_date?: string;
+  notes?: string;
+  recorded_at?: string;
 }
 
 export interface VerifiedMarketCacheRow {
