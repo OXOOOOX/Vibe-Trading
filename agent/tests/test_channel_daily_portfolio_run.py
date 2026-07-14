@@ -301,6 +301,80 @@ def test_channel_runtime_reuses_existing_holding_pdf_without_new_run(tmp_path: P
     assert daily.start_calls == 0
 
 
+def test_channel_runtime_can_rerun_daily_without_previous_run_id(tmp_path: Path) -> None:
+    async def scenario():
+        bus = MessageBus()
+        daily = FakeDailyRunService(tmp_path / "master.pdf")
+        runtime = ChannelRuntime(
+            bus=bus,
+            session_service=FakeSessionService(),
+            manager=None,
+            daily_run_service=daily,
+            session_map_path=tmp_path / "sessions.json",
+        )
+        await runtime._handle_daily_report_action(
+            InboundMessage(
+                channel="feishu",
+                sender_id="u1",
+                chat_id="c1",
+                content="",
+                metadata={
+                    "daily_report_action": "rerun_daily",
+                    "daily_run_id": "",
+                },
+            )
+        )
+        return daily
+
+    daily = asyncio.run(scenario())
+    assert daily.start_calls == 1
+    assert daily.record["status"] == "completed"
+
+
+def test_channel_runtime_does_not_redeliver_reused_scheduled_run(
+    tmp_path: Path,
+) -> None:
+    class ScheduledRunService:
+        async def start(self, **kwargs):
+            assert kwargs["trigger"] == "feishu"
+            return {
+                "run_id": "scheduled-run",
+                "market_date": "2026-07-14",
+                "status": "running",
+                "stage": "analyzing_holdings",
+                "trigger": "scheduled_0912",
+                "deduplicated": True,
+            }
+
+        async def wait(self, _run_id: str):
+            raise AssertionError("reused scheduled run must not be monitored twice")
+
+    async def scenario():
+        bus = MessageBus()
+        runtime = ChannelRuntime(
+            bus=bus,
+            session_service=FakeSessionService(),
+            manager=None,
+            daily_run_service=ScheduledRunService(),
+            session_map_path=tmp_path / "sessions.json",
+        )
+        await runtime._run_daily_portfolio(
+            InboundMessage(
+                channel="feishu",
+                sender_id="u1",
+                chat_id="c1",
+                content="启动组合晨会",
+                metadata={"daily_portfolio_run": True},
+            )
+        )
+        return await bus.consume_outbound()
+
+    message = asyncio.run(scenario())
+    assert message.metadata["scheduled_daily_reused"] is True
+    assert message.metadata["daily_run_id"] == "scheduled-run"
+    assert "不再重复生成或发送报告" in message.content
+
+
 def test_channel_runtime_does_not_claim_completion_when_data_gate_stops(tmp_path: Path) -> None:
     async def scenario():
         bus = MessageBus()
@@ -344,8 +418,10 @@ def test_scheduled_daily_delivery_waits_for_direct_channel_send(tmp_path: Path) 
     class DirectManager:
         def __init__(self) -> None:
             self.messages = []
+            self.ready = False
 
         async def send_direct(self, message):
+            assert self.ready is True
             self.messages.append(message)
 
     async def scenario():
@@ -359,6 +435,12 @@ def test_scheduled_daily_delivery_waits_for_direct_channel_send(tmp_path: Path) 
             daily_run_service=daily,
             session_map_path=tmp_path / "sessions.json",
         )
+
+        async def finish_manager_startup():
+            await asyncio.sleep(0.01)
+            manager.ready = True
+
+        runtime._manager_task = asyncio.create_task(finish_manager_startup())
         target = {
             "channel": "feishu",
             "chat_id": "ou_user",

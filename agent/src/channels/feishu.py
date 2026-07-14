@@ -1547,17 +1547,16 @@ class FeishuChannel(BaseChannel):
         elements: list[dict[str, Any]] = [
             {"tag": "markdown", "content": content}
         ]
-        if run_id:
-            elements.append(
-                cls._research_button(
-                    "手工重试组合晨会",
-                    "rerun_daily",
-                    route,
-                    button_type="primary",
-                    element_id="daily_failed_rerun",
-                    run_id=run_id,
-                )
+        elements.append(
+            cls._research_button(
+                "手工重试组合晨会",
+                "rerun_daily",
+                route,
+                button_type="primary",
+                element_id="daily_failed_rerun",
+                run_id=run_id,
             )
+        )
         return {
             "schema": "2.0",
             "config": {"wide_screen_mode": True, "update_multi": True},
@@ -3011,12 +3010,14 @@ class FeishuChannel(BaseChannel):
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu, including media (images/files) if present."""
         if not self._client:
-            self.logger.warning("client not initialized")
-            return
+            raise RuntimeError("Feishu client is not initialized")
 
         try:
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
+            require_delivery_receipt = bool(
+                msg.metadata.get("_require_delivery_receipt")
+            )
 
             if msg.metadata.get("_research_hub"):
                 chat_type = str(msg.metadata.get("chat_type") or "p2p")
@@ -3168,7 +3169,7 @@ class FeishuChannel(BaseChannel):
 
             first_send = True  # tracks whether the reply has already been used
 
-            def _do_send(m_type: str, content: str) -> None:
+            def _do_send(m_type: str, content: str) -> str | bool:
                 """Send via reply (first message) or create (subsequent).
 
                 Group chats only set reply_in_thread=True when
@@ -3184,7 +3185,7 @@ class FeishuChannel(BaseChannel):
                             reply_in_thread=self._should_use_reply_in_thread(msg.metadata),
                         )
                         if ok:
-                            return
+                            return ok
                     elif first_send:
                         # If we're not in a topic but replying to message, only first uses reply
                         first_send = False
@@ -3193,13 +3194,20 @@ class FeishuChannel(BaseChannel):
                             reply_in_thread=self._should_use_reply_in_thread(msg.metadata),
                         )
                         if ok:
-                            return
+                            return ok
                     # Fall back to regular send if reply fails
-                self._send_message_sync(receive_id_type, msg.chat_id, m_type, content)
+                message_id = self._send_message_sync(
+                    receive_id_type, msg.chat_id, m_type, content
+                )
+                if not message_id:
+                    raise RuntimeError(f"Feishu rejected the {m_type} message")
+                return message_id
 
             for file_path in msg.media:
                 if not os.path.isfile(file_path):
                     self.logger.warning("Media file not found: {}", file_path)
+                    if require_delivery_receipt:
+                        raise FileNotFoundError(file_path)
                     continue
                 ext = os.path.splitext(file_path)[1].lower()
                 if ext in self._IMAGE_EXTS:
@@ -3210,6 +3218,10 @@ class FeishuChannel(BaseChannel):
                             _do_send,
                             "image",
                             json.dumps({"image_key": key}, ensure_ascii=False),
+                        )
+                    elif require_delivery_receipt:
+                        raise RuntimeError(
+                            f"Feishu rejected image upload: {os.path.basename(file_path)}"
                         )
                 else:
                     key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
@@ -3228,6 +3240,10 @@ class FeishuChannel(BaseChannel):
                             _do_send,
                             media_type,
                             json.dumps({"file_key": key}, ensure_ascii=False),
+                        )
+                    elif require_delivery_receipt:
+                        raise RuntimeError(
+                            f"Feishu rejected file upload: {os.path.basename(file_path)}"
                         )
 
             if msg.metadata.get("portfolio_daily_complete"):

@@ -33,8 +33,13 @@ _PREWARM_SUCCESS_STATUSES = {
 _FINAL_DELIVERY_STATUSES = {
     "delivered",
     "shadow_suppressed",
-    "delivery_failed",
     "delivery_uncertain",
+    "origin_delivery_reused",
+}
+_DELIVERY_CLAIMABLE_STATUSES = {
+    "pending",
+    "delivery_waiting_target",
+    "delivery_waiting_record",
 }
 
 logger = logging.getLogger(__name__)
@@ -48,6 +53,13 @@ def _utc_now() -> str:
 
 def _row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
+
+
+def _append_error(current: Any, message: str) -> str:
+    value = str(current or "").strip()
+    if message in value:
+        return value
+    return f"{value}; {message}" if value else message
 
 
 class DailyScheduleStore:
@@ -162,14 +174,19 @@ class DailyScheduleStore:
     def begin_delivery(self, market_date: str) -> bool:
         """Claim delivery once; an ambiguous restart is never sent twice."""
 
+        placeholders = ", ".join("?" for _ in _DELIVERY_CLAIMABLE_STATUSES)
         with self._connect() as connection:
             cursor = connection.execute(
-                """
+                f"""
                 UPDATE daily_jobs
                 SET delivery_status = 'delivering', updated_at = ?
-                WHERE market_date = ? AND delivery_status = 'pending'
+                WHERE market_date = ? AND delivery_status IN ({placeholders})
                 """,
-                (_utc_now(), market_date),
+                (
+                    _utc_now(),
+                    market_date,
+                    *sorted(_DELIVERY_CLAIMABLE_STATUSES),
+                ),
             )
             return cursor.rowcount == 1
 
@@ -377,7 +394,31 @@ class DailyPortfolioScheduler:
         market_date = str(job["market_date"])
         try:
             if job["state"] in {"completed", "failed"}:
-                return await self._deliver_if_needed(job)
+                if str(job.get("mode") or "shadow") == "shadow":
+                    return await self._deliver_if_needed(job)
+                run_id = str(job.get("run_id") or "")
+                record = None
+                record_error: Exception | None = None
+                if run_id:
+                    try:
+                        record = self.run_service_factory().get_run(run_id)
+                    except Exception as exc:  # retry completed-record lookup next tick
+                        record_error = exc
+                if job["state"] == "completed" and record is None:
+                    return self.store.update(
+                        market_date,
+                        delivery_status="delivery_waiting_record",
+                        error=_append_error(
+                            job.get("error"),
+                            "completed run record is temporarily unavailable"
+                            + (
+                                f": {type(record_error).__name__}: {record_error}"
+                                if record_error is not None
+                                else ""
+                            ),
+                        ),
+                    )
+                return await self._deliver_if_needed(job, record=record)
 
             service = self.run_service_factory()
             run_id = str(job.get("run_id") or "")
@@ -421,6 +462,20 @@ class DailyPortfolioScheduler:
                 job = self.store.update(
                     market_date, state="running", run_id=str(record["run_id"])
                 )
+                target = self._target()
+                if (
+                    record.get("deduplicated") is True
+                    and target is not None
+                    and str(record.get("trigger") or "")
+                    == str(target.get("channel") or "")
+                ):
+                    # The same channel is already monitoring and delivering the
+                    # reused interactive run. Persist suppression before waiting
+                    # so a restart cannot send the same result a second time.
+                    job = self.store.update(
+                        market_date,
+                        delivery_status="origin_delivery_reused",
+                    )
 
             if record.get("status") not in (
                 _SUCCESS_RUN_STATUSES | _FAILED_RUN_STATUSES | {"interrupted"}
@@ -504,6 +559,24 @@ class DailyPortfolioScheduler:
         delivery_status = str(job.get("delivery_status") or "pending")
         if delivery_status in _FINAL_DELIVERY_STATUSES:
             return job
+        if delivery_status == "delivery_failed":
+            # Migrate scheduler rows created before retryable configuration
+            # failures had their own state. An external callback failure remains
+            # ambiguous and must never be resent blindly.
+            if "delivery target is not configured" in str(job.get("error") or ""):
+                job = self.store.update(
+                    market_date, delivery_status="delivery_waiting_target"
+                )
+                delivery_status = "delivery_waiting_target"
+            else:
+                return self.store.update(
+                    market_date,
+                    delivery_status="delivery_uncertain",
+                    error=_append_error(
+                        job.get("error"),
+                        "legacy delivery failure may already have been sent; not resent",
+                    ),
+                )
         if str(job.get("mode") or "shadow") == "shadow":
             return self.store.update(
                 market_date, delivery_status="shadow_suppressed"
@@ -512,15 +585,19 @@ class DailyPortfolioScheduler:
             return self.store.update(
                 market_date,
                 delivery_status="delivery_uncertain",
-                error=(job.get("error") or "")
-                + " delivery state was ambiguous after restart; not resent",
+                error=_append_error(
+                    job.get("error"),
+                    "delivery state was ambiguous after restart; not resent",
+                ),
             )
         target = self._target()
         if target is None or self.delivery_callback is None:
             return self.store.update(
                 market_date,
-                delivery_status="delivery_failed",
-                error=(job.get("error") or "") + " delivery target is not configured",
+                delivery_status="delivery_waiting_target",
+                error=_append_error(
+                    job.get("error"), "delivery target is not configured"
+                ),
             )
         if not self.store.begin_delivery(market_date):
             current = self.store.get(market_date) or job
@@ -536,12 +613,15 @@ class DailyPortfolioScheduler:
         except Exception as exc:  # noqa: BLE001 - never blindly resend an external message
             return self.store.update(
                 market_date,
-                delivery_status="delivery_failed",
-                error=(job.get("error") or "")
-                + f" delivery failed: {type(exc).__name__}: {exc}",
+                delivery_status="delivery_uncertain",
+                error=_append_error(
+                    job.get("error"),
+                    f"delivery failed ambiguously: {type(exc).__name__}: {exc}",
+                ),
             )
         return self.store.update(
             market_date,
             delivery_status="delivered",
             delivered_at=_utc_now(),
+            error=None,
         )

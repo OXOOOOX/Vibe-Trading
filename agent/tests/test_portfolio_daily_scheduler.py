@@ -161,6 +161,27 @@ def test_restart_recovers_one_interrupted_run(tmp_path: Path) -> None:
     assert result["delivery_status"] == "shadow_suppressed"
 
 
+def test_late_restart_does_not_create_missing_run_after_window(
+    tmp_path: Path,
+) -> None:
+    service = _RunService()
+    scheduler = DailyPortfolioScheduler(
+        lambda: service,
+        store=_store(tmp_path),
+        calendar=_Calendar(),
+        prewarm_status_provider=_prewarm(),
+        prewarm_wait_seconds=0,
+        mode_override="shadow",
+    )
+
+    late = datetime(2026, 7, 14, 10, 1, tzinfo=_TZ)
+    result = asyncio.run(scheduler.run_due_once(late))
+
+    assert result is None
+    assert service.starts == []
+    assert scheduler.status()["last_check"]["decision"] == "window_closed"
+
+
 def test_prewarm_timeout_forces_data_refresh(tmp_path: Path) -> None:
     service = _RunService()
     scheduler = DailyPortfolioScheduler(
@@ -216,6 +237,149 @@ def test_deliver_mode_waits_for_delivery_and_never_resends_after_restart(
 
     assert deliveries == [("run-1", "ou_user")]
     assert first["delivery_status"] == second["delivery_status"] == "delivered"
+
+
+def test_reused_feishu_run_is_not_delivered_by_scheduler_a_second_time(
+    tmp_path: Path,
+) -> None:
+    class ReusedRunService(_RunService):
+        async def start(self, **kwargs):
+            self.starts.append(kwargs)
+            record = {
+                "run_id": "manual-feishu-run",
+                "market_date": kwargs["market_date"],
+                "status": "completed",
+                "stage": "completed",
+                "revision": 1,
+                "trigger": "feishu",
+                "deduplicated": True,
+                "artifacts": [],
+                "error": None,
+            }
+            self.records[record["run_id"]] = record
+            return record
+
+    service = ReusedRunService()
+    store = _store(tmp_path)
+    store.remember_delivery_target(channel="feishu", chat_id="ou_user")
+    deliveries: list[str] = []
+
+    async def deliver(record, _job, _target):
+        deliveries.append(record["run_id"])
+
+    scheduler = DailyPortfolioScheduler(
+        lambda: service,
+        store=store,
+        calendar=_Calendar(),
+        prewarm_status_provider=_prewarm(),
+        delivery_callback=deliver,
+        prewarm_wait_seconds=0,
+        mode_override="deliver",
+    )
+
+    result = asyncio.run(scheduler.run_due_once(_DUE))
+
+    assert result["state"] == "completed"
+    assert result["delivery_status"] == "origin_delivery_reused"
+    assert deliveries == []
+
+
+def test_restart_delivers_completed_pending_job_with_persisted_run(
+    tmp_path: Path,
+) -> None:
+    service = _RunService()
+    service.records["persisted-run"] = {
+        "run_id": "persisted-run",
+        "market_date": "2026-07-14",
+        "status": "completed",
+        "stage": "completed",
+        "revision": 1,
+        "artifacts": [],
+    }
+    store = _store(tmp_path)
+    store.remember_delivery_target(channel="feishu", chat_id="ou_user")
+    store.claim("2026-07-14", mode="deliver")
+    store.update(
+        "2026-07-14",
+        state="completed",
+        run_id="persisted-run",
+        delivery_status="pending",
+    )
+    delivered: list[str] = []
+
+    async def deliver(record, _job, _target):
+        delivered.append(record["run_id"])
+
+    scheduler = DailyPortfolioScheduler(
+        lambda: service,
+        store=DailyScheduleStore(store.path),
+        calendar=_Calendar(),
+        delivery_callback=deliver,
+        prewarm_wait_seconds=0,
+        mode_override="deliver",
+    )
+
+    result = asyncio.run(scheduler.run_due_once(_DUE))
+
+    assert result["delivery_status"] == "delivered"
+    assert delivered == ["persisted-run"]
+
+
+def test_missing_delivery_target_retries_after_target_is_configured(
+    tmp_path: Path,
+) -> None:
+    service = _RunService()
+    store = _store(tmp_path)
+    delivered: list[str] = []
+
+    async def deliver(record, _job, _target):
+        delivered.append(record["run_id"])
+
+    scheduler = DailyPortfolioScheduler(
+        lambda: service,
+        store=store,
+        calendar=_Calendar(),
+        prewarm_status_provider=_prewarm(),
+        delivery_callback=deliver,
+        prewarm_wait_seconds=0,
+        mode_override="deliver",
+    )
+
+    first = asyncio.run(scheduler.run_due_once(_DUE))
+    store.remember_delivery_target(channel="feishu", chat_id="ou_user")
+    second = asyncio.run(scheduler.run_due_once(_DUE))
+
+    assert first["delivery_status"] == "delivery_waiting_target"
+    assert second["delivery_status"] == "delivered"
+    assert delivered == ["run-1"]
+
+
+def test_ambiguous_delivery_failure_is_not_retried(tmp_path: Path) -> None:
+    service = _RunService()
+    store = _store(tmp_path)
+    store.remember_delivery_target(channel="feishu", chat_id="ou_user")
+    attempts = 0
+
+    async def deliver(_record, _job, _target):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("connection closed after send")
+
+    scheduler = DailyPortfolioScheduler(
+        lambda: service,
+        store=store,
+        calendar=_Calendar(),
+        prewarm_status_provider=_prewarm(),
+        delivery_callback=deliver,
+        prewarm_wait_seconds=0,
+        mode_override="deliver",
+    )
+
+    first = asyncio.run(scheduler.run_due_once(_DUE))
+    second = asyncio.run(scheduler.run_due_once(_DUE))
+
+    assert first["delivery_status"] == second["delivery_status"] == "delivery_uncertain"
+    assert attempts == 1
 
 
 def test_failed_run_uses_same_single_delivery_path(tmp_path: Path) -> None:

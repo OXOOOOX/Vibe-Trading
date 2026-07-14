@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from datetime import date, datetime, time, timedelta
+from importlib.util import find_spec
+from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
+
+from src.config.paths import get_runtime_root
 
 
 _CN_TZ = ZoneInfo("Asia/Shanghai")
@@ -22,34 +27,139 @@ _SLOTS: tuple[tuple[str, time], ...] = (
 
 
 class ChinaMarketCalendar:
-    """Use AkShare's exchange calendar when available, with visible fallback."""
+    """Use the exchange calendar, retaining the last verified copy on disk."""
 
-    def __init__(self, calendar_fetcher: Callable[[], Any] | None = None) -> None:
+    def __init__(
+        self,
+        calendar_fetcher: Callable[[], Any] | None = None,
+        *,
+        cache_path: Path | None = None,
+    ) -> None:
         self.calendar_fetcher = calendar_fetcher
+        self.cache_path = cache_path or (
+            get_runtime_root() / "data" / "china_exchange_calendar.json"
+        )
         self._days: set[str] = set()
         self._loaded_at: datetime | None = None
+        self._source_mode = "uninitialized"
         self.mode = "uninitialized"
+        self._load_cache()
+
+    def _load_cache(self) -> None:
+        try:
+            payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
+            days = {
+                str(item)
+                for item in payload.get("days", [])
+                if len(str(item)) == 10
+            }
+            if not days:
+                return
+            loaded_at = datetime.fromisoformat(str(payload.get("updated_at") or ""))
+            if loaded_at.tzinfo is None:
+                loaded_at = loaded_at.replace(tzinfo=_CN_TZ)
+            self._days = days
+            self._loaded_at = loaded_at.astimezone(_CN_TZ)
+            self._source_mode = self.mode = "cached_exchange_calendar"
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return
+
+    def _save_cache(self, now: datetime) -> None:
+        payload = {
+            "schema_version": 1,
+            "updated_at": now.isoformat(),
+            "days": sorted(self._days),
+        }
+        temporary = self.cache_path.with_name(
+            f"{self.cache_path.name}.{os.getpid()}.{id(self)}.tmp"
+        )
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.cache_path)
+        except OSError:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _normalize_day(value: Any) -> str | None:
+        text = str(value).strip()[:10]
+        if len(text) == 8 and text.isdigit():
+            text = f"{text[:4]}-{text[4:6]}-{text[6:]}"
+        try:
+            return date.fromisoformat(text).isoformat()
+        except ValueError:
+            return None
+
+    @classmethod
+    def _extract_days(cls, payload: Any) -> set[str]:
+        if isinstance(payload, dict):
+            values = payload.get("days") or payload.get("trade_date") or []
+        elif isinstance(payload, (list, tuple, set)):
+            values = payload
+        else:
+            column = (
+                "trade_date"
+                if "trade_date" in payload.columns
+                else payload.columns[0]
+            )
+            values = payload[column].tolist()
+        return {
+            normalized
+            for item in values
+            if (normalized := cls._normalize_day(item)) is not None
+        }
+
+    @classmethod
+    def _default_calendar_payload(cls) -> Any:
+        # AkShare ships a decoded exchange calendar. Reading that data file does
+        # not import AkShare's optional JavaScript runtime, which can be absent
+        # even though the verified calendar itself is installed and current.
+        try:
+            spec = find_spec("akshare")
+        except (ImportError, ValueError):
+            spec = None
+        if spec is not None and spec.origin:
+            bundled_path = Path(spec.origin).parent / "file_fold" / "calendar.json"
+            try:
+                bundled = json.loads(bundled_path.read_text(encoding="utf-8"))
+                days = cls._extract_days(bundled)
+                if days and max(days) >= datetime.now(_CN_TZ).date().isoformat():
+                    return bundled
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+
+        import akshare as ak
+
+        return ak.tool_trade_date_hist_sina()
 
     def is_trading_day(self, value: date) -> bool:
         if value.weekday() >= 5:
             self.mode = "weekend"
             return False
+        self.mode = self._source_mode
         now = datetime.now(_CN_TZ)
         if self._loaded_at is None or now - self._loaded_at > timedelta(hours=24):
             try:
                 fetcher = self.calendar_fetcher
                 if fetcher is None:
-                    import akshare as ak
-
-                    fetcher = ak.tool_trade_date_hist_sina
+                    fetcher = self._default_calendar_payload
                 payload = fetcher()
-                column = "trade_date" if "trade_date" in payload.columns else payload.columns[0]
-                self._days = {str(item)[:10] for item in payload[column].tolist()}
+                days = self._extract_days(payload)
+                if not days:
+                    raise ValueError("exchange calendar returned no trading days")
+                self._days = days
                 self._loaded_at = now
-                self.mode = "exchange_calendar"
-            except Exception:  # A prewarm must not fail merely because calendar refresh failed.
-                self.mode = "weekday_fallback"
-        return value.isoformat() in self._days if self._days else True
+                self._source_mode = self.mode = "exchange_calendar"
+                self._save_cache(now)
+            except Exception:  # Keep the last verified calendar, otherwise fail closed.
+                self._loaded_at = now
+                self._source_mode = self.mode = (
+                    "cached_exchange_calendar" if self._days else "calendar_unavailable"
+                )
+        return value.isoformat() in self._days if self._days else False
 
 
 class DataPrewarmScheduler:

@@ -11,7 +11,7 @@ from src.data_layer.service import UnifiedDataService
 from src.data_layer.store import DataControlStore, ResearchCacheStore
 from src.market_cache.service import MarketRefreshService
 from src.market_cache.storage import MarketCacheStore
-from src.data_layer.prewarm import DataPrewarmScheduler
+from src.data_layer.prewarm import ChinaMarketCalendar, DataPrewarmScheduler
 from src.tools import build_registry
 
 
@@ -236,6 +236,57 @@ def test_registry_can_hide_low_level_data_tools_without_hiding_the_facade() -> N
     assert "get_market_data" not in registry.tool_names
     assert "verified_market_data" not in registry.tool_names
     assert "get_financial_statements" not in registry.tool_names
+
+
+class _CalendarPayload:
+    columns = ["trade_date"]
+
+    def __init__(self, days: list[str]) -> None:
+        self.days = days
+
+    def __getitem__(self, _key):
+        return self
+
+    def tolist(self) -> list[str]:
+        return self.days
+
+
+def test_market_calendar_fails_closed_without_verified_calendar(tmp_path: Path) -> None:
+    def unavailable():
+        raise RuntimeError("calendar unavailable")
+
+    calendar = ChinaMarketCalendar(
+        unavailable, cache_path=tmp_path / "missing-calendar.json"
+    )
+
+    assert calendar.is_trading_day(date(2026, 10, 1)) is False
+    assert calendar.mode == "calendar_unavailable"
+
+
+def test_market_calendar_reuses_persisted_verified_calendar(tmp_path: Path) -> None:
+    cache_path = tmp_path / "calendar.json"
+    fetched = ChinaMarketCalendar(
+        lambda: _CalendarPayload(["2026-07-14"]), cache_path=cache_path
+    )
+    assert fetched.is_trading_day(date(2026, 7, 14)) is True
+    assert cache_path.exists()
+
+    def unavailable():
+        raise RuntimeError("calendar unavailable")
+
+    cached = ChinaMarketCalendar(unavailable, cache_path=cache_path)
+    assert cached.is_trading_day(date(2026, 7, 14)) is True
+    assert cached.is_trading_day(date(2026, 10, 1)) is False
+    assert cached.mode == "cached_exchange_calendar"
+
+
+def test_market_calendar_accepts_bundled_compact_dates(tmp_path: Path) -> None:
+    calendar = ChinaMarketCalendar(
+        lambda: ["20260714", "20260715"], cache_path=tmp_path / "calendar.json"
+    )
+
+    assert calendar.is_trading_day(date(2026, 7, 14)) is True
+    assert calendar.is_trading_day(date(2026, 7, 16)) is False
 
 
 def test_prewarm_runs_each_market_calendar_slot_once() -> None:

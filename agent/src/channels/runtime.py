@@ -1316,6 +1316,29 @@ class ChannelRuntime:
             report_profile="master_with_holding_appendices",
             trigger=msg.channel,
         )
+        if (
+            record.get("deduplicated") is True
+            and record.get("trigger") == "scheduled_0912"
+        ):
+            run_id = str(record.get("run_id") or "")
+            self._daily_runs_by_chat[self._base_session_key(msg)] = run_id
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=(
+                        f"09:12 自动组合晨会 `{run_id}` 已在处理同一份输入，"
+                        "本次不再重复生成或发送报告。"
+                    ),
+                    metadata=self._response_metadata(
+                        msg,
+                        _channel_runtime=True,
+                        daily_run_id=run_id,
+                        scheduled_daily_reused=True,
+                    ),
+                )
+            )
+            return
         await self._monitor_daily_portfolio(msg, record)
 
     async def deliver_scheduled_daily(
@@ -1332,6 +1355,15 @@ class ChannelRuntime:
         chat_id = str(target.get("chat_id") or "")
         if not chat_id:
             raise RuntimeError("scheduled delivery chat is not configured")
+        if self._manager_task is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._manager_task), timeout=30.0
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"channel manager did not become ready for {channel}"
+                ) from exc
         chat_type = str(target.get("chat_type") or "p2p")
         session_key = str(target.get("session_key") or f"{channel}:{chat_id}")
         run_id = str((record or {}).get("run_id") or job.get("run_id") or "")
@@ -1499,6 +1531,17 @@ class ChannelRuntime:
         metadata = dict(msg.metadata or {})
         action = str(metadata.get("daily_report_action") or "")
         run_id = str(metadata.get("daily_run_id") or "")
+
+        if action == "rerun_daily":
+            rerun = await self.daily_run_service.start(
+                refresh_policy="force",
+                report_profile="master_with_holding_appendices",
+                trigger=msg.channel,
+                force_new=True,
+            )
+            await self._monitor_daily_portfolio(msg, rerun)
+            return
+
         record = self.daily_run_service.get_run(run_id) if run_id else None
         if not record:
             raise ValueError("找不到这次组合晨会，报告可能已过期。")
@@ -1572,16 +1615,6 @@ class ChannelRuntime:
             symbol = str(metadata.get("symbol") or "")
             retried = await self.daily_run_service.retry(run_id, symbol=symbol)
             await self._monitor_daily_portfolio(msg, retried)
-            return
-
-        if action == "rerun_daily":
-            rerun = await self.daily_run_service.start(
-                refresh_policy="force",
-                report_profile="master_with_holding_appendices",
-                trigger=msg.channel,
-                force_new=True,
-            )
-            await self._monitor_daily_portfolio(msg, rerun)
             return
 
         if action == "cancel_daily_run":

@@ -204,6 +204,35 @@ def test_channel_manager_status_includes_every_configured_adapter() -> None:
         assert status["slack"]["install_hint"].startswith("pip install")
 
 
+def test_channel_manager_direct_send_surfaces_failure_without_blind_retry() -> None:
+    class FailingChannel:
+        is_running = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def send(self, message: OutboundMessage) -> None:
+            self.calls += 1
+            assert message.metadata["_require_delivery_receipt"] is True
+            raise RuntimeError("connection closed after send")
+
+    manager = ChannelManager(
+        {"send_max_retries": 3},
+        MessageBus(),
+    )
+    channel = FailingChannel()
+    manager.channels["test"] = channel  # type: ignore[assignment]
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeError, match="connection closed after send"):
+            await manager.send_direct(
+                OutboundMessage(channel="test", chat_id="chat", content="report")
+            )
+
+    asyncio.run(scenario())
+    assert channel.calls == 1
+
+
 def test_registry_marks_lazy_sdk_adapter_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     import src.channels.discord as discord_channel
 

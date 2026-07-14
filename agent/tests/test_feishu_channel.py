@@ -4,6 +4,9 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
+
+from src.channels.bus.events import OutboundMessage
 from src.channels.bus.queue import MessageBus
 from src.channels.feishu import (
     FeishuChannel,
@@ -29,6 +32,27 @@ def test_feishu_defaults_to_mentions_and_topic_isolation() -> None:
     assert config.group_policy == "mention"
     assert config.topic_isolation is True
     assert config.streaming is True
+
+
+def test_feishu_strict_delivery_rejects_missing_provider_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = FeishuChannel(FeishuConfig(), MessageBus())
+    channel._client = object()
+    monkeypatch.setattr(channel, "_send_message_sync", lambda *_args: None)
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeError, match="rejected the text message"):
+            await channel.send(
+                OutboundMessage(
+                    channel="feishu",
+                    chat_id="ou_user",
+                    content="report",
+                    metadata={"_require_delivery_receipt": True},
+                )
+            )
+
+    asyncio.run(scenario())
 
 
 def test_feishu_group_policy_matches_only_the_bot_mention() -> None:
@@ -336,6 +360,21 @@ def test_feishu_daily_completion_and_holding_picker_use_artifact_callbacks() -> 
         for button in _elements_with_tag(failed, "button")
     ]
     assert failed_callbacks[0]["action"] == "rerun_daily"
+
+    failed_without_run = FeishuChannel._build_daily_failed_card(
+        "09:12 自动组合晨会生成失败。",
+        run_id="",
+        revision=1,
+        reply_chat_id="ou_user",
+        chat_type="p2p",
+        session_key=None,
+    )
+    no_run_callbacks = [
+        button["behaviors"][0]["value"]
+        for button in _elements_with_tag(failed_without_run, "button")
+    ]
+    assert no_run_callbacks[0]["action"] == "rerun_daily"
+    assert no_run_callbacks[0]["run_id"] == ""
 
 
 def test_feishu_custom_stock_prompt_keeps_one_explicit_target() -> None:

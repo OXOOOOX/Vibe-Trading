@@ -456,14 +456,29 @@ class ChannelManager:
         return self.channels.get(name)
 
     async def send_direct(self, msg: OutboundMessage) -> None:
-        """Deliver one message and wait for the adapter retry policy."""
+        """Attempt one externally visible delivery and surface ambiguity.
+
+        Scheduled delivery uses its own durable state machine.  Retrying here
+        after a connection-level failure could duplicate a message that the
+        provider accepted before the connection dropped, so this path makes a
+        single adapter call and lets the caller persist ``delivery_uncertain``.
+        """
 
         channel = self.channels.get(msg.channel)
         if channel is None:
             raise RuntimeError(f"channel is not configured: {msg.channel}")
         if not channel.is_running:
             raise RuntimeError(f"channel is not running: {msg.channel}")
-        await self._send_with_retry(channel, msg)
+        strict = OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=msg.content,
+            reply_to=msg.reply_to,
+            media=list(msg.media),
+            metadata={**dict(msg.metadata or {}), "_require_delivery_receipt": True},
+            buttons=list(msg.buttons),
+        )
+        await self._send_once(channel, strict)
 
     def get_status(self) -> dict[str, Any]:
         """Get status of all channels."""
