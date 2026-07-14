@@ -322,6 +322,21 @@ def test_feishu_daily_completion_and_holding_picker_use_artifact_callbacks() -> 
     ]
     assert skipped_callbacks[0]["action"] == "rerun_daily"
 
+    failed = FeishuChannel._build_daily_failed_card(
+        "09:12 自动组合晨会生成失败。",
+        run_id="dpr_1",
+        revision=2,
+        reply_chat_id="ou_user",
+        chat_type="p2p",
+        session_key=None,
+    )
+    assert failed["header"]["template"] == "red"
+    failed_callbacks = [
+        button["behaviors"][0]["value"]
+        for button in _elements_with_tag(failed, "button")
+    ]
+    assert failed_callbacks[0]["action"] == "rerun_daily"
+
 
 def test_feishu_custom_stock_prompt_keeps_one_explicit_target() -> None:
     prompt, label = FeishuChannel._build_research_prompt(

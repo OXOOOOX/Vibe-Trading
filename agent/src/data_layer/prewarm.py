@@ -70,6 +70,7 @@ class DataPrewarmScheduler:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._completed_slots: set[str] = set()
+        self._active_slots: set[str] = set()
         self.last_run: dict[str, Any] | None = None
 
     @staticmethod
@@ -110,11 +111,20 @@ class DataPrewarmScheduler:
             if key in self._completed_slots:
                 continue
             self._completed_slots.add(key)
+            self._active_slots.add(key)
+            self.last_run = {
+                "slot": key,
+                "phase": phase,
+                "status": "running",
+                "at": local_now.isoformat(),
+            }
             try:
                 result = await asyncio.to_thread(self.service_factory().prewarm, phase=phase)
                 record = {"slot": key, "phase": phase, "status": result.get("status", "completed"), "request_id": result.get("request_id"), "at": local_now.isoformat()}
             except Exception as exc:  # preserve the next slot even if one source has an outage
                 record = {"slot": key, "phase": phase, "status": "failed", "error": str(exc), "at": local_now.isoformat()}
+            finally:
+                self._active_slots.discard(key)
             self.last_run = record
             completed.append(record)
         # Bound dedupe memory to the recent trading week.
@@ -129,6 +139,7 @@ class DataPrewarmScheduler:
             "timezone": "Asia/Shanghai",
             "calendar_mode": self.calendar.mode,
             "slots": [{"phase": phase, "time": clock.strftime("%H:%M")} for phase, clock in _SLOTS],
+            "active_slots": sorted(self._active_slots),
             "last_run": self.last_run,
         }
 

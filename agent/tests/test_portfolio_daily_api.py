@@ -73,10 +73,27 @@ class FakeDailyService:
         return (artifact, self.master_path if artifact_id == "master" else self.holding_path) if artifact else None
 
 
+class FakeDailyScheduler:
+    async def start(self):
+        return None
+
+    async def stop(self):
+        return None
+
+    def status(self):
+        return {
+            "enabled": False,
+            "mode": "shadow",
+            "running": False,
+            "latest_job": None,
+        }
+
+
 def test_portfolio_mandate_and_daily_run_routes(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("VIBE_TRADING_PORTFOLIO_STATE_PATH", str(tmp_path / "state.json"))
     monkeypatch.setenv("VIBE_TRADING_PORTFOLIO_MANDATE_PATH", str(tmp_path / "mandate.json"))
     monkeypatch.setattr(api_server, "_portfolio_daily_service", FakeDailyService(tmp_path))
+    monkeypatch.setattr(api_server, "_portfolio_daily_scheduler", FakeDailyScheduler())
     client = TestClient(api_server.app, client=("127.0.0.1", 50000))
 
     seeded = client.post(
@@ -111,6 +128,9 @@ def test_portfolio_mandate_and_daily_run_routes(tmp_path, monkeypatch) -> None:
     assert fetched.status_code == 200
     assert all("path" not in item for item in fetched.json()["artifacts"])
     assert client.get("/portfolio/daily-runs/latest").json()["run_id"] == "dpr_api"
+    scheduler = client.get("/portfolio/daily-scheduler/status")
+    assert scheduler.status_code == 200
+    assert scheduler.json()["mode"] == "shadow"
     assert client.post("/portfolio/daily-runs/dpr_api/cancel").json()["status"] == "cancelling"
     retried = client.post(
         "/portfolio/daily-runs/dpr_api/retry", json={"symbol": "600036.SH"}

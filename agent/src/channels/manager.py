@@ -5,9 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from collections.abc import Callable
 from contextlib import suppress
-from pathlib import Path
 from typing import Any
 
 from src.channels.base import BaseChannel
@@ -456,6 +454,16 @@ class ChannelManager:
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""
         return self.channels.get(name)
+
+    async def send_direct(self, msg: OutboundMessage) -> None:
+        """Deliver one message and wait for the adapter retry policy."""
+
+        channel = self.channels.get(msg.channel)
+        if channel is None:
+            raise RuntimeError(f"channel is not configured: {msg.channel}")
+        if not channel.is_running:
+            raise RuntimeError(f"channel is not running: {msg.channel}")
+        await self._send_with_retry(channel, msg)
 
     def get_status(self) -> dict[str, Any]:
         """Get status of all channels."""

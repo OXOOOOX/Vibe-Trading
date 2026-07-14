@@ -1528,6 +1528,46 @@ class FeishuChannel(BaseChannel):
             },
         }
 
+    @classmethod
+    def _build_daily_failed_card(
+        cls,
+        content: str,
+        *,
+        run_id: str,
+        revision: int,
+        reply_chat_id: str,
+        chat_type: str,
+        session_key: str | None,
+    ) -> dict[str, Any]:
+        route = cls._research_route(
+            reply_chat_id=reply_chat_id,
+            chat_type=chat_type,
+            session_key=session_key,
+        )
+        elements: list[dict[str, Any]] = [
+            {"tag": "markdown", "content": content}
+        ]
+        if run_id:
+            elements.append(
+                cls._research_button(
+                    "手工重试组合晨会",
+                    "rerun_daily",
+                    route,
+                    button_type="primary",
+                    element_id="daily_failed_rerun",
+                    run_id=run_id,
+                )
+            )
+        return {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {
+                "template": "red",
+                "title": _plain_text(f"自动组合晨会失败 · revision {revision}"),
+            },
+            "body": {"elements": elements},
+        }
+
     async def _send_research_card(
         self, *, card: dict[str, Any], reply_chat_id: str, chat_type: str
     ) -> None:
@@ -3041,6 +3081,26 @@ class FeishuChannel(BaseChannel):
                 )
                 await self._send_research_card(
                     card=self._build_daily_skipped_card(
+                        msg.content,
+                        run_id=str(msg.metadata.get("daily_run_id") or ""),
+                        revision=int(msg.metadata.get("daily_run_revision") or 1),
+                        reply_chat_id=msg.chat_id,
+                        chat_type=chat_type,
+                        session_key=base_key,
+                    ),
+                    reply_chat_id=msg.chat_id,
+                    chat_type=chat_type,
+                )
+                return
+
+            if msg.metadata.get("portfolio_daily_failed"):
+                chat_type = str(msg.metadata.get("chat_type") or "p2p")
+                base_key = str(
+                    msg.metadata.get("research_base_session_key")
+                    or f"feishu:{msg.chat_id}"
+                )
+                await self._send_research_card(
+                    card=self._build_daily_failed_card(
                         msg.content,
                         run_id=str(msg.metadata.get("daily_run_id") or ""),
                         revision=int(msg.metadata.get("daily_run_revision") or 1),

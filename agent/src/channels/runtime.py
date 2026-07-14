@@ -189,6 +189,7 @@ class ChannelRuntime:
         manager: ChannelManager | None,
         dispatcher: Any | None = None,
         daily_run_service: Any | None = None,
+        daily_schedule_store: Any | None = None,
         session_map_path: Path | None = None,
         reply_timeout_s: float = 600.0,
         poll_interval_s: float = 0.25,
@@ -198,6 +199,7 @@ class ChannelRuntime:
         self.manager = manager
         self.dispatcher = dispatcher
         self.daily_run_service = daily_run_service
+        self.daily_schedule_store = daily_schedule_store
         self.config = ChannelRuntimeConfig(
             reply_timeout_s=reply_timeout_s,
             poll_interval_s=poll_interval_s,
@@ -1302,12 +1304,122 @@ class ChannelRuntime:
         """Run the report-oriented portfolio pipeline outside chat Session routing."""
         if self.daily_run_service is None:
             raise RuntimeError("组合晨会服务尚未启用")
+        if self.daily_schedule_store is not None:
+            self.daily_schedule_store.remember_delivery_target(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                chat_type=str((msg.metadata or {}).get("chat_type") or "p2p"),
+                session_key=self._base_session_key(msg),
+            )
         record = await self.daily_run_service.start(
             refresh_policy="ensure_fresh",
             report_profile="master_with_holding_appendices",
             trigger=msg.channel,
         )
         await self._monitor_daily_portfolio(msg, record)
+
+    async def deliver_scheduled_daily(
+        self,
+        record: dict[str, Any] | None,
+        job: dict[str, Any],
+        target: dict[str, str],
+    ) -> None:
+        """Synchronously deliver one terminal scheduled result."""
+
+        if self.manager is None:
+            raise RuntimeError("channel manager is not available")
+        channel = str(target.get("channel") or "feishu")
+        chat_id = str(target.get("chat_id") or "")
+        if not chat_id:
+            raise RuntimeError("scheduled delivery chat is not configured")
+        chat_type = str(target.get("chat_type") or "p2p")
+        session_key = str(target.get("session_key") or f"{channel}:{chat_id}")
+        run_id = str((record or {}).get("run_id") or job.get("run_id") or "")
+        common_metadata = {
+            "_channel_runtime": True,
+            "chat_type": chat_type,
+            "research_base_session_key": session_key,
+            "daily_run_id": run_id,
+            "daily_run_revision": int((record or {}).get("revision") or 1),
+            "scheduled_portfolio_daily": True,
+        }
+
+        if not record or record.get("status") not in {
+            "completed",
+            "completed_with_warnings",
+        }:
+            error = str(
+                (record or {}).get("error")
+                or job.get("error")
+                or "晨会未生成报告"
+            )
+            await self.manager.send_direct(
+                OutboundMessage(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content=(
+                        "09:12 自动组合晨会生成失败。\n"
+                        f"运行：{run_id or '未创建'}\n"
+                        f"原因：{error}\n"
+                        "请检查持仓或数据状态后手工重试。"
+                    ),
+                    metadata={**common_metadata, "portfolio_daily_failed": True},
+                )
+            )
+            return
+
+        if record.get("stage") == "skipped_data_unavailable":
+            gate = record.get("analysis_gate") or {}
+            await self.manager.send_direct(
+                OutboundMessage(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content=(
+                        "09:12 自动组合晨会因关键数据覆盖不足而停止，未生成 PDF。\n"
+                        f"覆盖：{gate.get('eligible_count', 0)}/{gate.get('total_count', 0)}"
+                    ),
+                    metadata={**common_metadata, "portfolio_daily_skipped": True},
+                )
+            )
+            return
+
+        master = next(
+            (
+                item
+                for item in record.get("artifacts") or []
+                if item.get("kind") == "master_pdf"
+                and not item.get("expired")
+                and not item.get("superseded")
+            ),
+            None,
+        )
+        if master is None or not master.get("path"):
+            raise RuntimeError("scheduled report completed without a master PDF")
+        counts = record.get("summary") or {}
+        holding_reports = self._daily_report_options(record)
+        decision_text = self._daily_decision_text(record)
+        content = (
+            f"✅ 09:12 自动组合晨会已完成｜{record.get('market_date')}｜"
+            f"revision {record.get('revision', 1)}\n"
+            f"退出 {counts.get('exit', 0)} · 减仓 {counts.get('reduce', 0)} · "
+            f"加仓 {counts.get('add', 0)} · 观察 {counts.get('observe', 0)}\n"
+            f"个股 PDF {len(holding_reports)} 份。综合报告已附上。"
+            f"{f'{chr(10)}{decision_text}' if decision_text else ''}"
+        )
+        await self.manager.send_direct(
+            OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content=content,
+                media=[str(master["path"])],
+                metadata={
+                    **common_metadata,
+                    "portfolio_daily_complete": True,
+                    "holding_reports": holding_reports,
+                    "delivery_mode": "report_pdf",
+                },
+            )
+        )
 
     def _daily_report_options(self, record: dict[str, Any]) -> list[dict[str, Any]]:
         """Return callback-safe holding report descriptors without local paths."""

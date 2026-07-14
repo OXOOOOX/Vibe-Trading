@@ -50,17 +50,22 @@ def _retention_days() -> int:
 
 def _data_status(contexts: list[dict[str, Any]]) -> str:
     statuses = {str(item.get("status") or "offline") for item in contexts}
-    if "offline" in statuses:
-        return "offline"
-    if statuses & {"partial", "limited", "stale_cache"}:
-        return "limited"
     series = [
         item
         for context in contexts
         for item in ((context.get("market") or {}).get("series") or [])
     ]
-    if any(str(item.get("actionability") or "analysis_only") != "price_actionable" for item in series):
+    if not series:
+        return "offline" if statuses == {"offline"} else "limited"
+    actionabilities = [
+        str(item.get("actionability") or "analysis_only") for item in series
+    ]
+    if not any(item == "price_actionable" for item in actionabilities):
         return "limited"
+    if any(item != "price_actionable" for item in actionabilities):
+        return "partial"
+    if statuses & {"offline", "partial", "limited", "stale_cache"}:
+        return "partial"
     return "ok"
 
 

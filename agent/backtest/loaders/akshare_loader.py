@@ -23,6 +23,22 @@ _INTERVAL_MAP_DAILY = {
     "1M": "monthly",
 }
 
+_FOREX_CURRENCIES = {
+    "AUD",
+    "CAD",
+    "CHF",
+    "CNY",
+    "EUR",
+    "GBP",
+    "HKD",
+    "JPY",
+    "NOK",
+    "NZD",
+    "SEK",
+    "SGD",
+    "USD",
+}
+
 
 def _is_a_share(code: str) -> bool:
     return code.upper().endswith((".SZ", ".SH", ".BJ"))
@@ -50,11 +66,17 @@ def _is_forex(code: str) -> bool:
     and previously fell through to the A-share endpoint.
     """
     upper = code.upper().removesuffix(".FX")
+    standard_pair = (
+        len(upper) == 6
+        and upper[:3] in _FOREX_CURRENCIES
+        and upper[3:] in _FOREX_CURRENCIES
+        and upper[:3] != upper[3:]
+    )
     try:
         from akshare.forex.cons import symbol_market_map
     except Exception:
-        return False
-    return upper in symbol_market_map
+        return standard_pair
+    return standard_pair or upper in symbol_market_map
 
 
 @register

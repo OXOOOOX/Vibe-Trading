@@ -783,11 +783,14 @@ async def _run_startup_preflight() -> None:
         dispatcher.start()
     if _env_flag_enabled("VIBE_TRADING_CHANNELS_AUTO_START"):
         await _start_channel_runtime()
+    await _get_portfolio_daily_scheduler().start()
 
 
 @app.on_event("shutdown")
 async def _stop_scheduled_research_on_shutdown() -> None:
     """Stop channel, message-dispatch, and scheduled workers on shutdown."""
+    if _portfolio_daily_scheduler is not None:
+        await _portfolio_daily_scheduler.stop()
     await _stop_channel_runtime()
     if _session_dispatcher is not None:
         await _session_dispatcher.stop()
@@ -2505,6 +2508,7 @@ _channel_bus = None
 _channel_manager = None
 _goal_store = None
 _portfolio_daily_service = None
+_portfolio_daily_scheduler = None
 
 
 def _get_session_service():
@@ -2575,6 +2579,32 @@ def _get_portfolio_daily_service():
     return _portfolio_daily_service
 
 
+async def _deliver_scheduled_portfolio_result(record, job, target) -> None:
+    """Deliver a scheduled result only after its durable job reaches terminal state."""
+
+    runtime = _get_channel_runtime()
+    if not runtime.status().get("running"):
+        await runtime.start(start_manager=True)
+    await runtime.deliver_scheduled_daily(record, job, target)
+
+
+def _get_portfolio_daily_scheduler():
+    """Return the durable, default-off 09:12 portfolio scheduler."""
+
+    global _portfolio_daily_scheduler
+    if _portfolio_daily_scheduler is None:
+        from src.data_layer.prewarm import get_data_prewarm_scheduler
+        from src.portfolio.daily import DailyPortfolioScheduler
+
+        prewarm = get_data_prewarm_scheduler()
+        _portfolio_daily_scheduler = DailyPortfolioScheduler(
+            _get_portfolio_daily_service,
+            prewarm_status_provider=prewarm.status,
+            delivery_callback=_deliver_scheduled_portfolio_result,
+        )
+    return _portfolio_daily_scheduler
+
+
 def _get_channel_runtime():
     """Lazy-init the official IM runtime with the persistent dispatcher."""
     global _channel_runtime, _channel_bus, _channel_manager
@@ -2600,6 +2630,7 @@ def _get_channel_runtime():
         manager=_channel_manager,
         dispatcher=dispatcher,
         daily_run_service=_get_portfolio_daily_service(),
+        daily_schedule_store=_get_portfolio_daily_scheduler().store,
         reply_timeout_s=float(config.get("reply_timeout_s", 600.0)),
     )
     return _channel_runtime
@@ -4741,6 +4772,7 @@ register_portfolio_daily_routes(
     app,
     require_local_or_auth,
     get_service=_get_portfolio_daily_service,
+    get_scheduler=_get_portfolio_daily_scheduler,
 )
 
 # ============================================================================

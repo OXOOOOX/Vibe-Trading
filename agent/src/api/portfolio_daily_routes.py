@@ -56,6 +56,7 @@ def register_portfolio_daily_routes(
     require_local_or_auth: Callable[..., Any],
     *,
     get_service: Callable[[], DailyPortfolioRunService],
+    get_scheduler: Callable[[], Any] | None = None,
 ) -> None:
     dependency = [Depends(require_local_or_auth)]
 
@@ -87,6 +88,12 @@ def register_portfolio_daily_routes(
     @app.get("/portfolio/daily-runs", dependencies=dependency)
     async def list_daily_runs(limit: int = Query(30, ge=1, le=200)):
         return {"runs": [_public_run(item) for item in get_service().list_runs(limit)]}
+
+    if get_scheduler is not None:
+
+        @app.get("/portfolio/daily-scheduler/status", dependencies=dependency)
+        async def get_portfolio_daily_scheduler_status():
+            return get_scheduler().status()
 
     @app.get("/portfolio/daily-runs/latest", dependencies=dependency)
     async def get_latest_daily_run():

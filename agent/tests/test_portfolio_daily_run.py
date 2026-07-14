@@ -9,7 +9,7 @@ from src.portfolio.daily.reporting import (
     render_holding_markdown,
     render_master_markdown,
 )
-from src.portfolio.daily.service import DailyPortfolioRunService
+from src.portfolio.daily.service import DailyPortfolioRunService, _data_status
 from src.portfolio.daily.store import DailyRunStore
 from src.portfolio.mandate import default_mandate, save_mandate
 from src.portfolio.state import PortfolioState
@@ -78,6 +78,41 @@ def fake_pdf(title: str, content: str) -> bytes:
 
 def forbidden_pdf(title: str, content: str) -> bytes:
     raise AssertionError("data gate must stop before rendering PDFs")
+
+
+def test_data_status_is_partial_when_only_some_domains_or_symbols_are_limited() -> None:
+    research_partial = {
+        "status": "partial",
+        "market": {
+            "series": [
+                {"symbol": "600036.SH", "actionability": "price_actionable"}
+            ]
+        },
+    }
+    mixed_market = {
+        "status": "ok",
+        "market": {
+            "series": [
+                {"symbol": "600036.SH", "actionability": "price_actionable"},
+                {"symbol": "513120.SH", "actionability": "analysis_only"},
+            ]
+        },
+    }
+
+    assert _data_status([research_partial]) == "partial"
+    assert _data_status([mixed_market]) == "partial"
+    assert _data_status(
+        [
+            {
+                "status": "partial",
+                "market": {
+                    "series": [
+                        {"symbol": "513120.SH", "actionability": "analysis_only"}
+                    ]
+                },
+            }
+        ]
+    ) == "limited"
 
 
 def portfolio() -> PortfolioState:

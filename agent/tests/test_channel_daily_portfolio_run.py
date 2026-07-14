@@ -340,6 +340,50 @@ def test_channel_runtime_does_not_claim_completion_when_data_gate_stops(tmp_path
     assert not any(item.metadata.get("portfolio_daily_complete") for item in messages)
 
 
+def test_scheduled_daily_delivery_waits_for_direct_channel_send(tmp_path: Path) -> None:
+    class DirectManager:
+        def __init__(self) -> None:
+            self.messages = []
+
+        async def send_direct(self, message):
+            self.messages.append(message)
+
+    async def scenario():
+        daily = FakeDailyRunService(tmp_path / "master.pdf")
+        completed = await daily.wait("dpr_test")
+        manager = DirectManager()
+        runtime = ChannelRuntime(
+            bus=MessageBus(),
+            session_service=FakeSessionService(),
+            manager=manager,
+            daily_run_service=daily,
+            session_map_path=tmp_path / "sessions.json",
+        )
+        target = {
+            "channel": "feishu",
+            "chat_id": "ou_user",
+            "chat_type": "p2p",
+            "session_key": "feishu:ou_user",
+        }
+        await runtime.deliver_scheduled_daily(
+            completed,
+            {"run_id": "dpr_test", "state": "completed"},
+            target,
+        )
+        await runtime.deliver_scheduled_daily(
+            {"run_id": "dpr_failed", "status": "failed", "error": "source timeout"},
+            {"run_id": "dpr_failed", "state": "failed"},
+            target,
+        )
+        return manager.messages
+
+    completed, failed = asyncio.run(scenario())
+    assert completed.metadata["portfolio_daily_complete"] is True
+    assert completed.media == [str(tmp_path / "master.pdf")]
+    assert failed.metadata["portfolio_daily_failed"] is True
+    assert "source timeout" in failed.content
+
+
 def test_stock_analysis_reuses_todays_session_and_report_for_followups(tmp_path: Path) -> None:
     async def scenario():
         symbol = "600036.SH"
