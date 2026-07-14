@@ -56,6 +56,7 @@ class DataLoader:
         *,
         interval: str = "1D",
         fields: Optional[List[str]] = None,
+        strict: bool = False,
     ) -> Dict[str, pd.DataFrame]:
         """Fetch OHLCV data via BaoStock.
 
@@ -75,6 +76,8 @@ class DataLoader:
         lg = bs.login()
         if lg.error_code != "0":
             logger.error("baostock login failed: %s", lg.error_msg)
+            if strict:
+                raise RuntimeError(f"baostock login failed: {lg.error_msg}")
             return {}
 
         result: Dict[str, pd.DataFrame] = {}
@@ -94,6 +97,8 @@ class DataLoader:
                         result[code] = df
                 except Exception as exc:
                     logger.warning("baostock failed for %s: %s", code, exc)
+                    if strict:
+                        raise
         finally:
             bs.logout()
 

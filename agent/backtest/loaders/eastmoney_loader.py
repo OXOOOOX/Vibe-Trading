@@ -33,6 +33,23 @@ _OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
 _OPTIONAL_COLUMNS = ["amount"]
 
 
+def _consume_transport_events() -> list[dict[str, object]]:
+    """Drain optional transport diagnostics without breaking quote retrieval.
+
+    The diagnostics hook was added after the Eastmoney adapter itself.  A
+    long-running process can therefore briefly hold an older client module
+    while a newer loader is imported.  Missing diagnostics must never turn a
+    valid market-data request into a provider failure.
+    """
+    consume = getattr(eastmoney_client, "consume_transport_events", None)
+    if not callable(consume):
+        return []
+    try:
+        return list(consume() or [])
+    except Exception:  # pragma: no cover - diagnostics are deliberately best effort
+        return []
+
+
 def _to_compact_date(value: str) -> str:
     """Convert a ``YYYY-MM-DD`` date into Eastmoney's ``YYYYMMDD`` form.
 
@@ -59,6 +76,9 @@ class DataLoader:
     markets = {"a_share", "hk_equity", "us_equity"}
     requires_auth = False
 
+    def __init__(self) -> None:
+        self.transport_events: list[dict[str, object]] = []
+
     def is_available(self) -> bool:
         """Always available — uses unauthenticated throttled HTTP."""
         return True
@@ -73,6 +93,7 @@ class DataLoader:
         fields: Optional[List[str]] = None,
         adjustment: str = "qfq",
         request_timeout_s: float | None = None,
+        strict: bool = False,
     ) -> Dict[str, pd.DataFrame]:
         """Fetch OHLCV for each symbol; a single failure never aborts the batch.
 
@@ -98,6 +119,7 @@ class DataLoader:
         include_amount = bool(fields and "amount" in fields)
 
         result: Dict[str, pd.DataFrame] = {}
+        _consume_transport_events()
         for code in codes:
             try:
                 df = cached_loader_fetch(
@@ -116,6 +138,11 @@ class DataLoader:
                     result[code] = df
             except Exception as exc:  # noqa: BLE001 - one bad symbol must not abort
                 logger.warning("eastmoney failed for %s: %s", code, exc)
+                self.transport_events.extend(_consume_transport_events())
+                if strict:
+                    raise
+            else:
+                self.transport_events.extend(_consume_transport_events())
         return result
 
     def _fetch_one(

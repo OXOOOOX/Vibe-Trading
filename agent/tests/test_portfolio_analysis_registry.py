@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from src.session.service import _CHANNEL_RESEARCH_TOOL_NAMES, _PORTFOLIO_ANALYSIS_TOOL_NAMES
+from src.session.service import (
+    _CHANNEL_RESEARCH_TOOL_NAMES,
+    _PORTFOLIO_ANALYSIS_TOOL_NAMES,
+    _PORTFOLIO_DAILY_RUN_TOOL_NAMES,
+)
 
 
 def test_portfolio_analysis_registry_excludes_order_execution_tools() -> None:
@@ -52,3 +56,10 @@ def test_channel_research_registry_allows_backtests_but_excludes_remote_controls
     }
     assert not forbidden & allowed
     assert not any(name.startswith("trading_") for name in allowed)
+
+
+def test_portfolio_daily_run_registry_cannot_refetch_or_mutate_state() -> None:
+    allowed = set(_PORTFOLIO_DAILY_RUN_TOOL_NAMES)
+
+    assert allowed == {"load_skill"}
+    assert not {"portfolio_state", "get_data_context", "write_file", "run_swarm"} & allowed

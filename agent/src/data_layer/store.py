@@ -85,10 +85,14 @@ class DataControlStore:
 
                 CREATE TABLE IF NOT EXISTS source_health (
                     source TEXT PRIMARY KEY,
+                    requested_source TEXT,
+                    actual_source TEXT,
+                    upstream_source TEXT,
                     consecutive_failures INTEGER NOT NULL DEFAULT 0,
                     circuit_open_until TEXT,
                     last_status TEXT NOT NULL,
                     last_latency_ms REAL,
+                    error_category TEXT,
                     last_error TEXT,
                     updated_at TEXT NOT NULL
                 );
@@ -103,6 +107,13 @@ class DataControlStore:
                 );
                 """
             )
+            health_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(source_health)").fetchall()
+            }
+            for column in ("requested_source", "actual_source", "upstream_source", "error_category"):
+                if column not in health_columns:
+                    conn.execute(f"ALTER TABLE source_health ADD COLUMN {column} TEXT")
 
     def start_request(self, request_id: str, fingerprint: str, purpose: str, symbols: list[str]) -> None:
         with self.connect() as conn:
@@ -163,32 +174,72 @@ class DataControlStore:
         with self.connect() as conn:
             return bool(conn.execute("DELETE FROM manual_watchlist WHERE symbol=?", (symbol.strip().upper(),)).rowcount)
 
-    def record_source(self, source: str, *, succeeded: bool, latency_ms: float | None = None, error: str | None = None) -> None:
+    def record_source(
+        self,
+        source: str,
+        *,
+        succeeded: bool,
+        latency_ms: float | None = None,
+        error: str | None = None,
+        status: str | None = None,
+        error_category: str | None = None,
+        requested_source: str | None = None,
+        actual_source: str | None = None,
+        upstream_source: str | None = None,
+    ) -> None:
         now = utc_now()
         with self.connect() as conn:
             current = conn.execute("SELECT consecutive_failures FROM source_health WHERE source=?", (source,)).fetchone()
-            failures = 0 if succeeded else int(current["consecutive_failures"] if current else 0) + 1
+            lowered_error = str(error or "").lower()
+            resolved_category = error_category or (
+                "transport_error"
+                if any(token in lowered_error for token in ("timeout", "timed out", "connection", "network", "socket"))
+                else None
+            )
+            availability_failure = (resolved_category or "") in {"transport_error", "rate_limited"}
+            failures = (
+                0 if succeeded or not availability_failure
+                else int(current["consecutive_failures"] if current else 0) + 1
+            )
             # Three transport failures open a five-minute circuit. A later success closes it.
             circuit = None
-            if failures >= 3:
+            if availability_failure and failures >= 3:
                 circuit = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
             conn.execute(
-                "INSERT INTO source_health(source, consecutive_failures, circuit_open_until, last_status, last_latency_ms, last_error, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source) DO UPDATE SET "
+                "INSERT INTO source_health(source, requested_source, actual_source, upstream_source, "
+                "consecutive_failures, circuit_open_until, last_status, last_latency_ms, error_category, last_error, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source) DO UPDATE SET "
+                "requested_source=excluded.requested_source, actual_source=excluded.actual_source, "
+                "upstream_source=excluded.upstream_source, "
                 "consecutive_failures=excluded.consecutive_failures, circuit_open_until=excluded.circuit_open_until, "
                 "last_status=excluded.last_status, last_latency_ms=excluded.last_latency_ms, "
-                "last_error=excluded.last_error, updated_at=excluded.updated_at",
-                (source, failures, circuit, "ok" if succeeded else "failed", latency_ms, error, now),
+                "error_category=excluded.error_category, last_error=excluded.last_error, updated_at=excluded.updated_at",
+                (
+                    source, requested_source, actual_source, upstream_source, failures, circuit,
+                    status or ("ok" if succeeded else "failed"), latency_ms, resolved_category, error, now,
+                ),
             )
 
     def source_health(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute("SELECT * FROM source_health ORDER BY source").fetchall()
-        now = utc_now()
+        now = datetime.now(timezone.utc)
         records = []
         for row in rows:
             item = dict(row)
-            item["circuit_open"] = bool(item["circuit_open_until"] and item["circuit_open_until"] > now)
+            circuit_until = item.get("circuit_open_until")
+            item["circuit_open"] = bool(
+                circuit_until and datetime.fromisoformat(str(circuit_until).replace("Z", "+00:00")) > now
+            )
+            source_name, _, capability = str(item.get("source") or "").partition(":")
+            item["requested_source"] = item.get("requested_source") or source_name
+            item["actual_source"] = item.get("actual_source") or source_name
+            item["upstream_source"] = item.get("upstream_source") or item["actual_source"]
+            item["capability"] = capability or "general"
+            updated = datetime.fromisoformat(str(item["updated_at"]).replace("Z", "+00:00"))
+            ttl = timedelta(minutes=30) if capability == "market" else timedelta(hours=6)
+            item["stale"] = now - updated > ttl
+            item["effective_status"] = "stale" if item["stale"] else item["last_status"]
             records.append(item)
         return records
 

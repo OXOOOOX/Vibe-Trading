@@ -26,18 +26,22 @@ import {
   type PortfolioAnalysisScope,
   type PortfolioAnalysisSession,
   type MarketCacheRun,
+  type PortfolioDailyRun,
   type PortfolioHolding,
+  type PortfolioMandate,
   type PortfolioReview,
   type PortfolioTrade,
   type VerifiedMarketCacheRow,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import MarketCacheKlineDialog from "@/components/portfolio/MarketCacheKlineDialog";
+import PortfolioDailyRunPanel from "@/components/portfolio/PortfolioDailyRunPanel";
 
 const ACTIVE_REFRESH_KEY = "vibe-trading:portfolio-market-refresh:v1";
 const ANALYSIS_RUNS_STORAGE_KEY = "vibe-trading:portfolio-analysis-runs:v1";
 const TERMINAL_REFRESH_STATUSES = new Set(["completed", "partial", "failed", "interrupted"]);
 const ACTIVE_ANALYSIS_STATUSES = new Set(["queued", "running"]);
+const ACTIVE_DAILY_RUN_STATUSES = new Set(["queued", "running", "cancelling"]);
 
 const HOLDING_SORT_COLUMNS = [
   { key: "name", label: "名称" },
@@ -257,8 +261,6 @@ export function Portfolio() {
   const [refreshing, setRefreshing] = useState(false);
   const [refreshRun, setRefreshRun] = useState<MarketCacheRun | null>(null);
   const [holdingsText, setHoldingsText] = useState("");
-  const [cash, setCash] = useState("");
-  const [cashCurrency, setCashCurrency] = useState("CNY");
   const [savingHoldings, setSavingHoldings] = useState(false);
   const [tradeForm, setTradeForm] = useState(createEmptyTradeForm);
   const [savingTrade, setSavingTrade] = useState(false);
@@ -270,6 +272,12 @@ export function Portfolio() {
   const [analysisRuns, setAnalysisRuns] = useState<Record<string, PortfolioAnalysisSession>>(loadSavedAnalysisRuns);
   const [startingAnalysisKey, setStartingAnalysisKey] = useState<string | null>(null);
   const [analysisClock, setAnalysisClock] = useState(Date.now);
+  const [mandate, setMandate] = useState<PortfolioMandate | null>(null);
+  const [dailyRun, setDailyRun] = useState<PortfolioDailyRun | null>(null);
+  const [loadingMandate, setLoadingMandate] = useState(true);
+  const [savingMandate, setSavingMandate] = useState(false);
+  const [savingCash, setSavingCash] = useState(false);
+  const [startingDailyRun, setStartingDailyRun] = useState(false);
   const completedRefreshRef = useRef<string | null>(null);
 
   const loadReview = useCallback(async (mode: "initial" | "refresh" = "refresh") => {
@@ -290,9 +298,58 @@ export function Portfolio() {
     }
   }, []);
 
+  const loadMorningMeeting = useCallback(async () => {
+    setLoadingMandate(true);
+    try {
+      const [nextMandate, runs] = await Promise.all([
+        api.getPortfolioMandate(),
+        api.listPortfolioDailyRuns(1),
+      ]);
+      setMandate(nextMandate);
+      setDailyRun(runs.runs[0] || null);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "加载组合晨会设置失败");
+    } finally {
+      setLoadingMandate(false);
+    }
+  }, []);
+
   useEffect(() => {
-    void loadReview("initial");
-  }, [loadReview]);
+    void Promise.all([loadReview("initial"), loadMorningMeeting()]);
+  }, [loadReview, loadMorningMeeting]);
+
+  useEffect(() => {
+    if (!dailyRun || !ACTIVE_DAILY_RUN_STATUSES.has(dailyRun.status)) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const next = await api.getPortfolioDailyRun(dailyRun.run_id);
+        if (cancelled) return;
+        setDailyRun(next);
+        if (!ACTIVE_DAILY_RUN_STATUSES.has(next.status)) {
+          if (next.status === "completed") toast.success("组合晨会报告已生成。");
+          else if (next.status === "completed_with_warnings") {
+            toast.warning(
+              next.stage === "skipped_data_unavailable"
+                ? "数据覆盖不足，已跳过报告与模型分析。"
+                : "组合晨会已完成，部分标的使用保守降级结果。",
+            );
+          }
+          else if (next.status === "failed") toast.error(next.error || "组合晨会生成失败。");
+          return;
+        }
+        timer = setTimeout(poll, 1500);
+      } catch {
+        if (!cancelled) timer = setTimeout(poll, 2500);
+      }
+    };
+    timer = setTimeout(poll, 600);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [dailyRun?.run_id, dailyRun?.status]);
 
   useEffect(() => {
     const code = tradeForm.code.trim();
@@ -461,6 +518,101 @@ export function Portfolio() {
     }
   };
 
+  const saveMorningMeetingMandate = async (nextMandate: PortfolioMandate) => {
+    setSavingMandate(true);
+    try {
+      const saved = await api.updatePortfolioMandate(nextMandate);
+      setMandate(saved);
+      toast.success("组合目标已保存，下次晨会按新版本执行。");
+      return true;
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "保存组合目标失败");
+      return false;
+    } finally {
+      setSavingMandate(false);
+    }
+  };
+
+  const savePortfolioCash = async (nextCash: number, currency: string) => {
+    setSavingCash(true);
+    try {
+      const saved = await api.updatePortfolioCash({ cash: nextCash, cash_currency: currency });
+      setReview(saved);
+      toast.success("当前现金已更新，不会改动持仓。");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "更新现金失败");
+    } finally {
+      setSavingCash(false);
+    }
+  };
+
+  const updateMorningMeetingAssignment = async (symbol: string, sleeveId: string) => {
+    try {
+      const saved = await api.updatePortfolioAssignment(symbol, sleeveId);
+      toast.success(`${symbol} 分区已锁定。`);
+      return saved;
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "更新持仓分区失败");
+      return null;
+    }
+  };
+
+  const startMorningMeeting = async () => {
+    setStartingDailyRun(true);
+    try {
+      const run = await api.startPortfolioDailyRun({ refresh_policy: "ensure_fresh" });
+      setDailyRun(run);
+      toast.success(run.deduplicated ? "已恢复今天相同输入的组合晨会。" : "组合晨会已启动。");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "启动组合晨会失败");
+    } finally {
+      setStartingDailyRun(false);
+    }
+  };
+
+  const retryMorningMeeting = async () => {
+    if (!dailyRun) return;
+    setStartingDailyRun(true);
+    try {
+      const legacyDataLimited = (
+        !dailyRun.analysis_gate
+        && ["limited", "offline"].includes(dailyRun.data_status || "")
+      );
+      const run = legacyDataLimited
+        ? await api.startPortfolioDailyRun({ refresh_policy: "ensure_fresh", force_new: true })
+        : await api.retryPortfolioDailyRun(dailyRun.run_id);
+      setDailyRun(run);
+      toast.success("已重新获取数据；只有数据门禁通过后才会启动报告模型。");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "重试组合晨会失败");
+    } finally {
+      setStartingDailyRun(false);
+    }
+  };
+
+  const retryMorningMeetingHolding = async (symbol: string) => {
+    if (!dailyRun) return;
+    setStartingDailyRun(true);
+    try {
+      const run = await api.retryPortfolioDailyRun(dailyRun.run_id, symbol);
+      setDailyRun(run);
+      toast.success(`${symbol} 已进入单股重试；组合结论和综合 PDF 会同步生成新 revision。`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "重试个股日报失败");
+    } finally {
+      setStartingDailyRun(false);
+    }
+  };
+
+  const cancelMorningMeeting = async () => {
+    if (!dailyRun) return;
+    try {
+      setDailyRun(await api.cancelPortfolioDailyRun(dailyRun.run_id));
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "取消组合晨会失败");
+    }
+  };
+
   const startAnalysis = async (scope: PortfolioAnalysisScope, holding?: PortfolioHolding) => {
     const symbol = scope === "holding" ? holdingSymbol(holding || {}) : undefined;
     const key = analysisTargetKey(scope, symbol);
@@ -512,7 +664,11 @@ export function Portfolio() {
       holdingCount: holdings.length,
       tradeCount: review?.portfolio_state.recent_trades.length || 0,
       cacheCount: caches.length,
-      conflictCount: caches.filter((row) => row.status === "conflict").length,
+      conflictCount: caches.filter((row) => row.status === "unresolved_conflict").length,
+      singleSourceCount: caches.filter((row) => row.status === "single_source").length,
+      lagCount: caches.filter((row) => row.status === "source_lag").length,
+      provisionalCount: caches.filter((row) => row.status === "provisional_mix").length,
+      basisMismatchCount: caches.filter((row) => row.status === "basis_mismatch").length,
       totalMarketValue,
     };
   }, [review]);
@@ -546,8 +702,6 @@ export function Portfolio() {
     try {
       const payload = await api.updatePortfolioHoldings({
         raw_text: holdingsText,
-        cash: cash.trim() ? Number(cash) : undefined,
-        cash_currency: cashCurrency.trim() || "CNY",
       });
       setReview(payload);
       setHoldingsText("");
@@ -700,6 +854,26 @@ export function Portfolio() {
 
         {refreshRun ? <RefreshProgress run={refreshRun} /> : null}
 
+        <PortfolioDailyRunPanel
+          mandate={mandate}
+          holdings={review?.portfolio_state.holdings || []}
+          currentCash={review?.portfolio_state.cash ?? null}
+          cashCurrency={review?.portfolio_state.cash_currency || "CNY"}
+          run={dailyRun}
+          loading={loadingMandate}
+          saving={savingMandate}
+          savingCash={savingCash}
+          starting={startingDailyRun}
+          onSave={saveMorningMeetingMandate}
+          onSaveCash={savePortfolioCash}
+          onAssign={updateMorningMeetingAssignment}
+          onStart={startMorningMeeting}
+          onRetry={retryMorningMeeting}
+          onRetryHolding={retryMorningMeetingHolding}
+          onCancel={cancelMorningMeeting}
+          artifactUrl={api.portfolioDailyRunArtifactUrl}
+        />
+
         {loading ? (
           <div className="grid gap-3 md:grid-cols-4">
             {[1, 2, 3, 4].map((item) => (
@@ -710,13 +884,17 @@ export function Portfolio() {
 
         {!loading ? (
           <>
-            <section className="grid gap-3 md:grid-cols-6">
+            <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-10">
               <SummaryTile label="持仓数" value={String(summary.holdingCount)} />
               <SummaryTile label="现金" value={`${fmtNumber(review?.portfolio_state.cash, 2)} ${review?.portfolio_state.cash_currency || "CNY"}`} />
               <SummaryTile label="总市值" value={fmtNumber(summary.totalMarketValue, 2)} />
               <SummaryTile label="交易记录" value={String(summary.tradeCount)} />
               <SummaryTile label="缓存数" value={String(summary.cacheCount)} />
               <SummaryTile label="冲突缓存" value={String(summary.conflictCount)} danger={summary.conflictCount > 0} />
+              <SummaryTile label="单一来源" value={String(summary.singleSourceCount)} />
+              <SummaryTile label="来源延迟" value={String(summary.lagCount)} />
+              <SummaryTile label="盘中旧值" value={String(summary.provisionalCount)} />
+              <SummaryTile label="口径不符" value={String(summary.basisMismatchCount)} />
             </section>
 
             <section className="grid gap-4 lg:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
@@ -732,20 +910,7 @@ export function Portfolio() {
                   placeholder="支持完整券商表，也支持：名称 证券代码 持仓数量 成本价；个股无ETF 会按已知别名补全代码。"
                   className="w-full resize-y rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/30"
                 />
-                <div className="mt-3 grid gap-3 sm:grid-cols-[1fr_8rem_auto]">
-                  <input
-                    value={cash}
-                    onChange={(event) => setCash(event.target.value)}
-                    inputMode="decimal"
-                    placeholder="现金"
-                    className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/30"
-                  />
-                  <input
-                    value={cashCurrency}
-                    onChange={(event) => setCashCurrency(event.target.value)}
-                    placeholder="CNY"
-                    className="rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/30"
-                  />
+                <div className="mt-3 flex justify-end">
                   <button
                     type="submit"
                     disabled={savingHoldings}
@@ -918,8 +1083,12 @@ function refreshStatusLabel(status: string): string {
     partial: "部分完成",
     verified: "已校核",
     single_source: "单一来源",
+    source_lag: "来源延迟",
+    provisional_mix: "盘中旧值已隔离",
+    basis_mismatch: "复权口径不符",
+    unresolved_conflict: "未解决冲突",
     stale: "已过期",
-    conflict: "有冲突",
+    conflict: "旧版冲突",
     unresolved: "未解析",
     failed: "失败",
     interrupted: "已中断",
@@ -1391,7 +1560,7 @@ function CacheTable({
             ) : (
               groups.map((group) => (
                 <Fragment key={group.symbol}>
-                  <tr className={cn("border-t-2 bg-muted/40", group.status === "conflict" && "bg-destructive/10")} data-cache-group={group.symbol}>
+                  <tr className={cn("border-t-2 bg-muted/40", group.status === "unresolved_conflict" && "bg-destructive/10")} data-cache-group={group.symbol}>
                     <td colSpan={12} className="px-3 py-2.5">
                       <div className="flex flex-wrap items-center justify-between gap-3">
                         <div className="flex min-w-0 flex-wrap items-center gap-2.5">
@@ -1419,7 +1588,7 @@ function CacheTable({
                     const expanded = expandedCachePath === row.path;
                     return (
                       <Fragment key={row.path}>
-                        <tr className={cn("border-t bg-background", row.status === "conflict" && "bg-destructive/5")}>
+                        <tr className={cn("border-t bg-background", row.status === "unresolved_conflict" && "bg-destructive/5")}>
                           <td className="px-2 py-2">
                             <button
                               type="button"
@@ -1506,15 +1675,21 @@ function groupCacheRows(caches: VerifiedMarketCacheRow[], holdings: PortfolioHol
         return (adjustmentOrder.get(leftAdjustment) ?? 99) - (adjustmentOrder.get(rightAdjustment) ?? 99);
       });
       const statuses = new Set(rows.map((row) => row.status || "unknown"));
-      const status = statuses.has("conflict")
-        ? "conflict"
-        : statuses.has("unresolved")
-          ? "unresolved"
-          : statuses.has("stale")
-            ? "stale"
-            : statuses.has("single_source")
-              ? "single_source"
-              : "verified";
+      const status = statuses.has("unresolved_conflict")
+        ? "unresolved_conflict"
+        : statuses.has("basis_mismatch")
+          ? "basis_mismatch"
+          : statuses.has("source_lag")
+            ? "source_lag"
+            : statuses.has("provisional_mix")
+              ? "provisional_mix"
+              : statuses.has("unresolved")
+                ? "unresolved"
+                : statuses.has("stale")
+                  ? "stale"
+                  : statuses.has("single_source")
+                    ? "single_source"
+                    : "verified";
       return {
         symbol,
         name: holdingNames.get(symbol),
@@ -1554,6 +1729,8 @@ function CacheDetails({ row }: { row: VerifiedMarketCacheRow }) {
             <KeyValue label="成交额" value={fmtNumber(obs.amount, 2)} />
             <KeyValue label="VWAP" value={fmtNumber(obs.vwap)} />
             <KeyValue label="时间" value={fmtDate(obs.date)} />
+            <KeyValue label="获取时间" value={fmtDate(obs.retrieved_at)} />
+            <KeyValue label="刷新批次" value={fmtText(obs.batch_id)} />
             <KeyValue label="置信度" value={fmtText(obs.adjustment_confidence)} />
             <KeyValue label="获取方式" value={fmtText(obs.acquisition_mode)} />
             <KeyValue label="纳入共识" value={obs.included_in_consensus ? "是" : "否"} />
@@ -1568,9 +1745,9 @@ function StatusPill({ status }: { status?: string }) {
   const value = status || "unknown";
   const tone = value === "verified" || value === "completed"
     ? "success"
-    : value === "conflict" || value === "failed"
+    : value === "unresolved_conflict" || value === "conflict" || value === "failed"
       ? "danger"
-      : ["single_source", "stale", "partial", "interrupted"].includes(value)
+      : ["single_source", "source_lag", "provisional_mix", "basis_mismatch", "stale", "partial", "interrupted"].includes(value)
         ? "warning"
         : "neutral";
   return (

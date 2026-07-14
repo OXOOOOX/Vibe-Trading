@@ -43,6 +43,13 @@ def get_loader(source: str):
     return get_loader_cls_with_fallback(source)
 
 
+def get_loader_strict(source: str):
+    """Get exactly ``source`` without registry fallback."""
+    from backtest.loaders.registry import get_loader_cls_strict
+
+    return get_loader_cls_strict(source)
+
+
 def cap_rows(records: list, max_rows: int) -> list | dict[str, object]:
     """Bound a per-symbol row list to keep tool payloads within budget."""
     n = len(records)

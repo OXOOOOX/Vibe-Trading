@@ -26,6 +26,7 @@ from src.channels.research_sessions import (
 )
 from src.channels.utils import safe_filename
 from src.config.paths import get_data_dir
+from src.portfolio.state import normalize_symbol
 from src.session.models import Message, Session
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,37 @@ _REPORT_DATE_CN = re.compile(r"(?<!\d)(20\d{2})年(\d{1,2})月(\d{1,2})日")
 _REPORT_TRAILING_DATE = re.compile(
     r"[\s:：_—-]*(?:20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}|20\d{2}年\d{1,2}月\d{1,2}日)\s*$"
 )
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _shanghai_date(value: str | None = None) -> str:
+    """Return an ISO date interpreted in the user's market timezone."""
+    if not value:
+        return datetime.now(_SHANGHAI_TZ).date().isoformat()
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_SHANGHAI_TZ)
+    else:
+        parsed = parsed.astimezone(_SHANGHAI_TZ)
+    return parsed.date().isoformat()
+
+
+def _shanghai_time(value: str | None) -> str:
+    """Format a persisted timestamp as a compact Shanghai time label."""
+    if not value:
+        return "今天"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return "今天"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_SHANGHAI_TZ)
+    else:
+        parsed = parsed.astimezone(_SHANGHAI_TZ)
+    return parsed.strftime("%H:%M")
 
 
 def _render_research_pdf(title: str, content: str, target: Path) -> Path:
@@ -156,6 +188,7 @@ class ChannelRuntime:
         session_service: Any,
         manager: ChannelManager | None,
         dispatcher: Any | None = None,
+        daily_run_service: Any | None = None,
         session_map_path: Path | None = None,
         reply_timeout_s: float = 600.0,
         poll_interval_s: float = 0.25,
@@ -164,6 +197,7 @@ class ChannelRuntime:
         self.session_service = session_service
         self.manager = manager
         self.dispatcher = dispatcher
+        self.daily_run_service = daily_run_service
         self.config = ChannelRuntimeConfig(
             reply_timeout_s=reply_timeout_s,
             poll_interval_s=poll_interval_s,
@@ -174,6 +208,7 @@ class ChannelRuntime:
         self._manager_task: asyncio.Task[Any] | None = None
         self._handler_tasks: set[asyncio.Task[None]] = set()
         self._running = False
+        self._daily_runs_by_chat: dict[str, str] = {}
 
     async def start(self, *, start_manager: bool = True) -> None:
         """Start channel processing and, optionally, platform adapters."""
@@ -267,8 +302,22 @@ class ChannelRuntime:
                 await self._publish_sessions(msg)
                 return
 
+            if str((msg.metadata or {}).get("stock_research_action") or ""):
+                prepared = await self._handle_stock_research_action(msg)
+                if prepared is None:
+                    return
+                msg = prepared
+
             if bool((msg.metadata or {}).get("pdf_from_previous_report")):
                 await self._send_previous_report_pdf(msg)
+                return
+
+            if str((msg.metadata or {}).get("daily_report_action") or ""):
+                await self._handle_daily_report_action(msg)
+                return
+
+            if bool((msg.metadata or {}).get("daily_portfolio_run")):
+                await self._run_daily_portfolio(msg)
                 return
 
             session_id = self._session_for(msg)
@@ -687,6 +736,383 @@ class ChannelRuntime:
             )
             return []
 
+    @staticmethod
+    def _session_stock_symbol(session: Any) -> str:
+        config = dict(getattr(session, "config", {}) or {})
+        research = dict(config.get("research_session") or {})
+        daily = dict(config.get("portfolio_daily_run") or {})
+        raw = research.get("symbol") or daily.get("symbol") or ""
+        return normalize_symbol(str(raw)).upper() if raw else ""
+
+    def _stock_session_info(
+        self,
+        session_id: str,
+        *,
+        symbol: str,
+        today: str,
+        msg: InboundMessage,
+        mapped_route: bool = False,
+    ) -> dict[str, Any] | None:
+        get_session = getattr(self.session_service, "get_session", None)
+        session = get_session(session_id) if callable(get_session) else None
+        if session is None or _shanghai_date(getattr(session, "created_at", None)) != today:
+            return None
+        normalized = normalize_symbol(symbol).upper()
+        session_symbol = self._session_stock_symbol(session)
+        if session_symbol != normalized:
+            if not mapped_route or not msg.session_key.endswith(f":symbol:{normalized}"):
+                return None
+        config = dict(getattr(session, "config", {}) or {})
+        daily = dict(config.get("portfolio_daily_run") or {})
+        if not daily and not mapped_route:
+            if config.get("channel") != msg.channel or config.get("channel_chat_id") != msg.chat_id:
+                return None
+        return {
+            "session_id": session_id,
+            "title": str(getattr(session, "title", "") or "个股研究 Session"),
+            "created_at": str(getattr(session, "created_at", "") or ""),
+            "created_time": _shanghai_time(getattr(session, "created_at", None)),
+            "source": "daily_report" if daily else "research",
+        }
+
+    def _today_stock_session(
+        self, msg: InboundMessage, symbol: str, *, today: str
+    ) -> dict[str, Any] | None:
+        candidate_ids: list[tuple[str, bool]] = []
+
+        def add(session_id: str | None, mapped: bool = False) -> None:
+            if session_id and not any(item[0] == session_id for item in candidate_ids):
+                candidate_ids.append((session_id, mapped))
+
+        add(self._session_map.get(msg.session_key), True)
+        list_sessions = getattr(self.session_service, "list_sessions", None)
+        if callable(list_sessions):
+            for session in list_sessions(limit=500):
+                add(str(getattr(session, "session_id", "") or ""))
+
+        for session_id, mapped in candidate_ids:
+            info = self._stock_session_info(
+                session_id,
+                symbol=symbol,
+                today=today,
+                msg=msg,
+                mapped_route=mapped,
+            )
+            if info:
+                return info
+        return None
+
+    def _today_stock_report(
+        self,
+        symbol: str,
+        *,
+        today: str,
+        run_id: str = "",
+        artifact_id: str = "",
+    ) -> dict[str, Any] | None:
+        if self.daily_run_service is None:
+            return None
+        store = getattr(self.daily_run_service, "store", None)
+        if store is None:
+            return None
+        if run_id:
+            record = self.daily_run_service.get_run(run_id)
+            records = [record] if record else []
+        else:
+            list_runs = getattr(store, "list", None)
+            records = list_runs(limit=500) if callable(list_runs) else []
+        normalized = normalize_symbol(symbol).upper()
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            created_today = _shanghai_date(str(record.get("created_at") or "")) == today
+            if str(record.get("market_date") or "") != today and not created_today:
+                continue
+            if record.get("status") not in {"completed", "completed_with_warnings"}:
+                continue
+            if record.get("stage") == "skipped_data_unavailable":
+                continue
+            artifacts = list(record.get("artifacts") or [])
+            pdf = next(
+                (
+                    item
+                    for item in artifacts
+                    if item.get("kind") == "holding_daily_pdf"
+                    and normalize_symbol(str(item.get("symbol") or "")).upper() == normalized
+                    and not item.get("expired")
+                    and not item.get("superseded")
+                    and (not artifact_id or item.get("artifact_id") == artifact_id)
+                ),
+                None,
+            )
+            if not pdf:
+                continue
+            markdown = next(
+                (
+                    item
+                    for item in artifacts
+                    if item.get("kind") == "holding_daily_markdown"
+                    and normalize_symbol(str(item.get("symbol") or "")).upper() == normalized
+                    and not item.get("expired")
+                    and not item.get("superseded")
+                ),
+                None,
+            )
+            worker = next(
+                (
+                    item
+                    for item in record.get("workers") or []
+                    if normalize_symbol(str(item.get("symbol") or "")).upper() == normalized
+                ),
+                {},
+            )
+            return {
+                "run_id": str(record.get("run_id") or ""),
+                "market_date": str(record.get("market_date") or today),
+                "revision": int(pdf.get("revision") or record.get("revision") or 1),
+                "artifact_id": str(pdf.get("artifact_id") or ""),
+                "filename": str(pdf.get("filename") or ""),
+                "markdown_artifact_id": str((markdown or {}).get("artifact_id") or ""),
+                "worker_session_id": str(worker.get("session_id") or ""),
+                "created_at": str(record.get("created_at") or ""),
+            }
+        return None
+
+    async def _seed_stock_report_context(
+        self,
+        session_id: str,
+        *,
+        symbol: str,
+        report: dict[str, Any],
+    ) -> None:
+        run_id = str(report.get("run_id") or "")
+        messages = self.session_service.get_messages(session_id, limit=500)
+        if any(
+            (message.metadata or {}).get("daily_report_context_run_id") == run_id
+            and (message.metadata or {}).get("daily_report_context_symbol") == symbol
+            for message in messages
+        ):
+            return
+
+        store = getattr(self.daily_run_service, "store", None)
+        markdown = ""
+        markdown_id = str(report.get("markdown_artifact_id") or "")
+        if store is not None and markdown_id:
+            resolved = store.resolve_artifact(run_id, markdown_id)
+            if resolved:
+                _, path = resolved
+                try:
+                    markdown = path.read_text(encoding="utf-8")
+                except OSError:
+                    logger.exception("Unable to read daily report context %s", path)
+        if not markdown and store is not None:
+            safe_symbol = re.sub(r"[^A-Za-z0-9._-]+", "_", symbol)[:40] or "holding"
+            brief = store.read_json(run_id, f"outputs/holdings/{safe_symbol}/brief.json")
+            if isinstance(brief, dict):
+                markdown = json.dumps(brief, ensure_ascii=False, indent=2)
+        context = (
+            f"# 已载入今日个股报告：{symbol}\n\n"
+            f"报告日期：{report.get('market_date')}\n"
+            f"报告 revision：{report.get('revision')}\n\n"
+            f"{markdown or '报告 PDF 已存在，但正文缓存不可用；回答前应明确说明这一限制。'}"
+        )
+        metadata = {
+            "daily_report_context_run_id": run_id,
+            "daily_report_context_symbol": symbol,
+            "daily_report_context_revision": int(report.get("revision") or 1),
+        }
+        execute = getattr(self.session_service, "execute_message", None)
+        if callable(execute):
+            await execute(
+                session_id,
+                context,
+                role="assistant",
+                message_metadata=metadata,
+            )
+            return
+        session_store = getattr(self.session_service, "store", None)
+        append_message = getattr(session_store, "append_message", None)
+        if callable(append_message):
+            append_message(
+                Message(
+                    session_id=session_id,
+                    role="assistant",
+                    content=context,
+                    metadata=metadata,
+                )
+            )
+
+    def _activate_existing_stock_session(
+        self, msg: InboundMessage, session_id: str
+    ) -> None:
+        self._ensure_channel_policy(session_id, msg)
+        self._activate_research_session(msg, session_id)
+
+    async def _report_continuation_session(
+        self,
+        msg: InboundMessage,
+        *,
+        symbol: str,
+        report: dict[str, Any],
+        requested_session_id: str = "",
+    ) -> str:
+        today = _shanghai_date()
+        session_id = ""
+        for candidate in (
+            requested_session_id,
+            str(report.get("worker_session_id") or ""),
+        ):
+            if candidate and self._stock_session_info(
+                candidate,
+                symbol=symbol,
+                today=today,
+                msg=msg,
+                mapped_route=candidate == self._session_map.get(msg.session_key),
+            ):
+                session_id = candidate
+                break
+        if not session_id:
+            existing = self._today_stock_session(msg, symbol, today=today)
+            session_id = str((existing or {}).get("session_id") or "")
+        if not session_id:
+            self.reset_session(msg.session_key)
+            session_id = self._session_for(msg)
+        self._activate_existing_stock_session(msg, session_id)
+        await self._seed_stock_report_context(
+            session_id,
+            symbol=normalize_symbol(symbol).upper(),
+            report=report,
+        )
+        return session_id
+
+    async def _handle_stock_research_action(
+        self, msg: InboundMessage
+    ) -> InboundMessage | None:
+        metadata = dict(msg.metadata or {})
+        action = str(metadata.get("stock_research_action") or "")
+        symbol = normalize_symbol(str(metadata.get("research_symbol") or "")).upper()
+        if not symbol:
+            raise ValueError("无法识别要分析的证券代码。")
+        today = _shanghai_date()
+
+        if action == "prepare":
+            session = self._today_stock_session(msg, symbol, today=today)
+            report = self._today_stock_report(symbol, today=today)
+            if session or report:
+                label = str(metadata.get("research_label") or symbol)
+                name = label.removesuffix("个股分析").strip() or symbol
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content="",
+                        metadata=self._response_metadata(
+                            msg,
+                            _channel_runtime=True,
+                            _stock_research_context=True,
+                            stock_research_context={
+                                "symbol": symbol,
+                                "name": name,
+                                "analysis_action": str(metadata.get("research_action") or "holding"),
+                                "session": session or {},
+                                "report": report or {},
+                            },
+                        ),
+                    )
+                )
+                return None
+            self.reset_session(msg.session_key)
+            metadata.pop("stock_research_action", None)
+            return replace(msg, metadata=metadata)
+
+        if action == "start_stock_research":
+            self.reset_session(msg.session_key)
+            metadata.pop("stock_research_action", None)
+            return replace(msg, metadata=metadata)
+
+        if action == "resume_stock_session":
+            session_id = str(metadata.get("stock_session_id") or "")
+            info = self._stock_session_info(
+                session_id,
+                symbol=symbol,
+                today=today,
+                msg=msg,
+                mapped_route=session_id == self._session_map.get(msg.session_key),
+            )
+            if not info:
+                raise ValueError("今天的个股 Session 已不存在或不再匹配，请重新选择。")
+            self._activate_existing_stock_session(msg, session_id)
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=(
+                        f"已切换到今天的 {symbol} Session：`{session_id}`。\n"
+                        "现在直接发送问题即可接着聊，不会重新生成报告。"
+                    ),
+                    metadata=self._response_metadata(
+                        msg,
+                        _channel_runtime=True,
+                        session_id=session_id,
+                        stock_session_resumed=True,
+                    ),
+                )
+            )
+            return None
+
+        if action in {"send_stock_daily_report", "continue_stock_daily_report"}:
+            report = self._today_stock_report(
+                symbol,
+                today=today,
+                run_id=str(metadata.get("daily_run_id") or ""),
+                artifact_id=str(metadata.get("artifact_id") or ""),
+            )
+            if not report:
+                raise ValueError("今天的个股日报已不存在、过期或已被新 revision 替代。")
+            session_id = await self._report_continuation_session(
+                msg,
+                symbol=symbol,
+                report=report,
+                requested_session_id=str(metadata.get("stock_session_id") or ""),
+            )
+            media: list[str] = []
+            if action == "send_stock_daily_report":
+                resolved = self.daily_run_service.store.resolve_artifact(
+                    str(report["run_id"]), str(report["artifact_id"])
+                )
+                if not resolved:
+                    raise ValueError("今天的个股日报 PDF 已不存在或已过期。")
+                _, path = resolved
+                media = [str(path)]
+                content = (
+                    f"已发送 {symbol} 今日个股日报（revision {report['revision']}）。\n"
+                    "报告正文也已载入当前 Session，接下来可直接针对报告提问。"
+                )
+            else:
+                content = (
+                    f"已载入 {symbol} 今日个股日报（revision {report['revision']}）。\n"
+                    "现在直接发送要补充研究的问题即可；不会重复生成原报告。"
+                )
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=content,
+                    media=media,
+                    metadata=self._response_metadata(
+                        msg,
+                        _channel_runtime=True,
+                        session_id=session_id,
+                        daily_run_id=str(report["run_id"]),
+                        delivery_mode="report_pdf" if media else "report_context",
+                        stock_report_continuation=True,
+                    ),
+                )
+            )
+            return None
+
+        raise ValueError("不支持的个股研究衔接操作。")
+
     def _session_for(self, msg: InboundMessage) -> str:
         key = msg.session_key
         existing = self._session_map.get(key)
@@ -799,6 +1225,20 @@ class ChannelRuntime:
         )
 
     async def _cancel_session(self, msg: InboundMessage) -> None:
+        daily_run_id = self._daily_runs_by_chat.get(self._base_session_key(msg))
+        if daily_run_id and self.daily_run_service is not None:
+            record = await self.daily_run_service.cancel(daily_run_id)
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"已请求取消组合晨会：{record.get('run_id')}",
+                    metadata=self._response_metadata(
+                        msg, _channel_runtime=True, daily_run_cancel=True, _progress=True
+                    ),
+                )
+            )
+            return
         session_id = self._session_map.get(self._base_session_key(msg))
         if not session_id:
             content = "No active session for this chat or topic."
@@ -857,6 +1297,410 @@ class ChannelRuntime:
     def _response_metadata(msg: InboundMessage, **updates: Any) -> dict[str, Any]:
         """Keep adapter routing metadata on every runtime response."""
         return {**dict(msg.metadata or {}), **updates}
+
+    async def _run_daily_portfolio(self, msg: InboundMessage) -> None:
+        """Run the report-oriented portfolio pipeline outside chat Session routing."""
+        if self.daily_run_service is None:
+            raise RuntimeError("组合晨会服务尚未启用")
+        record = await self.daily_run_service.start(
+            refresh_policy="ensure_fresh",
+            report_profile="master_with_holding_appendices",
+            trigger=msg.channel,
+        )
+        await self._monitor_daily_portfolio(msg, record)
+
+    def _daily_report_options(self, record: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return callback-safe holding report descriptors without local paths."""
+
+        store = getattr(self.daily_run_service, "store", None)
+        snapshot = (
+            store.read_json(str(record["run_id"]), "inputs/portfolio_snapshot.json")
+            if store is not None
+            else None
+        )
+        names = {
+            str(item.get("symbol") or item.get("code") or "").upper(): str(
+                item.get("name") or item.get("symbol") or item.get("code") or ""
+            )
+            for item in (snapshot or {}).get("holdings") or []
+        }
+        workers = {
+            str(item.get("symbol") or "").upper(): item
+            for item in record.get("workers") or []
+        }
+        options: list[dict[str, Any]] = []
+        for artifact in record.get("artifacts") or []:
+            if (
+                artifact.get("kind") != "holding_daily_pdf"
+                or artifact.get("expired")
+                or artifact.get("superseded")
+            ):
+                continue
+            symbol = str(artifact.get("symbol") or "").upper()
+            worker = workers.get(symbol) or {}
+            options.append(
+                {
+                    "symbol": symbol,
+                    "name": names.get(symbol) or symbol,
+                    "artifact_id": str(artifact.get("artifact_id") or ""),
+                    "filename": str(artifact.get("filename") or ""),
+                    "revision": int(artifact.get("revision") or record.get("revision") or 1),
+                    "status": str(worker.get("status") or "completed"),
+                }
+            )
+        return options
+
+    def _daily_decision_text(self, record: dict[str, Any]) -> str:
+        store = getattr(self.daily_run_service, "store", None)
+        decision = (
+            store.read_json(str(record["run_id"]), "outputs/decision.json")
+            if store is not None
+            else None
+        )
+        if not isinstance(decision, dict):
+            return ""
+        lines: list[str] = []
+        cash = decision.get("cash_summary") or {}
+        if cash:
+            actual = cash.get("actual_cash")
+            minimum = cash.get("minimum_cash")
+            lines.append(f"现金：实际 {actual if actual is not None else '未维护'} · 最低保留 {minimum}")
+        for sleeve in (decision.get("sleeve_summaries") or [])[:4]:
+            lines.append(
+                f"{sleeve.get('name') or sleeve.get('id')}：当前 {sleeve.get('current_amount')} · "
+                f"目标 {sleeve.get('target_amount')} · 缺口 {sleeve.get('gap_amount')}"
+            )
+        observations = decision.get("today_observation_points") or []
+        if observations:
+            lines.append("今日优先关注：")
+            lines.extend(
+                f"- {item.get('symbol')}：{item.get('watch_point')}"
+                for item in observations[:3]
+            )
+        if not decision.get("quantitative_plan_enabled", False):
+            lines.append("定量金额计划：已关闭（方向与观察结论仍保留）")
+        return "\n".join(lines)
+
+    async def _handle_daily_report_action(self, msg: InboundMessage) -> None:
+        if self.daily_run_service is None:
+            raise RuntimeError("组合晨会服务尚未启用")
+        metadata = dict(msg.metadata or {})
+        action = str(metadata.get("daily_report_action") or "")
+        run_id = str(metadata.get("daily_run_id") or "")
+        record = self.daily_run_service.get_run(run_id) if run_id else None
+        if not record:
+            raise ValueError("找不到这次组合晨会，报告可能已过期。")
+
+        if action == "show_daily_reports":
+            options = self._daily_report_options(record)
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=(
+                        "请选择要发送或重新分析的个股日报。"
+                        if options
+                        else "这次运行没有可发送的个股 PDF。"
+                    ),
+                    metadata=self._response_metadata(
+                        msg,
+                        _channel_runtime=True,
+                        _daily_report_picker=True,
+                        daily_run_id=run_id,
+                        daily_run_revision=int(record.get("revision") or 1),
+                        holding_reports=options,
+                    ),
+                )
+            )
+            return
+
+        if action in {"send_daily_report", "send_daily_master"}:
+            if action == "send_daily_master":
+                artifact = next(
+                    (
+                        item
+                        for item in record.get("artifacts") or []
+                        if item.get("kind") == "master_pdf"
+                        and not item.get("expired")
+                        and not item.get("superseded")
+                    ),
+                    None,
+                )
+                artifact_id = str((artifact or {}).get("artifact_id") or "")
+            else:
+                artifact_id = str(metadata.get("artifact_id") or "")
+            resolved = self.daily_run_service.store.resolve_artifact(run_id, artifact_id)
+            if not resolved:
+                raise ValueError("报告文件不存在、已过期或已失效。")
+            artifact, path = resolved
+            expected_kind = "master_pdf" if action == "send_daily_master" else "holding_daily_pdf"
+            if artifact.get("kind") != expected_kind:
+                raise ValueError("报告类型不匹配。")
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=(
+                        f"已发送组合综合报告（revision {artifact.get('revision', 1)}）。"
+                        if action == "send_daily_master"
+                        else f"已发送 {artifact.get('symbol')} 个股日报（revision {artifact.get('revision', 1)}）。"
+                    ),
+                    media=[str(path)],
+                    metadata=self._response_metadata(
+                        msg,
+                        _channel_runtime=True,
+                        daily_run_id=run_id,
+                        delivery_mode="report_pdf",
+                    ),
+                )
+            )
+            return
+
+        if action == "retry_daily_holding":
+            symbol = str(metadata.get("symbol") or "")
+            retried = await self.daily_run_service.retry(run_id, symbol=symbol)
+            await self._monitor_daily_portfolio(msg, retried)
+            return
+
+        if action == "rerun_daily":
+            rerun = await self.daily_run_service.start(
+                refresh_policy="force",
+                report_profile="master_with_holding_appendices",
+                trigger=msg.channel,
+                force_new=True,
+            )
+            await self._monitor_daily_portfolio(msg, rerun)
+            return
+
+        if action == "cancel_daily_run":
+            cancelled = await self.daily_run_service.cancel(run_id)
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"已请求取消组合晨会 `{run_id}`，当前状态：{cancelled.get('status')}。",
+                    metadata=self._response_metadata(
+                        msg, _channel_runtime=True, daily_run_id=run_id
+                    ),
+                )
+            )
+            return
+
+        raise ValueError("不支持的组合晨会操作。")
+
+    async def _monitor_daily_portfolio(
+        self, msg: InboundMessage, record: dict[str, Any]
+    ) -> None:
+        """Stream one run's progress and deliver its immutable artifacts."""
+
+        run_id = str(record["run_id"])
+        key = self._base_session_key(msg)
+        self._daily_runs_by_chat[key] = run_id
+        retry_symbol = str(record.get("retry_symbol") or "")
+        lead = (
+            f"已启动 `{retry_symbol}` 个股重试"
+            if retry_symbol
+            else "已启动组合晨会"
+        )
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"# 组合晨会\n\n{lead} `{run_id}`，正在冻结输入。可点击取消或发送 `/cancel`。",
+                metadata=self._response_metadata(
+                    msg,
+                    _channel_runtime=True,
+                    daily_run_id=run_id,
+                    _stream_delta=True,
+                    _stream_id=f"daily-run:{run_id}",
+                ),
+            )
+        )
+        completion: asyncio.Task[Any] | None = None
+        try:
+            if record.get("status") not in {"completed", "completed_with_warnings", "failed", "cancelled"}:
+                completion = asyncio.create_task(self.daily_run_service.wait(run_id))
+                last_progress = None
+                while not completion.done():
+                    current = self.daily_run_service.get_run(run_id)
+                    if current:
+                        progress = current.get("progress") or {}
+                        signature = (
+                            current.get("stage"),
+                            progress.get("completed"),
+                            progress.get("total"),
+                            progress.get("percent"),
+                        )
+                        if signature != last_progress:
+                            last_progress = signature
+                            await self.bus.publish_outbound(
+                                OutboundMessage(
+                                    channel=msg.channel,
+                                    chat_id=msg.chat_id,
+                                    content=(
+                                        f"\n\n- 阶段：{current.get('stage')}"
+                                        f"\n- 进度：{progress.get('completed', 0)}/{progress.get('total', 0)}"
+                                        f"（{progress.get('percent', 0)}%）"
+                                    ),
+                                    metadata=self._response_metadata(
+                                        msg,
+                                        _channel_runtime=True,
+                                        daily_run_id=run_id,
+                                        _stream_delta=True,
+                                        _stream_id=f"daily-run:{run_id}",
+                                    ),
+                                )
+                            )
+                    try:
+                        await asyncio.wait_for(asyncio.shield(completion), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        pass
+                record = await completion
+            if record.get("status") not in {"completed", "completed_with_warnings"}:
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=f"\n\n组合晨会 **{record.get('status')}**：{record.get('error') or '未生成报告'}",
+                        metadata=self._response_metadata(
+                            msg,
+                            _channel_runtime=True,
+                            daily_run_id=run_id,
+                            _stream_delta=True,
+                            _stream_id=f"daily-run:{run_id}",
+                        ),
+                    )
+                )
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content="",
+                        metadata=self._response_metadata(
+                            msg,
+                            _channel_runtime=True,
+                            daily_run_id=run_id,
+                            _stream_end=True,
+                            _stream_id=f"daily-run:{run_id}",
+                        ),
+                    )
+                )
+                return
+            if record.get("stage") == "skipped_data_unavailable":
+                gate = record.get("analysis_gate") or {}
+                warning = "\n".join(record.get("warnings") or [])
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content="\n\n⚠️ 数据覆盖不足，已在模型分析前停止，未生成 PDF。",
+                        metadata=self._response_metadata(
+                            msg,
+                            _channel_runtime=True,
+                            daily_run_id=run_id,
+                            _stream_delta=True,
+                            _stream_id=f"daily-run:{run_id}",
+                        ),
+                    )
+                )
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content="",
+                        metadata=self._response_metadata(
+                            msg,
+                            _channel_runtime=True,
+                            daily_run_id=run_id,
+                            _stream_end=True,
+                            _stream_id=f"daily-run:{run_id}",
+                        ),
+                    )
+                )
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=(
+                            f"关键数据覆盖 {gate.get('eligible_count', 0)}/{gate.get('total_count', 0)}；"
+                            "未启动个股研究 Session，也未生成综合或个股 PDF。"
+                            f"{f'{chr(10)}{warning}' if warning else ''}"
+                        ),
+                        metadata=self._response_metadata(
+                            msg,
+                            _channel_runtime=True,
+                            daily_run_id=run_id,
+                            daily_run_revision=int(record.get("revision") or 1),
+                            portfolio_daily_skipped=True,
+                        ),
+                    )
+                )
+                return
+            master = next(
+                (item for item in record.get("artifacts") or [] if item.get("kind") == "master_pdf"),
+                None,
+            )
+            media = [str(master["path"])] if master else []
+            counts = record.get("summary") or {}
+            holding_reports = self._daily_report_options(record)
+            decision_text = self._daily_decision_text(record)
+            content = (
+                f"✅ 组合晨会已完成｜{record.get('market_date')}｜revision {record.get('revision', 1)}\n"
+                f"退出 {counts.get('exit', 0)} · 减仓 {counts.get('reduce', 0)} · "
+                f"加仓 {counts.get('add', 0)} · 观察 {counts.get('observe', 0)}\n"
+                f"个股 PDF {len(holding_reports)} 份。综合报告已附上；可选择发送已有个股报告。"
+                f"{f'{chr(10)}{decision_text}' if decision_text else ''}"
+            )
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="\n\n✅ 全部阶段完成，综合报告与个股附录已生成。",
+                    metadata=self._response_metadata(
+                        msg,
+                        _channel_runtime=True,
+                        daily_run_id=run_id,
+                        _stream_delta=True,
+                        _stream_id=f"daily-run:{run_id}",
+                    ),
+                )
+            )
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="",
+                    metadata=self._response_metadata(
+                        msg,
+                        _channel_runtime=True,
+                        daily_run_id=run_id,
+                        _stream_end=True,
+                        _stream_id=f"daily-run:{run_id}",
+                    ),
+                )
+            )
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=content,
+                    media=media,
+                    metadata=self._response_metadata(
+                        msg,
+                        _channel_runtime=True,
+                        daily_run_id=run_id,
+                        daily_run_revision=int(record.get("revision") or 1),
+                        portfolio_daily_complete=True,
+                        holding_reports=holding_reports,
+                        delivery_mode="report_pdf",
+                    ),
+                )
+            )
+        finally:
+            if completion is not None and not completion.done():
+                completion.cancel()
+            if self._daily_runs_by_chat.get(key) == run_id:
+                self._daily_runs_by_chat.pop(key, None)
 
     async def _wait_for_reply(self, session_id: str, attempt_id: str | None) -> Message:
         deadline = time.monotonic() + self.config.reply_timeout_s

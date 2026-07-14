@@ -44,6 +44,10 @@ dependencies = [
     "requests>=2.31.0",
     "yfinance>=0.2.30",
     "akshare>=1.12.0",
+    "baostock>=0.8.8",
+    # Mootdx 0.11.7 pins httpx<0.26, while the agent runtime requires httpx>=0.28.
+    # tdxpy speaks the same independent TDX TCP upstream without that conflict.
+    "tdxpy>=0.2.5,<0.3.0",
     "ccxt>=4.0.0",
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
@@ -106,10 +110,8 @@ deepseek = [
     "langchain-deepseek>=1.0.0,<2",
 ]
 ashare = [
-    # Free, no-auth A-share source over BaoStock's TCP protocol; bypasses the
-    # HTTP CDN IP blocks that affect eastmoney-backed sources. The Tencent
-    # A-share loader needs no extra dependency (stdlib HTTP only).
-    "baostock>=0.8.8",
+    # Compatibility alias. BaoStock and TDX TCP are standard dependencies now
+    # because verified A-share prices require independent TCP providers.
 ]
 harmonic = [
     "pyharmonics>=1.5.0",

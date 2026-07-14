@@ -53,6 +53,7 @@ class DataLoader:
         fields: Optional[List[str]] = None,
         adjustment: str = "qfq",
         request_timeout_s: float | None = None,
+        strict: bool = False,
     ) -> Dict[str, pd.DataFrame]:
         validate_date_range(start_date, end_date)
         if interval not in {"1D", "1m", "5m"}:
@@ -80,6 +81,8 @@ class DataLoader:
                     result[code] = df
             except Exception as exc:
                 logger.warning("tencent failed for %s: %s", code, exc)
+                if strict:
+                    raise
         return result
 
     def _fetch_one(

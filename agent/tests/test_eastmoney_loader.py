@@ -152,6 +152,20 @@ class TestFetchWithMockedClient:
 
         assert out == {}
 
+    def test_missing_optional_transport_hook_does_not_break_quotes(self) -> None:
+        loader = DataLoader()
+        with patch.object(
+            eastmoney_client, "consume_transport_events", None
+        ), patch.object(
+            eastmoney_client, "resolve_secid", return_value="1.600519"
+        ), patch.object(
+            eastmoney_client, "fetch_kline", return_value=_client_rows()
+        ):
+            out = loader.fetch(["600519.SH"], "2024-01-01", "2024-01-31")
+
+        assert set(out) == {"600519.SH"}
+        assert loader.transport_events == []
+
     def test_invalid_date_range_raises(self) -> None:
         loader = DataLoader()
         with pytest.raises(ValueError):

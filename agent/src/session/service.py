@@ -37,6 +37,11 @@ _PORTFOLIO_ANALYSIS_TOOL_NAMES = [
     "pattern",
 ]
 
+# Daily-run workers receive an immutable data manifest in their prompt. They
+# may load a formatting/research skill, but cannot re-read portfolio state,
+# bypass the data refresh policy, write files, or reach any broker surface.
+_PORTFOLIO_DAILY_RUN_TOOL_NAMES = ["load_skill"]
+
 # Remote chat channels are intentionally limited to research and backtesting.
 # This is an actual registry allowlist, not a prompt-only promise: broker,
 # order, mandate, shell, swarm, and generic file-write tools never enter the
@@ -519,8 +524,14 @@ class SessionService:
             self.event_bus.emit(session_id, "mcp.warning", {"attempt_id": attempt_id, "message": msg})
 
         portfolio_analysis = dict((session_config or {}).get("portfolio_analysis") or {})
+        portfolio_daily_run = dict((session_config or {}).get("portfolio_daily_run") or {})
         channel_policy = dict((session_config or {}).get("channel_policy") or {})
-        if channel_policy.get("research_only"):
+        if portfolio_daily_run.get("research_only"):
+            registry = await loop.run_in_executor(
+                _AGENT_EXECUTOR,
+                lambda: build_filtered_registry(_PORTFOLIO_DAILY_RUN_TOOL_NAMES, include_shell_tools=False),
+            )
+        elif channel_policy.get("research_only"):
             registry = await loop.run_in_executor(
                 _AGENT_EXECUTOR,
                 lambda: build_filtered_registry(_CHANNEL_RESEARCH_TOOL_NAMES, include_shell_tools=False),

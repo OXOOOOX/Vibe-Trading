@@ -47,6 +47,27 @@ def test_update_portfolio_holdings_parses_and_normalizes_symbols(tmp_path, monke
     assert [row["symbol"] for row in state["holdings"]] == ["588870.SH", "159842.SZ"]
 
 
+def test_update_portfolio_cash_does_not_replace_holdings(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    seeded = client.post(
+        "/portfolio/holdings",
+        json={"raw_text": HOLDINGS_TEXT, "cash": 30000, "cash_currency": "CNY"},
+    )
+    assert seeded.status_code == 200
+    before = seeded.json()["portfolio_state"]["holdings"]
+
+    response = client.put(
+        "/portfolio/cash",
+        json={"cash": 45678.9, "cash_currency": "CNY"},
+    )
+
+    assert response.status_code == 200
+    state = response.json()["portfolio_state"]
+    assert state["cash"] == 45678.9
+    assert state["cash_currency"] == "CNY"
+    assert state["holdings"] == before
+
+
 def test_update_portfolio_holdings_accepts_simple_table_and_infers_stocks(tmp_path, monkeypatch) -> None:
     client = _client(tmp_path, monkeypatch)
 

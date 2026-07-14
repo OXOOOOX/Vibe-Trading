@@ -14,7 +14,7 @@ describe("DataCenter", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     vi.mocked(dataApi.coverage).mockResolvedValue({ status: "ok", coverage: [{ symbol: "588870.SH", actual_source: "eastmoney", interval: "1D", actual_adjustment: "qfq", min_bar_time: "2024-01-01T00:00:00Z", max_bar_time: "2026-07-13T00:00:00Z", row_count: 500, last_success_at: "2026-07-13T00:00:00Z" }], watchlist: [], retention: {} });
-    vi.mocked(dataApi.sources).mockResolvedValue({ status: "ok", quorum: "two sources", sources: [{ source: "eastmoney", consecutive_failures: 0, circuit_open: false, circuit_open_until: null, last_status: "ok", last_latency_ms: 42, last_error: null, updated_at: "2026-07-13T00:00:00Z" }] });
+    vi.mocked(dataApi.sources).mockResolvedValue({ status: "ok", quorum: "two sources", sources: [{ source: "eastmoney:market", requested_source: "eastmoney", actual_source: "eastmoney", upstream_source: "eastmoney_push2his", capability: "market", consecutive_failures: 0, circuit_open: false, circuit_open_until: null, last_status: "ok", effective_status: "ok", stale: false, last_latency_ms: 42, error_category: null, last_error: null, updated_at: "2026-07-13T00:00:00Z" }] });
     vi.mocked(dataApi.storage).mockResolvedValue({ status: "ok", entries: [{ kind: "market_cache", path: "C:/cache", bytes: 1024 }], total_bytes: 1024, soft_limit_bytes: 10 * 1024 ** 3, evict_at_bytes: 9 * 1024 ** 3, retention: {} });
     vi.mocked(dataApi.watchlist).mockResolvedValue({ status: "ok", watchlist: [] });
     vi.mocked(dataApi.addWatchlist).mockResolvedValue({ status: "ok", entry: { symbol: "510300.SH", note: null, added_at: "2026-07-13T00:00:00Z" } });

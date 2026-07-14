@@ -250,6 +250,28 @@ def update_holdings(
     return state
 
 
+def update_cash(
+    *,
+    cash: float,
+    cash_currency: str = "CNY",
+    path: Path | None = None,
+) -> PortfolioState:
+    """Update manually confirmed account cash without touching holdings."""
+
+    amount = _number(cash)
+    if amount is None or amount < 0:
+        raise ValueError("Cash must be a non-negative number.")
+    currency = str(cash_currency or "CNY").strip().upper()
+    if not currency:
+        raise ValueError("Cash currency is required.")
+
+    state = load_state(path)
+    state.cash = amount
+    state.cash_currency = currency
+    save_state(state, path)
+    return state
+
+
 def _recalculate_holding_totals(holding: dict[str, Any]) -> None:
     """Keep derived holding values consistent after a quantity/cost change."""
     quantity = _number(holding.get("quantity"))

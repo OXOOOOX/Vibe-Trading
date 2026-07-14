@@ -229,6 +229,13 @@ class UpdatePortfolioHoldingsRequest(BaseModel):
     cash_currency: str = Field("CNY", max_length=16)
 
 
+class UpdatePortfolioCashRequest(BaseModel):
+    """Persist a manually confirmed cash balance without replacing holdings."""
+
+    cash: float = Field(..., ge=0)
+    cash_currency: str = Field("CNY", min_length=1, max_length=16)
+
+
 class RecordPortfolioTradeRequest(BaseModel):
     """Persist one complete, resolved A-share trade into structured portfolio state."""
 
@@ -2061,6 +2068,25 @@ async def update_portfolio_holdings(payload: UpdatePortfolioHoldingsRequest):
     return _build_portfolio_review(state)
 
 
+@app.put(
+    "/portfolio/cash",
+    response_model=PortfolioReviewResponse,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def update_portfolio_cash(payload: UpdatePortfolioCashRequest):
+    """Update account cash independently from the broker holdings import."""
+    from src.portfolio.state import update_cash
+
+    try:
+        state = update_cash(
+            cash=payload.cash,
+            cash_currency=payload.cash_currency,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _build_portfolio_review(state)
+
+
 @app.patch(
     "/portfolio/holdings/{symbol}",
     response_model=PortfolioReviewResponse,
@@ -2478,6 +2504,7 @@ _channel_runtime = None
 _channel_bus = None
 _channel_manager = None
 _goal_store = None
+_portfolio_daily_service = None
 
 
 def _get_session_service():
@@ -2529,6 +2556,25 @@ def _get_session_dispatcher():
     return _session_dispatcher
 
 
+def _get_portfolio_daily_service():
+    """Return the one-click portfolio Daily Run orchestrator."""
+    global _portfolio_daily_service
+    if _portfolio_daily_service is None:
+        from src.portfolio.daily import DailyPortfolioRunService
+
+        raw = os.getenv("VIBE_TRADING_DAILY_RUN_MAX_WORKERS", "3")
+        try:
+            max_workers = int(raw)
+        except ValueError:
+            max_workers = 3
+        _portfolio_daily_service = DailyPortfolioRunService(
+            session_service=_get_session_service(),
+            pdf_renderer=_render_pdf_reportlab,
+            max_workers=max_workers,
+        )
+    return _portfolio_daily_service
+
+
 def _get_channel_runtime():
     """Lazy-init the official IM runtime with the persistent dispatcher."""
     global _channel_runtime, _channel_bus, _channel_manager
@@ -2553,6 +2599,7 @@ def _get_channel_runtime():
         session_service=service,
         manager=_channel_manager,
         dispatcher=dispatcher,
+        daily_run_service=_get_portfolio_daily_service(),
         reply_timeout_s=float(config.get("reply_timeout_s", 600.0)),
     )
     return _channel_runtime
@@ -2617,7 +2664,13 @@ async def list_sessions(limit: int = Query(50, ge=1, le=200)):
     svc = _get_session_service()
     if not svc:
         raise HTTPException(status_code=501, detail="Session runtime not enabled")
-    sessions = svc.list_sessions(limit=limit)
+    # Worker sessions belong to report-oriented orchestrators and should not
+    # clutter the user's conversation list. They remain persisted for audit.
+    sessions = [
+        session
+        for session in svc.list_sessions(limit=200)
+        if not bool((session.config or {}).get("internal"))
+    ][:limit]
     return [
         SessionResponse(
             session_id=s.session_id,
@@ -3228,6 +3281,7 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
             rows.pop(1)
         column_count = max(len(row) for row in rows)
         normalized = [row + [""] * (column_count - len(row)) for row in rows]
+        headers = normalized[0]
         data = [
             [
                 Paragraph(inline_markdown(cell), table_header_style if row_index == 0 else table_cell_style)
@@ -3236,8 +3290,18 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
             for row_index, row in enumerate(normalized)
         ]
         available_width = A4[0] - 36 * mm
-        table = Table(data, colWidths=[available_width / column_count] * column_count, repeatRows=1)
-        table.setStyle(TableStyle([
+        if headers == ["优先级", "标的", "触发条件", "建议响应"]:
+            width_shares = [0.12, 0.22, 0.28, 0.38]
+        elif headers == ["优先级", "触发条件", "建议响应"]:
+            width_shares = [0.14, 0.34, 0.52]
+        else:
+            width_shares = [1 / column_count] * column_count
+        table = Table(
+            data,
+            colWidths=[available_width * share for share in width_shares],
+            repeatRows=1,
+        )
+        table_commands = [
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eff6ff")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#1e3a8a")),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
@@ -3246,7 +3310,93 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
             ("RIGHTPADDING", (0, 0), (-1, -1), 6),
             ("TOPPADDING", (0, 0), (-1, -1), 5),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ]))
+        ]
+        priority_column = headers.index("优先级") if "优先级" in headers else None
+        status_column = headers.index("状态") if "状态" in headers else None
+        for row_index, row in enumerate(normalized[1:], start=1):
+            if row_index % 2 == 0:
+                table_commands.append(
+                    ("BACKGROUND", (0, row_index), (-1, row_index), colors.HexColor("#f8fafc"))
+                )
+            if priority_column is not None:
+                priority = row[priority_column]
+                if "高" in priority:
+                    table_commands.extend(
+                        [
+                            ("BACKGROUND", (0, row_index), (-1, row_index), colors.HexColor("#fff1f2")),
+                            (
+                                "TEXTCOLOR",
+                                (priority_column, row_index),
+                                (priority_column, row_index),
+                                colors.HexColor("#b91c1c"),
+                            ),
+                        ]
+                    )
+                elif "常规" in priority:
+                    table_commands.append(
+                        (
+                            "TEXTCOLOR",
+                            (priority_column, row_index),
+                            (priority_column, row_index),
+                            colors.HexColor("#1d4ed8"),
+                        )
+                    )
+            if status_column is not None:
+                status = row[status_column]
+                status_color = (
+                    "#b91c1c"
+                    if "高于上限" in status
+                    else "#b45309"
+                    if "未配置" in status
+                    else "#047857"
+                    if "目标区间内" in status
+                    else "#1d4ed8"
+                )
+                table_commands.append(
+                    (
+                        "TEXTCOLOR",
+                        (status_column, row_index),
+                        (status_column, row_index),
+                        colors.HexColor(status_color),
+                    )
+                )
+        grouped_column = headers.index("标的") if "标的" in headers else None
+        if grouped_column is not None:
+            row_index = 1
+            while row_index < len(normalized):
+                if not normalized[row_index][grouped_column].strip():
+                    row_index += 1
+                    continue
+                group_end = row_index
+                while (
+                    group_end + 1 < len(normalized)
+                    and not normalized[group_end + 1][grouped_column].strip()
+                ):
+                    group_end += 1
+                if group_end > row_index:
+                    table_commands.extend(
+                        [
+                            (
+                                "SPAN",
+                                (grouped_column, row_index),
+                                (grouped_column, group_end),
+                            ),
+                            (
+                                "VALIGN",
+                                (grouped_column, row_index),
+                                (grouped_column, group_end),
+                                "MIDDLE",
+                            ),
+                            (
+                                "BACKGROUND",
+                                (grouped_column, row_index),
+                                (grouped_column, group_end),
+                                colors.HexColor("#f8fafc"),
+                            ),
+                        ]
+                    )
+                row_index = group_end + 1
+        table.setStyle(TableStyle(table_commands))
         story.extend([table, Spacer(1, 7)])
     buffer = BytesIO()
     document = SimpleDocTemplate(
@@ -3369,6 +3519,68 @@ def _render_pdf_chromium(document: str) -> bytes:
                 logger.debug("Unable to remove temporary PDF render file %s", path, exc_info=True)
 
 
+def _merge_grouped_table_cells(body: str, *, header_label: str = "标的") -> str:
+    """Turn blank continuation cells into safe HTML rowspans.
+
+    The report Markdown leaves the target cell blank after the first condition
+    for a security.  Markdown itself has no merged-cell syntax, so this final
+    HTML-only step upgrades those consecutive blank cells without allowing raw
+    HTML from the report payload through the escaping boundary.
+    """
+    import html as _html
+
+    table_pattern = re.compile(
+        r"(<table\b[^>]*>.*?<thead\b[^>]*>.*?</thead>\s*<tbody\b[^>]*>)(.*?)(</tbody>\s*</table>)",
+        re.DOTALL,
+    )
+    row_pattern = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.DOTALL)
+    header_pattern = re.compile(r"<th\b[^>]*>(.*?)</th>", re.DOTALL)
+    cell_pattern = re.compile(r"<td\b[^>]*>.*?</td>", re.DOTALL)
+
+    def plain_text(value: str) -> str:
+        return _html.unescape(re.sub(r"<[^>]+>", "", value)).strip()
+
+    def merge_table(match: re.Match[str]) -> str:
+        prefix, tbody, suffix = match.groups()
+        headers = [plain_text(value) for value in header_pattern.findall(prefix)]
+        if header_label not in headers:
+            return match.group(0)
+        target_column = headers.index(header_label)
+        rows = [cell_pattern.findall(value) for value in row_pattern.findall(tbody)]
+        if not rows or any(len(row) != len(headers) for row in rows):
+            return match.group(0)
+
+        row_index = 0
+        while row_index < len(rows):
+            if not plain_text(rows[row_index][target_column]):
+                row_index += 1
+                continue
+            group_end = row_index
+            while (
+                group_end + 1 < len(rows)
+                and not plain_text(rows[group_end + 1][target_column])
+            ):
+                group_end += 1
+            span = group_end - row_index + 1
+            if span > 1:
+                rows[row_index][target_column] = re.sub(
+                    r"^<td\b",
+                    f'<td rowspan="{span}"',
+                    rows[row_index][target_column],
+                    count=1,
+                )
+                for continuation in range(row_index + 1, group_end + 1):
+                    rows[continuation].pop(target_column)
+            row_index = group_end + 1
+
+        rendered_rows = "\n".join(
+            "<tr>\n" + "\n".join(row) + "\n</tr>" for row in rows
+        )
+        return prefix + rendered_rows + suffix
+
+    return table_pattern.sub(merge_table, body)
+
+
 @app.post("/reports/pdf", dependencies=[Depends(require_auth)])
 async def generate_response_pdf(payload: GeneratePdfRequest):
     """Render one assistant response as a downloadable PDF report."""
@@ -3403,6 +3615,7 @@ async def generate_response_pdf(payload: GeneratePdfRequest):
         safe_markdown,
     )
     body = markdown.markdown(safe_markdown, extensions=["tables", "fenced_code"])
+    body = _merge_grouped_table_cells(body)
     document = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -3415,6 +3628,7 @@ h2 {{ font-size: 15pt; margin-top: 22px; }} h3 {{ font-size: 12pt; }}
 table {{ border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 9pt; }}
 th, td {{ border: 1px solid #cbd5e1; padding: 6px 8px; text-align: left; vertical-align: top; }}
 th {{ background: #eff6ff; }}
+td[rowspan] {{ vertical-align: middle; font-weight: 600; background: #f8fafc; }}
 pre {{ white-space: pre-wrap; background: #f8fafc; border: 1px solid #e2e8f0; padding: 10px; }}
 blockquote {{ border-left: 3px solid #60a5fa; margin-left: 0; padding-left: 12px; color: #475569; }}
 .meta {{ color: #64748b; font-size: 8.5pt; margin-bottom: 20px; }}
@@ -4521,6 +4735,13 @@ register_alpha_routes(app)
 # providing the single policy-aware API used by the Agent and Data Center.
 from src.api.data_routes import register_data_routes  # noqa: E402
 register_data_routes(app, require_local_or_auth)
+
+from src.api.portfolio_daily_routes import register_portfolio_daily_routes  # noqa: E402
+register_portfolio_daily_routes(
+    app,
+    require_local_or_auth,
+    get_service=_get_portfolio_daily_service,
+)
 
 # ============================================================================
 # Scheduled Research Routes

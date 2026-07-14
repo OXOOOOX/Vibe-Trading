@@ -180,8 +180,8 @@ def test_is_available_false_when_mootdx_missing(monkeypatch: pytest.MonkeyPatch)
     real_import = builtins.__import__
 
     def blocking_import(name, *args, **kwargs):
-        if name == "mootdx" or name.startswith("mootdx."):
-            raise ImportError("mootdx not installed")
+        if name in {"mootdx", "tdxpy"} or name.startswith(("mootdx.", "tdxpy.")):
+            raise ImportError(f"{name} not installed")
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", blocking_import)
@@ -189,6 +189,24 @@ def test_is_available_false_when_mootdx_missing(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_is_available_true_when_mootdx_present(fake_client: _FakeStdQuotes) -> None:
+    assert DataLoader().is_available() is True
+
+
+def test_is_available_true_with_direct_tdx_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    import builtins
+    import sys
+
+    real_import = builtins.__import__
+    monkeypatch.delitem(sys.modules, "mootdx", raising=False)
+    monkeypatch.delitem(sys.modules, "mootdx.quotes", raising=False)
+    monkeypatch.setitem(sys.modules, "tdxpy", SimpleNamespace())
+
+    def blocking_import(name, *args, **kwargs):
+        if name == "mootdx" or name.startswith("mootdx."):
+            raise ImportError("mootdx not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocking_import)
     assert DataLoader().is_available() is True
 
 

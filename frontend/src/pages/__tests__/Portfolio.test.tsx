@@ -1,7 +1,13 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
-import { api, type MarketCacheRun, type PortfolioAnalysisSession, type PortfolioReview } from "@/lib/api";
+import {
+  api,
+  type MarketCacheRun,
+  type PortfolioAnalysisSession,
+  type PortfolioMandate,
+  type PortfolioReview,
+} from "@/lib/api";
 import { getMarketAnalysisLabel, getMarketAnalysisPhase, Portfolio } from "../Portfolio";
 
 vi.mock("@/components/charts/CandlestickChart", () => ({
@@ -95,6 +101,49 @@ const review: PortfolioReview = {
   }],
 };
 
+const mandate: PortfolioMandate = {
+  schema_version: 1,
+  version: 2,
+  suggestion_revision: 0,
+  base_currency: "CNY",
+  classification_policy: {},
+  cash_policy: { configured: true, target_amount: 1000, min_amount: 500, max_amount: 2000 },
+  sleeves: [
+    {
+      id: "offensive",
+      name: "进攻型",
+      configured: true,
+      target_amount: 5000,
+      min_amount: 3000,
+      max_amount: 7000,
+      rebalance_band_amount: 500,
+      single_position_max_amount: null,
+      sort_order: 10,
+    },
+    {
+      id: "defensive",
+      name: "防守型",
+      configured: true,
+      target_amount: 3000,
+      min_amount: 2000,
+      max_amount: 4000,
+      rebalance_band_amount: 300,
+      single_position_max_amount: null,
+      sort_order: 20,
+    },
+  ],
+  assignments: {
+    "588870.SH": {
+      active_sleeve_id: "offensive",
+      assigned_by: "agent",
+      confidence: 0.8,
+      user_locked: false,
+    },
+  },
+  classification_history: [],
+  updated_at: "2026-07-13T09:00:00+08:00",
+};
+
 function makeRun(status: string): MarketCacheRun {
   const terminal = status === "completed";
   return {
@@ -135,6 +184,8 @@ describe("Portfolio market cache", () => {
     localStorage.clear();
     vi.restoreAllMocks();
     vi.spyOn(api, "getPortfolioReview").mockResolvedValue(review);
+    vi.spyOn(api, "getPortfolioMandate").mockResolvedValue(mandate);
+    vi.spyOn(api, "listPortfolioDailyRuns").mockResolvedValue({ runs: [] });
     vi.spyOn(api, "lookupPortfolioSecurity").mockResolvedValue({
       code: "588870",
       symbol: "588870.SH",
@@ -142,6 +193,293 @@ describe("Portfolio market cache", () => {
       market: "cn",
       source: "eastmoney",
     });
+  });
+
+  it("starts the one-click portfolio morning meeting", async () => {
+    vi.spyOn(api, "startPortfolioDailyRun").mockResolvedValue({
+      run_id: "dpr-1",
+      market_date: "2026-07-13",
+      status: "queued",
+      stage: "queued",
+      progress: { completed: 0, total: 1, percent: 0 },
+      refresh_policy: "ensure_fresh",
+      report_profile: "master_with_holding_appendices",
+      created_at: "2026-07-13T09:00:00+08:00",
+    });
+    render(<Portfolio />, { wrapper: MemoryRouter });
+
+    await userEvent.setup().click(await screen.findByRole("button", { name: "一键生成今日组合晨会" }));
+
+    expect(api.startPortfolioDailyRun).toHaveBeenCalledWith({ refresh_policy: "ensure_fresh" });
+    expect(await screen.findByText("2026-07-13 · queued")).toBeInTheDocument();
+  });
+
+  it("persists the visible AI allocation before starting when sleeves are unconfigured", async () => {
+    const unconfiguredMandate: PortfolioMandate = {
+      ...mandate,
+      sleeves: mandate.sleeves.map((sleeve) => ({
+        ...sleeve,
+        configured: false,
+        target_amount: 0,
+        min_amount: 0,
+        max_amount: null,
+      })),
+    };
+    vi.mocked(api.getPortfolioMandate).mockResolvedValueOnce(unconfiguredMandate);
+    const updateSpy = vi.spyOn(api, "updatePortfolioMandate").mockImplementation(async (next) => ({
+      ...next,
+      version: next.version + 1,
+    }));
+    const startSpy = vi.spyOn(api, "startPortfolioDailyRun").mockResolvedValue({
+      run_id: "dpr-configured",
+      market_date: "2026-07-14",
+      status: "queued",
+      stage: "queued",
+      progress: { completed: 0, total: 1, percent: 0 },
+      refresh_policy: "ensure_fresh",
+      report_profile: "master_with_holding_appendices",
+      created_at: "2026-07-14T09:00:00+08:00",
+    });
+    render(<Portfolio />, { wrapper: MemoryRouter });
+
+    await userEvent.setup().click(await screen.findByRole("button", { name: "一键生成今日组合晨会" }));
+
+    await waitFor(() => expect(startSpy).toHaveBeenCalledTimes(1));
+    expect(updateSpy).toHaveBeenCalledTimes(1);
+    expect(updateSpy.mock.invocationCallOrder[0]).toBeLessThan(startSpy.mock.invocationCallOrder[0]);
+    const saved = updateSpy.mock.calls[0][0];
+    expect(saved.sleeves.every((sleeve) => sleeve.configured)).toBe(true);
+    expect(saved.sleeves.reduce((total, sleeve) => total + sleeve.target_amount, 0)).toBe(4910);
+  });
+
+  it("shows the hard data gate and retries without presenting a fake completed report", async () => {
+    vi.mocked(api.listPortfolioDailyRuns).mockResolvedValue({
+      runs: [{
+        run_id: "dpr-skipped",
+        market_date: "2026-07-14",
+        status: "completed_with_warnings",
+        stage: "skipped_data_unavailable",
+        progress: { completed: 0, total: 11, percent: 0 },
+        refresh_policy: "ensure_fresh",
+        report_profile: "master_with_holding_appendices",
+        data_status: "limited",
+        analysis_gate: {
+          decision: "skip_report",
+          minimum_coverage_ratio: 0.5,
+          coverage_ratio: 0,
+          eligible_count: 0,
+          total_count: 11,
+          eligible_symbols: [],
+          missing_symbols: ["588870.SH"],
+          missing_market_symbols: ["588870.SH"],
+          missing_research_symbols: ["588870.SH"],
+          model_sessions_started: 0,
+        },
+        warnings: ["数据不足，已停止。"],
+        artifacts: [],
+        created_at: "2026-07-14T09:00:00+08:00",
+      }],
+    });
+    vi.spyOn(api, "retryPortfolioDailyRun").mockResolvedValue({
+      run_id: "dpr-retry",
+      market_date: "2026-07-14",
+      status: "queued",
+      stage: "queued",
+      progress: { completed: 0, total: 11, percent: 0 },
+      refresh_policy: "ensure_fresh",
+      report_profile: "master_with_holding_appendices",
+      created_at: "2026-07-14T09:05:00+08:00",
+    });
+    render(<Portfolio />, { wrapper: MemoryRouter });
+
+    expect(await screen.findByText("2026-07-14 · 已跳过（数据不足）")).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "报告因数据不足已跳过" })).toHaveTextContent(
+      "未启动个股研究模型 Session，也未生成 PDF",
+    );
+    expect(screen.queryByText("综合报告 PDF")).not.toBeInTheDocument();
+
+    await userEvent.setup().click(screen.getByRole("button", { name: "数据恢复后重试" }));
+
+    expect(api.retryPortfolioDailyRun).toHaveBeenCalledWith("dpr-skipped");
+    expect(await screen.findByText("2026-07-14 · queued")).toBeInTheDocument();
+  });
+
+  it("retries one holding report into a new revision", async () => {
+    vi.mocked(api.listPortfolioDailyRuns).mockResolvedValue({
+      runs: [{
+        run_id: "dpr-completed",
+        market_date: "2026-07-14",
+        status: "completed",
+        stage: "completed",
+        progress: { completed: 1, total: 1, percent: 100 },
+        refresh_policy: "ensure_fresh",
+        report_profile: "master_with_holding_appendices",
+        artifacts: [{
+          artifact_id: "holding-pdf",
+          kind: "holding_daily_pdf",
+          symbol: "588870.SH",
+          filename: "holding.pdf",
+          media_type: "application/pdf",
+          size_bytes: 100,
+          sha256: "abc",
+          revision: 1,
+        }],
+        created_at: "2026-07-14T09:00:00+08:00",
+      }],
+    });
+    vi.spyOn(api, "retryPortfolioDailyRun").mockResolvedValue({
+      run_id: "dpr-revision-2",
+      market_date: "2026-07-14",
+      status: "queued",
+      stage: "queued",
+      progress: { completed: 0, total: 1, percent: 0 },
+      refresh_policy: "ensure_fresh",
+      report_profile: "master_with_holding_appendices",
+      revision: 2,
+      parent_run_id: "dpr-completed",
+      retry_symbol: "588870.SH",
+      created_at: "2026-07-14T09:05:00+08:00",
+    });
+    render(<Portfolio />, { wrapper: MemoryRouter });
+
+    await userEvent.setup().click(
+      await screen.findByRole("button", { name: "重试 588870.SH 个股日报" }),
+    );
+
+    expect(api.retryPortfolioDailyRun).toHaveBeenCalledWith("dpr-completed", "588870.SH");
+    expect(await screen.findByText("2026-07-14 · queued")).toBeInTheDocument();
+  });
+
+  it("marks a legacy limited run as unusable and reruns it through the new gate", async () => {
+    vi.mocked(api.listPortfolioDailyRuns).mockResolvedValue({
+      runs: [{
+        run_id: "dpr-legacy-limited",
+        market_date: "2026-07-13",
+        status: "completed",
+        stage: "completed",
+        progress: { completed: 11, total: 11, percent: 100 },
+        refresh_policy: "ensure_fresh",
+        report_profile: "master_with_holding_appendices",
+        data_status: "limited",
+        artifacts: [{
+          artifact_id: "legacy-pdf",
+          kind: "master_pdf",
+          filename: "legacy.pdf",
+          media_type: "application/pdf",
+          size_bytes: 100,
+          sha256: "abc",
+        }],
+        created_at: "2026-07-13T09:00:00+08:00",
+      }],
+    });
+    vi.spyOn(api, "startPortfolioDailyRun").mockResolvedValue({
+      run_id: "dpr-legacy-retry",
+      market_date: "2026-07-14",
+      status: "queued",
+      stage: "queued",
+      progress: { completed: 0, total: 11, percent: 0 },
+      refresh_policy: "ensure_fresh",
+      report_profile: "master_with_holding_appendices",
+      created_at: "2026-07-14T09:05:00+08:00",
+    });
+    render(<Portfolio />, { wrapper: MemoryRouter });
+
+    expect(await screen.findByText("2026-07-13 · 历史报告（数据受限）")).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "历史报告数据受限" })).toHaveTextContent("PDF 已隐藏");
+    expect(screen.queryByText("综合报告 PDF")).not.toBeInTheDocument();
+
+    await userEvent.setup().click(screen.getByRole("button", { name: "按新门禁重新获取" }));
+
+    expect(api.startPortfolioDailyRun).toHaveBeenCalledWith({
+      refresh_policy: "ensure_fresh",
+      force_new: true,
+    });
+  });
+
+  it("updates current cash independently from the holdings import", async () => {
+    const updatedReview: PortfolioReview = {
+      ...review,
+      portfolio_state: { ...review.portfolio_state, cash: 2500 },
+    };
+    vi.spyOn(api, "updatePortfolioCash").mockResolvedValue(updatedReview);
+    const holdingsSpy = vi.spyOn(api, "updatePortfolioHoldings");
+    const user = userEvent.setup();
+    render(<Portfolio />, { wrapper: MemoryRouter });
+
+    const cashInput = await screen.findByLabelText("当前可用现金");
+    await user.clear(cashInput);
+    await user.type(cashInput, "2500");
+    await user.click(screen.getByRole("button", { name: "更新现金" }));
+
+    expect(api.updatePortfolioCash).toHaveBeenCalledWith({ cash: 2500, cash_currency: "CNY" });
+    expect(holdingsSpy).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByLabelText("当前可用现金")).toHaveValue(2500));
+  });
+
+  it("starts from the AI ratio and saves a dragged red-blue allocation", async () => {
+    vi.spyOn(api, "updatePortfolioMandate").mockImplementation(async (next) => next);
+    const user = userEvent.setup();
+    render(<Portfolio />, { wrapper: MemoryRouter });
+
+    const slider = await screen.findByRole("slider", { name: "进攻型目标比例" });
+    expect(slider).toHaveValue("63");
+    await user.click(screen.getByRole("button", { name: "采用 AI 建议 65/35" }));
+    expect(slider).toHaveValue("65");
+    await waitFor(() => expect(api.updatePortfolioMandate).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(api.updatePortfolioMandate).mock.calls[0][0].sleeves.every((item) => item.configured)).toBe(true);
+
+    fireEvent.change(slider, { target: { value: "30" } });
+    expect(slider).toHaveValue("30");
+    await user.click(screen.getByRole("button", { name: "保存组合设置" }));
+
+    await waitFor(() => expect(api.updatePortfolioMandate).toHaveBeenCalledTimes(2));
+    const saved = vi.mocked(api.updatePortfolioMandate).mock.calls[1][0];
+    expect(saved.sleeves.find((item) => item.id === "offensive")?.target_amount).toBe(1473);
+    expect(saved.sleeves.find((item) => item.id === "defensive")?.target_amount).toBe(3437);
+  });
+
+  it("drags an individual holding from the offensive zone to the defensive zone", async () => {
+    const savedMandate: PortfolioMandate = {
+      ...mandate,
+      version: mandate.version + 1,
+      assignments: {
+        ...mandate.assignments,
+        "588870.SH": {
+          ...mandate.assignments["588870.SH"],
+          active_sleeve_id: "defensive",
+          assigned_by: "user",
+          confidence: 1,
+          user_locked: true,
+        },
+      },
+    };
+    vi.spyOn(api, "updatePortfolioAssignment").mockResolvedValue(savedMandate);
+    render(<Portfolio />, { wrapper: MemoryRouter });
+
+    const offensiveZone = await screen.findByRole("region", { name: "进攻型持仓分区" });
+    const defensiveZone = screen.getByRole("region", { name: "防守型持仓分区" });
+    const card = within(offensiveZone).getByTestId("holding-card-588870.SH");
+    const payload = new Map<string, string>();
+    const dataTransfer = {
+      effectAllowed: "none",
+      dropEffect: "none",
+      setData: (type: string, value: string) => payload.set(type, value),
+      getData: (type: string) => payload.get(type) || "",
+    };
+
+    fireEvent.dragStart(card, { dataTransfer });
+    fireEvent.dragEnter(defensiveZone, { dataTransfer });
+    fireEvent.dragOver(defensiveZone, { dataTransfer });
+    fireEvent.drop(defensiveZone, { dataTransfer });
+
+    await waitFor(() => {
+      expect(api.updatePortfolioAssignment).toHaveBeenCalledWith("588870.SH", "defensive");
+      expect(within(defensiveZone).getByTestId("holding-card-588870.SH")).toHaveAttribute(
+        "data-sleeve",
+        "defensive",
+      );
+    });
+    expect(within(defensiveZone).getByText("你的分类")).toBeInTheDocument();
   });
 
   it("renders layered cache metadata and source details in Chinese", async () => {

@@ -12,7 +12,7 @@ from typing import Any, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def utc_now() -> str:
@@ -196,6 +196,7 @@ class MarketCacheStore:
                     status TEXT NOT NULL,
                     requested_sources_json TEXT NOT NULL DEFAULT '[]',
                     actual_sources_json TEXT NOT NULL DEFAULT '[]',
+                    attempts_json TEXT NOT NULL DEFAULT '[]',
                     rows_written INTEGER NOT NULL DEFAULT 0,
                     message TEXT,
                     started_at TEXT,
@@ -214,6 +215,14 @@ class MarketCacheStore:
                 );
                 """
             )
+            item_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(refresh_items)").fetchall()
+            }
+            if "attempts_json" not in item_columns:
+                conn.execute(
+                    "ALTER TABLE refresh_items ADD COLUMN attempts_json TEXT NOT NULL DEFAULT '[]'"
+                )
             conn.execute(
                 "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -313,7 +322,7 @@ class MarketCacheStore:
 
     def update_item(self, run_id: str, symbol: str, interval: str, adjustment: str, **values: Any) -> None:
         allowed = {
-            "status", "requested_sources_json", "actual_sources_json", "rows_written",
+            "status", "requested_sources_json", "actual_sources_json", "attempts_json", "rows_written",
             "message", "started_at", "completed_at",
         }
         payload = {key: value for key, value in values.items() if key in allowed}
@@ -346,6 +355,14 @@ class MarketCacheStore:
             ).fetchone()
         return self.get_run(row["run_id"]) if row else None
 
+    def latest_finished_run(self) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT run_id FROM refresh_runs WHERE status IN ('completed','partial') "
+                "AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 1"
+            ).fetchone()
+        return self.get_run(row["run_id"]) if row else None
+
     @staticmethod
     def _decode_run(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
@@ -361,6 +378,7 @@ class MarketCacheStore:
         result = dict(row)
         result["requested_sources"] = json.loads(result.pop("requested_sources_json") or "[]")
         result["actual_sources"] = json.loads(result.pop("actual_sources_json") or "[]")
+        result["attempts"] = json.loads(result.pop("attempts_json") or "[]")
         return result
 
     def coverage(self, symbol: str, actual_source: str, interval: str, adjustment: str) -> dict[str, Any] | None:
@@ -480,7 +498,7 @@ class MarketCacheStore:
             row = conn.execute(
                 """
                 SELECT * FROM consensus_bars
-                WHERE symbol=? AND adjustment='raw' AND status IN ('verified','single_source')
+                WHERE symbol=? AND adjustment='raw' AND status='verified'
                 ORDER BY bar_time DESC, CASE interval WHEN '1m' THEN 0 WHEN '5m' THEN 1 ELSE 2 END
                 LIMIT 1
                 """,
@@ -628,6 +646,7 @@ class MarketCacheStore:
             item = dict(row)
             sources = json.loads(item.pop("sources_json") or "[]")
             observations = json.loads(item.pop("observations_json") or "[]")
+            quality_flags = json.loads(item.pop("quality_flags") or "[]")
             matching = [
                 entry for entry in coverage
                 if entry["symbol"] == item["symbol"] and entry["interval"] == item["interval"]
@@ -654,9 +673,11 @@ class MarketCacheStore:
                     },
                     "sources": sources,
                     "observations": observations,
+                    "quality_flags": quality_flags,
                     "interval": item["interval"],
                     "bar_time": item["bar_time"],
                     "verified_at": item["verified_at"],
+                    "batch_id": item["batch_id"],
                     "start_date": start_date,
                     "end_date": end_date,
                     "source_count": item["source_count"],

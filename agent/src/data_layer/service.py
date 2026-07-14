@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 from src.market_cache import get_market_refresh_service
 from src.portfolio.state import load_state, normalize_symbol
@@ -36,9 +37,19 @@ PROFILES: dict[str, dict[str, Any]] = {
     # so a report never serially re-fetches every holding and spends its entire
     # data budget waiting on a slow public provider.  ``force_live=True`` keeps
     # an explicit on-demand refresh available for callers that really need it.
-    "holding": {"items": [("1m", "raw"), ("5m", "raw"), ("1D", "qfq")], "lookback_days": 250, "live": False},
+    "holding": {
+        "items": [("1m", "raw"), ("5m", "raw"), ("1D", "qfq")],
+        "lookback_days": 250,
+        "item_lookback_days": {"1m:raw": 10, "5m:raw": 10, "1D:qfq": 250},
+        "live": False,
+    },
     "premarket": {"items": [("1D", "qfq")], "lookback_days": 300, "live": False},
-    "intraday": {"items": [("1m", "raw"), ("5m", "raw"), ("1D", "qfq")], "lookback_days": 300, "live": False},
+    "intraday": {
+        "items": [("1m", "raw"), ("5m", "raw"), ("1D", "qfq")],
+        "lookback_days": 300,
+        "item_lookback_days": {"1m:raw": 10, "5m:raw": 10, "1D:qfq": 300},
+        "live": False,
+    },
     "long_term": {"items": [("1D", "qfq")], "lookback_days": 750, "live": False},
     "backtest": {"items": [("1D", "qfq")], "lookback_days": 2500, "live": False},
 }
@@ -108,7 +119,8 @@ class UnifiedDataService:
         if purpose not in PROFILES:
             raise ValueError(f"unsupported purpose: {purpose}")
         profile = PROFILES[purpose]
-        effective_days = max(int(lookback_days or 0), int(profile["lookback_days"]))
+        requested_days = max(int(lookback_days or 0), 0)
+        effective_days = max(requested_days, int(profile["lookback_days"]))
         include_set = {entry.strip().lower() for entry in (include or ["market", "fundamentals", "news", "reports"])}
         invalid_include = include_set - {"market", "fundamentals", "news", "reports"}
         if invalid_include:
@@ -116,6 +128,7 @@ class UnifiedDataService:
         live = bool(profile["live"] if force_live is None else force_live)
         fingerprint_data = {
             "symbols": normalized, "purpose": purpose, "days": effective_days,
+            "requested_days": requested_days,
             "include": sorted(include_set), "live": live,
         }
         fingerprint = hashlib.sha256(json.dumps(fingerprint_data, sort_keys=True).encode()).hexdigest()
@@ -145,6 +158,7 @@ class UnifiedDataService:
                 purpose=purpose,
                 profile=profile,
                 effective_days=effective_days,
+                requested_days=requested_days,
                 include=include_set,
                 live=live,
                 started=started,
@@ -171,6 +185,7 @@ class UnifiedDataService:
         purpose: str,
         profile: dict[str, Any],
         effective_days: int,
+        requested_days: int,
         include: set[str],
         live: bool,
         started: float,
@@ -182,7 +197,16 @@ class UnifiedDataService:
         pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="unified-data")
         try:
             if "market" in include:
-                tasks.append(("market", pool.submit(self._market_context, symbols, profile, effective_days, live, started, cancel_event)))
+                tasks.append(("market", pool.submit(
+                    self._market_context,
+                    symbols,
+                    profile,
+                    effective_days,
+                    requested_days,
+                    live,
+                    started,
+                    cancel_event,
+                )))
             if "fundamentals" in include:
                 tasks.append(("fundamentals", pool.submit(self._research_context, "fundamental", symbols, started, cancel_event)))
             if "news" in include:
@@ -230,7 +254,7 @@ class UnifiedDataService:
                 "bar_preview": _AGENT_BAR_PREVIEW,
                 "bar_page_size": _BAR_PAGE_SIZE,
                 "reporting_guard": {
-                    "partial_mode": "no_price_or_position_actions",
+                    "analysis_only": "no_exact_price_position_size_or_trade_action",
                     "confirmed_claim": "direct_source_url_and_timestamp_required",
                 },
             },
@@ -241,6 +265,7 @@ class UnifiedDataService:
         symbols: list[str],
         profile: dict[str, Any],
         days: int,
+        requested_days: int,
         live: bool,
         started: float,
         cancel_event: threading.Event,
@@ -252,7 +277,10 @@ class UnifiedDataService:
                 result.setdefault("warnings", []).append("live request deadline reached")
                 break
             item_live = live
-            target_start = (date.today() - timedelta(days=days)).isoformat()
+            item_defaults = profile.get("item_lookback_days") or {}
+            item_default_days = int(item_defaults.get(f"{interval}:{adjustment}", days))
+            item_days = max(requested_days, item_default_days)
+            target_start = (date.today() - timedelta(days=item_days)).isoformat()
             cache_complete = self._has_coverage(symbols, interval, adjustment, target_start)
             run: dict[str, Any] | None = None
             # Settled historical data does not refetch merely because it was read.
@@ -291,18 +319,48 @@ class UnifiedDataService:
                     "adjustment": adjustment,
                     "handle": handle,
                 })
-        result["quotes"] = self.market_service.store.list_quotes(symbols)
+        quotes = self.market_service.store.list_quotes(symbols)
+        preferred_series: dict[str, dict[str, Any]] = {}
+        for series in result["series"]:
+            symbol = str(series["symbol"])
+            current = preferred_series.get(symbol)
+            rank = {"1m": 0, "5m": 1, "1D": 2}.get(str(series["interval"]), 9)
+            current_rank = {"1m": 0, "5m": 1, "1D": 2}.get(str((current or {}).get("interval")), 9)
+            if current is None or rank < current_rank:
+                preferred_series[symbol] = series
+        for quote in quotes:
+            summary = preferred_series.get(str(quote["symbol"])) or {}
+            quote["decision_status"] = summary.get("decision_status", quote.get("status"))
+            quote["actionability"] = summary.get("actionability", "analysis_only")
+            quote["selected_quote"] = summary.get("selected_quote")
+            quote["blocked_reasons"] = summary.get("blocked_reasons", [])
+        result["quotes"] = quotes
         if result["series"]:
             statuses = {series["retrieval"]["mode"] for series in result["series"]}
-            computed_status = "live" if statuses <= {"live"} else ("partial" if "offline" in statuses or "stale_cache" in statuses else "live")
+            computed_status = "live" if statuses <= {"live"} else (
+                "partial" if statuses - {"live", "cache"} else "live"
+            )
             result["status"] = "partial" if result["status"] == "partial" else computed_status
+            result["actionability"] = (
+                "price_actionable"
+                if all(series["actionability"] == "price_actionable" for series in result["series"])
+                else "analysis_only"
+            )
         return result
 
     def _has_coverage(self, symbols: list[str], interval: str, adjustment: str, target_start: str) -> bool:
         coverage = self.market_service.store.list_coverage(symbols)
+        target_date = date.fromisoformat(target_start)
+        # A calendar lookback often starts on a weekend or exchange holiday.
+        # Accept the first observed session within the following week instead
+        # of treating an impossible weekend bar as a permanent coverage gap.
+        latest_acceptable_start = target_date + timedelta(days=7)
         for symbol in symbols:
             matched = [row for row in coverage if row["symbol"] == symbol and row["interval"] == interval and row["actual_adjustment"] == adjustment]
-            if not matched or min(str(row["min_bar_time"])[:10] for row in matched) > target_start:
+            if not matched:
+                return False
+            earliest = min(date.fromisoformat(str(row["min_bar_time"])[:10]) for row in matched)
+            if earliest > latest_acceptable_start:
                 return False
         return True
 
@@ -318,10 +376,25 @@ class UnifiedDataService:
         latest = bars[-1] if bars else None
         run_item = next((item for item in (run or {}).get("items", []) if item.get("symbol") == symbol and item.get("interval") == interval and item.get("adjustment") == adjustment), {})
         live_sources = list(run_item.get("actual_sources") or [])
+        source_attempts = list(run_item.get("attempts") or [])
+        latest_status = str((latest or {}).get("status") or "unresolved")
+        if latest_status == "conflict":
+            latest_status = "unresolved_conflict"
+        current_batch = bool(
+            latest
+            and run
+            and latest.get("batch_id") == run.get("run_id")
+            and live_sources
+        )
+        flags = set((latest or {}).get("quality_flags") or [])
+        forming = "forming_bar" in flags
+        fresh = self._is_fresh_market_bar(symbol, interval, latest)
         if latest is None:
             mode = "offline"
-        elif live_requested and not live_sources:
-            mode = "stale_cache"
+        elif live_requested and not current_batch:
+            mode = "cache_fallback"
+        elif live_requested and latest_status != "verified":
+            mode = latest_status
         elif not live_requested:
             # Cache-first profiles deliberately avoid an in-request provider
             # refresh.  Do not mislabel that read as live merely because the
@@ -329,6 +402,29 @@ class UnifiedDataService:
             mode = "cache"
         else:
             mode = "live"
+        blocked_reasons: list[str] = []
+        if latest_status != "verified":
+            blocked_reasons.append(latest_status)
+        if int((latest or {}).get("source_count") or 0) < 2:
+            blocked_reasons.append("insufficient_independent_sources")
+        if forming:
+            blocked_reasons.append("forming_bar_before_15_10")
+        if latest is not None and not fresh:
+            blocked_reasons.append("stale_verification")
+        if live_requested and not current_batch:
+            blocked_reasons.append("live_refresh_not_verified")
+        actionability = "price_actionable" if not blocked_reasons else "analysis_only"
+        selected_quote = None
+        if latest is not None and actionability == "price_actionable":
+            selected_quote = {
+                "symbol": symbol,
+                "interval": interval,
+                "adjustment": adjustment,
+                "bar_time": latest.get("bar_time"),
+                "price": latest.get("close"),
+                "sources": latest.get("sources", []),
+                "verified_at": latest.get("verified_at"),
+            }
         return {
             "symbol": symbol,
             "interval": interval,
@@ -336,17 +432,57 @@ class UnifiedDataService:
             "bar_count": len(bars),
             "coverage": {"start": bars[0]["bar_time"] if bars else None, "end": latest["bar_time"] if latest else None},
             "latest": latest,
+            "decision_status": "cache_fallback" if mode == "cache_fallback" else latest_status,
+            "actionability": actionability,
+            "selected_quote": selected_quote,
+            "blocked_reasons": list(dict.fromkeys(blocked_reasons)),
+            "freshness": {
+                "bar_time": latest.get("bar_time") if latest else None,
+                "verified_at": latest.get("verified_at") if latest else None,
+                "forming": forming,
+                "fresh": fresh,
+                "current_batch": current_batch,
+                "source_count": latest.get("source_count", 0) if latest else 0,
+                "independent_source_count": latest.get("source_count", 0) if latest else 0,
+            },
+            "source_attempts": source_attempts,
             "retrieval": {
                 "mode": mode,
                 "live_requested": live_requested,
                 "live_sources": live_sources,
-                "cache_fallback_used": mode == "stale_cache",
-                "verification_status": latest.get("status") if latest else "unresolved",
+                "cache_fallback_used": mode == "cache_fallback",
+                "verification_status": latest_status,
                 "source_count": latest.get("source_count", 0) if latest else 0,
                 "sources": latest.get("sources", []) if latest else [],
                 "verified_at": latest.get("verified_at") if latest else None,
             },
         }
+
+    @staticmethod
+    def _is_fresh_market_bar(symbol: str, interval: str, latest: dict[str, Any] | None) -> bool:
+        if not latest or not latest.get("verified_at"):
+            return False
+        try:
+            verified_at = datetime.fromisoformat(
+                str(latest["verified_at"]).replace("Z", "+00:00")
+            ).astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            return False
+        now = datetime.now(timezone.utc)
+        maximum_age = timedelta(hours=96 if interval == "1D" else 1)
+        if now - verified_at > maximum_age:
+            return False
+        if interval != "1D":
+            market_tz = ZoneInfo("Asia/Shanghai") if symbol.upper().endswith((".SH", ".SZ", ".BJ", ".HK")) else ZoneInfo("UTC")
+            try:
+                bar_local = datetime.fromisoformat(
+                    str(latest["bar_time"]).replace("Z", "+00:00")
+                ).astimezone(market_tz)
+            except (TypeError, ValueError):
+                return False
+            if bar_local.date() != datetime.now(market_tz).date():
+                return False
+        return True
 
     def _record_market_sources(self, run: dict[str, Any]) -> None:
         """Record market-source successes and failures without mislabelling run time.
@@ -357,22 +493,23 @@ class UnifiedDataService:
         later supplied usable bars.
         """
         for item in run.get("items") or []:
-            sources = {str(source) for source in item.get("actual_sources") or []}
-            for source in sources:
-                self.control.record_source(f"{source}:market", succeeded=True)
-            requested = [str(source) for source in item.get("requested_sources") or []]
-            attempted = requested[:2]
-            message = str(item.get("message") or "")
-            if len(requested) > 2 and (requested[2] in sources or requested[2] in message):
-                attempted.append(requested[2])
-            for source in attempted:
-                if source in sources:
-                    continue
-                detail = next(
-                    (part.strip() for part in message.split(";") if part.strip().startswith(f"{source}:")),
-                    f"{source} returned no usable bars",
+            for attempt in item.get("attempts") or []:
+                requested = str(attempt.get("requested_source") or "unknown")
+                status = str(attempt.get("status") or "failed")
+                succeeded = status == "success"
+                transport_events = list(attempt.get("transport_events") or [])
+                warning = transport_events[-1].get("primary_error") if transport_events else None
+                self.control.record_source(
+                    f"{requested}:market",
+                    succeeded=succeeded,
+                    status="ok_with_transport_fallback" if succeeded and warning else ("ok" if succeeded else status),
+                    latency_ms=attempt.get("latency_ms"),
+                    error=warning or attempt.get("error"),
+                    error_category="transport_fallback" if warning else attempt.get("error_category"),
+                    requested_source=requested,
+                    actual_source=attempt.get("actual_source"),
+                    upstream_source=attempt.get("upstream_source"),
                 )
-                self.control.record_source(f"{source}:market", succeeded=False, error=detail)
 
     def _research_context(
         self, kind: str, symbols: list[str], started: float, cancel_event: threading.Event
@@ -482,7 +619,87 @@ class UnifiedDataService:
         return {"status": "ok", "coverage": rows, "watchlist": self.control.list_watchlist(), "retention": self._retention_policy()}
 
     def sources(self) -> dict[str, Any]:
-        return {"status": "ok", "sources": self.control.source_health(), "quorum": "two sources; a third is requested when the first two conflict"}
+        stored = {row["source"]: row for row in self.control.source_health()}
+        for current in self._latest_market_source_health():
+            stored[current["source"]] = {**stored.get(current["source"], {}), **current}
+        return {
+            "status": "ok",
+            "sources": [stored[key] for key in sorted(stored)],
+            "quorum": "two fresh independent sources; a third independent source decides disagreements",
+        }
+
+    def _latest_market_source_health(self) -> list[dict[str, Any]]:
+        """Project the latest cache refresh attempts into current source health.
+
+        Portfolio refreshes do not pass through ``get_data_context``. Reading the
+        persisted run here keeps Data Center accurate without rewriting history or
+        treating an old endpoint failure as a current outage.
+        """
+        latest_run = getattr(self.market_service.store, "latest_finished_run", lambda: None)()
+        if not latest_run:
+            return []
+        updated_at = str(latest_run.get("completed_at") or latest_run.get("created_at") or utc_now())
+        try:
+            completed = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        except ValueError:
+            completed = datetime.now(timezone.utc)
+        stale = datetime.now(timezone.utc) - completed.astimezone(timezone.utc) > timedelta(minutes=30)
+        grouped: dict[str, dict[str, Any]] = {}
+        for item in latest_run.get("items") or []:
+            for attempt in item.get("attempts") or []:
+                requested = str(attempt.get("requested_source") or "unknown")
+                group = grouped.setdefault(requested, {"successes": [], "failures": []})
+                target = "successes" if attempt.get("status") == "success" else "failures"
+                group[target].append(attempt)
+
+        records: list[dict[str, Any]] = []
+        for requested, group in grouped.items():
+            successes = group["successes"]
+            failures = group["failures"]
+            representative = successes[-1] if successes else failures[-1]
+            failure = failures[-1] if failures else None
+            fallback_event = None
+            for attempt in reversed(successes):
+                events = list(attempt.get("transport_events") or [])
+                if events:
+                    fallback_event = events[-1]
+                    break
+            if successes and failures:
+                status = "degraded"
+            elif successes and fallback_event:
+                status = "ok_with_transport_fallback"
+            elif successes:
+                status = "ok"
+            else:
+                status = str(representative.get("status") or "failed")
+            error = (
+                failure.get("error") if failure
+                else fallback_event.get("primary_error") if fallback_event
+                else None
+            )
+            category = (
+                failure.get("error_category") if failure
+                else "transport_fallback" if fallback_event
+                else None
+            )
+            records.append({
+                "source": f"{requested}:market",
+                "requested_source": requested,
+                "actual_source": representative.get("actual_source"),
+                "upstream_source": representative.get("upstream_source"),
+                "capability": "market",
+                "consecutive_failures": len(failures) if not successes else 0,
+                "circuit_open": False,
+                "circuit_open_until": None,
+                "last_status": status,
+                "effective_status": "stale" if stale else status,
+                "stale": stale,
+                "last_latency_ms": representative.get("latency_ms"),
+                "error_category": category,
+                "last_error": error,
+                "updated_at": updated_at,
+            })
+        return records
 
     def storage(self) -> dict[str, Any]:
         entries = []

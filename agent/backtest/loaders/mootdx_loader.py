@@ -13,6 +13,7 @@ v0.11.7 — falls through to tushare/akshare for those markets.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -42,6 +43,81 @@ _DAILY_FREQ: dict[str, int] = {
 # minutes against the TDX server.
 _BARS_PAGE = 800
 _MAX_PAGES = 25  # 25 × 800 = 20 000 bars (~10y daily, ~5y 1H, ~3mo 1m)
+
+_DEFAULT_TDX_SERVERS: tuple[tuple[str, int], ...] = (
+    ("180.153.18.170", 7709),
+    ("115.238.56.198", 7709),
+    ("60.191.117.167", 7709),
+)
+
+
+def _tdx_servers() -> tuple[tuple[str, int], ...]:
+    """Return an optional configured endpoint followed by known public TDX nodes."""
+    configured = os.getenv("VIBE_TRADING_TDX_SERVER", "").strip()
+    if not configured:
+        return _DEFAULT_TDX_SERVERS
+    host, separator, raw_port = configured.partition(":")
+    if not separator or not host or not raw_port.isdigit():
+        raise ValueError("VIBE_TRADING_TDX_SERVER must use host:port format")
+    preferred = (host, int(raw_port))
+    return (preferred, *tuple(item for item in _DEFAULT_TDX_SERVERS if item != preferred))
+
+
+class _DirectTdxQuotes:
+    """Quotes-compatible adapter backed by the maintained ``tdxpy`` client."""
+
+    def __init__(self) -> None:
+        from tdxpy.hq import TdxHq_API
+
+        failures: list[str] = []
+        for host, port in _tdx_servers():
+            client = TdxHq_API(heartbeat=False, auto_retry=False, raise_exception=True)
+            try:
+                self._client = client.connect(host, port, time_out=5.0)
+                if not self._client.get_security_count(1):
+                    raise ConnectionError("TDX endpoint did not return a market directory")
+                self._endpoint = f"{host}:{port}"
+                break
+            except Exception as exc:
+                failures.append(f"{host}:{port}={type(exc).__name__}: {exc}")
+                try:
+                    client.disconnect()
+                except Exception:
+                    pass
+        else:
+            raise ConnectionError("all TDX TCP endpoints failed: " + "; ".join(failures))
+
+    @staticmethod
+    def _market(symbol: str) -> int:
+        return 1 if symbol.startswith(("5", "6", "9")) else 0
+
+    def bars(self, symbol: str, frequency: int, start: int = 0, offset: int = 800):
+        rows = self._client.get_security_bars(
+            int(frequency), self._market(symbol), symbol, int(start), min(int(offset), 800)
+        )
+        frame = self._client.to_df(rows or [])
+        if not frame.empty and "volume" not in frame.columns and "vol" in frame.columns:
+            frame["volume"] = frame["vol"]
+        return frame
+
+    def get_k_data(self, code: str, start_date: str, end_date: str):
+        chunks: list[pd.DataFrame] = []
+        start_ts = pd.Timestamp(start_date)
+        for page in range(_MAX_PAGES):
+            frame = self.bars(code, 9, start=page * _BARS_PAGE, offset=_BARS_PAGE)
+            if frame is None or frame.empty:
+                break
+            chunks.append(frame)
+            datetimes = pd.to_datetime(frame["datetime"])
+            if datetimes.min() <= start_ts:
+                break
+        if not chunks:
+            return pd.DataFrame()
+        combined = pd.concat(chunks, ignore_index=True).drop_duplicates(subset=["datetime"])
+        combined.index = pd.to_datetime(combined["datetime"])
+        combined.index.name = "date"
+        end_ts = pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        return combined.loc[start_ts:end_ts]
 
 
 def _is_a_share(code: str) -> bool:
@@ -75,17 +151,25 @@ class DataLoader:
         self._client = None
 
     def is_available(self) -> bool:
-        """Available if mootdx is installed."""
+        """Available with either Mootdx or the compatible direct TDX client."""
         try:
             import mootdx  # noqa: F401
             return True
         except ImportError:
-            return False
+            try:
+                import tdxpy  # noqa: F401
+                return True
+            except ImportError:
+                return False
 
     def _get_client(self):
         if self._client is None:
-            from mootdx.quotes import Quotes
-            self._client = Quotes.factory(market="std")
+            try:
+                from mootdx.quotes import Quotes
+            except ImportError:
+                self._client = _DirectTdxQuotes()
+            else:
+                self._client = Quotes.factory(market="std")
         return self._client
 
     def fetch(
@@ -96,6 +180,7 @@ class DataLoader:
         *,
         interval: str = "1D",
         fields: Optional[List[str]] = None,
+        strict: bool = False,
     ) -> Dict[str, pd.DataFrame]:
         """Fetch A-share OHLCV via mootdx.
 
@@ -145,6 +230,8 @@ class DataLoader:
                     result[code] = df
             except Exception as exc:
                 logger.warning("mootdx failed for %s: %s", code, exc)
+                if strict:
+                    raise
         return result
 
     def _fetch_one(
@@ -209,7 +296,12 @@ class DataLoader:
         """
         if df is None or df.empty:
             return None
-        out = df.rename(columns={"vol": "volume"}).copy()
+        out = df.copy()
+        if "volume" in out.columns:
+            out = out.drop(columns=["vol"], errors="ignore")
+        else:
+            out = out.rename(columns={"vol": "volume"})
+        out = out.loc[:, ~out.columns.duplicated(keep="last")]
         out.index = pd.to_datetime(out.index)
         out.index.name = "trade_date"
         for col in ("open", "high", "low", "close", "volume"):
@@ -233,6 +325,11 @@ class DataLoader:
         if df is None or df.empty:
             return None
         out = df.copy()
+        if "volume" in out.columns:
+            out = out.drop(columns=["vol"], errors="ignore")
+        else:
+            out = out.rename(columns={"vol": "volume"})
+        out = out.loc[:, ~out.columns.duplicated(keep="last")]
         if "datetime" in out.columns:
             out["trade_date"] = pd.to_datetime(out["datetime"])
             out = out.set_index("trade_date")

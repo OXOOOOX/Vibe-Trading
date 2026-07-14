@@ -18,10 +18,13 @@ machines. For batch jobs raise the relevant ``*_MIN_INTERVAL`` env var.
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import threading
 import time
+import urllib.parse
+import urllib.request
 from typing import Any
 
 import requests
@@ -177,3 +180,31 @@ def throttled_get_json(
     )
     response.raise_for_status()
     return response.json()
+
+
+def throttled_urllib_get_json(
+    url: str,
+    *,
+    host_key: str,
+    min_interval: float,
+    params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: float = 15.0,
+) -> Any:
+    """Throttled stdlib GET used when a provider rejects ``requests`` pools.
+
+    Eastmoney occasionally closes reused ``requests`` connections while the
+    same request succeeds through a fresh stdlib connection.  This helper
+    shares the normal host throttle but intentionally does not share the
+    requests session or cookie jar.
+    """
+    merged_headers = {"User-Agent": DEFAULT_USER_AGENT}
+    if headers:
+        merged_headers.update(headers)
+    query = urllib.parse.urlencode(params or {})
+    target = f"{url}{'&' if '?' in url else '?'}{query}" if query else url
+    _THROTTLE.wait(host_key, min_interval)
+    request = urllib.request.Request(target, headers=merged_headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = response.read().decode(response.headers.get_content_charset() or "utf-8")
+    return json.loads(body)

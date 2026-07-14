@@ -98,6 +98,7 @@ def test_feishu_new_research_trigger_is_explicit() -> None:
 
 
 def test_feishu_direct_research_shortcuts_are_deterministic() -> None:
+    assert _direct_research_action("组合晨会") == "morning_meeting"
     assert _direct_research_action("盘前分析") == "premarket"
     assert _direct_research_action("全仓分析！") == "portfolio"
     assert _direct_research_action("个股分析") == "show_stock_picker"
@@ -166,7 +167,7 @@ def test_feishu_group_messages_share_chat_session_but_threads_are_isolated(
     asyncio.run(scenario())
 
 
-def test_feishu_research_menu_offers_three_scopes() -> None:
+def test_feishu_research_menu_offers_morning_meeting_and_three_scopes() -> None:
     card = FeishuChannel._build_research_menu_card(
         reply_chat_id="ou_user",
         chat_type="p2p",
@@ -179,7 +180,7 @@ def test_feishu_research_menu_offers_three_scopes() -> None:
     }
 
     assert card["schema"] == "2.0"
-    assert actions == {"premarket", "show_stock_picker", "portfolio"}
+    assert actions == {"morning_meeting", "premarket", "show_stock_picker", "portfolio"}
     assert all(isinstance(button["behaviors"][0]["value"], dict) for button in buttons)
     assert all(
         button["behaviors"][0]["value"]["base_session_key"] == "feishu:ou_user"
@@ -217,6 +218,109 @@ def test_feishu_stock_picker_offers_holdings_and_six_digit_form() -> None:
             "placeholder": {"tag": "plain_text", "content": "例如：600036"},
         }
     ]
+
+
+def test_feishu_stock_reuse_card_offers_session_report_and_fresh_paths() -> None:
+    card = FeishuChannel._build_stock_reuse_card(
+        {
+            "symbol": "600036.SH",
+            "name": "招商银行",
+            "analysis_action": "holding",
+            "session": {
+                "session_id": "session-today",
+                "title": "飞书·个股·招商银行（600036.SH）",
+                "created_time": "09:30",
+            },
+            "report": {
+                "run_id": "dpr_today",
+                "artifact_id": "pdf-today",
+                "market_date": "2026-07-14",
+                "revision": 2,
+            },
+        },
+        reply_chat_id="ou_user",
+        chat_type="p2p",
+        session_key=None,
+    )
+    callbacks = [
+        button["behaviors"][0]["value"]
+        for button in _elements_with_tag(card, "button")
+    ]
+
+    assert {item["action"] for item in callbacks} == {
+        "resume_stock_session",
+        "send_stock_daily_report",
+        "continue_stock_daily_report",
+        "start_stock_research",
+    }
+    assert all(item["symbol"] == "600036.SH" for item in callbacks)
+    assert all(item["analysis_action"] == "holding" for item in callbacks)
+    assert next(
+        item for item in callbacks if item["action"] == "send_stock_daily_report"
+    )["artifact_id"] == "pdf-today"
+    assert "不会重复生成" in _elements_with_tag(card, "markdown")[0]["content"]
+
+
+def test_feishu_daily_completion_and_holding_picker_use_artifact_callbacks() -> None:
+    complete = FeishuChannel._build_daily_complete_card(
+        "组合报告已生成",
+        run_id="dpr_1",
+        revision=2,
+        reply_chat_id="ou_user",
+        chat_type="p2p",
+        session_key=None,
+    )
+    complete_actions = {
+        button["behaviors"][0]["value"]["action"]
+        for button in _elements_with_tag(complete, "button")
+    }
+    assert complete_actions == {
+        "send_daily_master",
+        "show_daily_reports",
+        "rerun_daily",
+    }
+
+    picker = FeishuChannel._build_daily_report_picker_card(
+        [
+            {
+                "symbol": "600036.SH",
+                "name": "招商银行",
+                "artifact_id": "artifact_1",
+                "status": "completed",
+            }
+        ],
+        run_id="dpr_1",
+        revision=2,
+        reply_chat_id="ou_user",
+        chat_type="p2p",
+        session_key=None,
+    )
+    callbacks = [
+        button["behaviors"][0]["value"]
+        for button in _elements_with_tag(picker, "button")
+    ]
+    assert {item["action"] for item in callbacks} == {
+        "send_daily_report",
+        "retry_daily_holding",
+    }
+    assert all(item["run_id"] == "dpr_1" for item in callbacks)
+    assert next(
+        item for item in callbacks if item["action"] == "send_daily_report"
+    )["artifact_id"] == "artifact_1"
+
+    skipped = FeishuChannel._build_daily_skipped_card(
+        "数据覆盖不足",
+        run_id="dpr_1",
+        revision=2,
+        reply_chat_id="ou_user",
+        chat_type="p2p",
+        session_key=None,
+    )
+    skipped_callbacks = [
+        button["behaviors"][0]["value"]
+        for button in _elements_with_tag(skipped, "button")
+    ]
+    assert skipped_callbacks[0]["action"] == "rerun_daily"
 
 
 def test_feishu_custom_stock_prompt_keeps_one_explicit_target() -> None:
@@ -421,5 +525,34 @@ def test_feishu_research_callback_preserves_base_session(monkeypatch) -> None:
 
         assert captured["base_session_key"] == "feishu:ou_user"
         assert captured["action"] == "premarket"
+
+    asyncio.run(scenario())
+
+
+def test_feishu_stock_selection_checks_reuse_before_starting_agent(monkeypatch) -> None:
+    async def scenario() -> None:
+        channel = FeishuChannel(FeishuConfig(allow_from=["ou_user"]), MessageBus())
+        captured: dict = {}
+
+        async def fake_handle_message(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(channel, "_handle_message", fake_handle_message)
+        await channel._handle_research_card_action(
+            {
+                "action": "custom_stock",
+                "code": "600036",
+                "sender_id": "ou_user",
+                "reply_chat_id": "ou_user",
+                "chat_type": "p2p",
+                "base_session_key": "feishu:ou_user",
+                "source_message_id": "om_card",
+            }
+        )
+
+        assert captured["metadata"]["stock_research_action"] == "prepare"
+        assert captured["metadata"]["research_symbol"] == "600036.SH"
+        assert captured["session_key"].endswith(":research:symbol:600036.SH")
+        assert "600036.SH" in captured["content"]
 
     asyncio.run(scenario())

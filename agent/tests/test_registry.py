@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-import pandas as pd
 import pytest
 
 from backtest.loaders.base import DataLoaderProtocol, NoAvailableSourceError
@@ -12,6 +11,7 @@ from backtest.loaders.registry import (
     FALLBACK_CHAINS,
     LOADER_REGISTRY,
     VALID_SOURCES,
+    get_loader_cls_strict,
     get_loader_cls_with_fallback,
     register,
     resolve_loader,
@@ -291,6 +291,16 @@ class TestGetLoaderWithFallback:
         assert "local" in msg
         # The error must point the user at the Data Bridge config, not a network hop.
         assert "data-bridge" in msg.lower() or "config" in msg.lower()
+
+
+class TestGetLoaderStrict:
+    def test_unavailable_provider_never_falls_back(self) -> None:
+        with patch.dict(LOADER_REGISTRY, {
+            "mootdx": _FakeUnavailableLoader,
+            "tencent": _FakeAvailableLoader,
+        }, clear=True), patch.dict(FALLBACK_CHAINS, {"a_share": ["tencent"]}):
+            with pytest.raises(NoAvailableSourceError, match="mootdx"):
+                get_loader_cls_strict("mootdx")
 
 
 # ---------------------------------------------------------------------------

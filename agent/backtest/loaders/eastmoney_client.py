@@ -23,9 +23,17 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from typing import Any
 
-from backtest.loaders._http import resolve_min_interval, throttled_get, throttled_get_json
+import requests
+
+from backtest.loaders._http import (
+    resolve_min_interval,
+    throttled_get,
+    throttled_get_json,
+    throttled_urllib_get_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +68,7 @@ _FIELDS2 = "f51,f52,f53,f54,f55,f56,f57"
 # Process-level cache of resolved US secids so a repeated ticker never re-hits
 # the search endpoint. Keyed by the upper-cased bare ticker (e.g. "AAPL").
 _US_SECID_CACHE: dict[str, str | None] = {}
+_TRANSPORT_STATE = threading.local()
 
 # A JSONP envelope is a JS callback identifier followed by a parenthesized body,
 # optionally terminated by ';'. The identifier is restricted to legal JS names
@@ -76,7 +85,28 @@ def _min_interval() -> float:
     return resolve_min_interval(_MIN_INTERVAL_ENV, _DEFAULT_MIN_INTERVAL)
 
 
-def get_json(url: str, *, params: dict[str, Any], timeout: float = 15.0) -> Any:
+def _record_transport_event(event: dict[str, Any]) -> None:
+    events = getattr(_TRANSPORT_STATE, "events", None)
+    if events is None:
+        events = []
+        _TRANSPORT_STATE.events = events
+    events.append(event)
+
+
+def consume_transport_events() -> list[dict[str, Any]]:
+    """Return and clear provider transport diagnostics for this thread."""
+    events = list(getattr(_TRANSPORT_STATE, "events", []))
+    _TRANSPORT_STATE.events = []
+    return events
+
+
+def get_json(
+    url: str,
+    *,
+    params: dict[str, Any],
+    timeout: float = 15.0,
+    urllib_fallback: bool = False,
+) -> Any:
     """Issue a throttled Eastmoney GET and decode the body as JSON.
 
     Args:
@@ -93,13 +123,41 @@ def get_json(url: str, *, params: dict[str, Any], timeout: float = 15.0) -> Any:
         requests.HTTPError: Non-2xx response status.
         ValueError: Body is not valid JSON.
     """
-    return throttled_get_json(
-        url,
-        host_key=_HOST_KEY,
-        min_interval=_min_interval(),
-        params=params,
-        timeout=timeout,
-    )
+    try:
+        return throttled_get_json(
+            url,
+            host_key=_HOST_KEY,
+            min_interval=_min_interval(),
+            params=params,
+            timeout=timeout,
+        )
+    except (requests.ConnectionError, requests.Timeout) as primary_error:
+        if not urllib_fallback:
+            raise
+        try:
+            payload = throttled_urllib_get_json(
+                url,
+                host_key=_HOST_KEY,
+                min_interval=_min_interval(),
+                params=params,
+                timeout=timeout,
+            )
+        except Exception as fallback_error:
+            raise RuntimeError(
+                "Eastmoney transport failed via requests "
+                f"({type(primary_error).__name__}: {primary_error}) and urllib "
+                f"({type(fallback_error).__name__}: {fallback_error})"
+            ) from fallback_error
+        _record_transport_event(
+            {
+                "category": "transport_fallback",
+                "primary_transport": "requests",
+                "primary_error": f"{type(primary_error).__name__}: {primary_error}",
+                "selected_transport": "urllib",
+                "status": "success",
+            }
+        )
+        return payload
 
 
 def get_text(
@@ -333,6 +391,7 @@ def fetch_kline(
             "lmt": "1000000",
         },
         timeout=timeout,
+        urllib_fallback=True,
     )
 
     data = payload.get("data") if isinstance(payload, dict) else None

@@ -7,6 +7,7 @@ into the client module), so no test touches a live Eastmoney endpoint.
 from unittest.mock import patch
 
 import pytest
+import requests
 
 from backtest.loaders import eastmoney_client as ec
 
@@ -157,6 +158,20 @@ class TestFetchKline:
         ):
             with pytest.raises(RuntimeError, match="429"):
                 ec.fetch_kline("1.600519", klt=101)
+
+    def test_connection_close_falls_back_to_urllib_and_records_diagnostic(self):
+        payload = {"data": {"klines": ["2026-07-13,2,2.025,2.03,1.99,100,200"]}}
+        ec.consume_transport_events()
+        with patch.object(
+            ec, "throttled_get_json", side_effect=requests.ConnectionError("remote end closed")
+        ), patch.object(ec, "throttled_urllib_get_json", return_value=payload) as urllib_get:
+            rows = ec.fetch_kline("1.588870", klt=101)
+
+        assert rows[-1]["close"] == pytest.approx(2.025)
+        urllib_get.assert_called_once()
+        events = ec.consume_transport_events()
+        assert events[0]["category"] == "transport_fallback"
+        assert "remote end closed" in events[0]["primary_error"]
 
 
 class TestStripJsonp:

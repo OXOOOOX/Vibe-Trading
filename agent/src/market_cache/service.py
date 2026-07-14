@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from src.market_data import get_loader
+from src.market_data import get_loader_strict
 from src.market_verification import normalize_adjustment, source_adjustment_policy, verified_cache_dir
 from src.portfolio.state import load_state, save_state
 
@@ -58,13 +58,19 @@ def _json_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _normalize_bar_time(value: Any, symbol: str) -> tuple[str, str]:
+def _normalize_bar_time(value: Any, symbol: str, interval: str) -> tuple[str, str]:
     timestamp = pd.Timestamp(value)
     market_tz = _market_timezone(symbol)
     if timestamp.tzinfo is None:
         timestamp = timestamp.tz_localize(market_tz)
     local = timestamp.tz_convert(market_tz)
+    if interval == "1D":
+        # Providers encode the same daily session either as local midnight or
+        # the 15:00 market close. Canonicalize by trading date before quorum.
+        local = local.normalize()
     utc = timestamp.tz_convert(timezone.utc)
+    if interval == "1D":
+        utc = local.tz_convert(timezone.utc)
     return utc.isoformat(), local.date().isoformat()
 
 
@@ -87,6 +93,42 @@ def _actual_adjustment(source: str, symbol: str, requested: str) -> tuple[str, s
     return str(policy["adjustment"]), str(policy["confidence"])
 
 
+def _source_fingerprint(source: str, symbol: str) -> str:
+    """Identify the real upstream, not merely the Python adapter."""
+    normalized = source.lower()
+    if normalized == "eastmoney":
+        return "eastmoney_push2his"
+    if normalized == "tencent":
+        return "tencent_ifzq"
+    if normalized == "mootdx":
+        return "tdx_tcp"
+    if normalized == "baostock":
+        return "baostock_tcp"
+    if normalized == "akshare":
+        upper = symbol.upper()
+        is_etf = upper.endswith((".SH", ".SZ", ".BJ")) and upper[:2] in {
+            "15", "16", "50", "51", "52", "56", "58",
+        }
+        return "sina_etf" if is_etf else "eastmoney_push2his"
+    return normalized
+
+
+def _error_category(error: BaseException | str) -> str:
+    text = str(error).lower()
+    if any(token in text for token in ("unavailable", "install", "no module named", "unknown data source")):
+        return "dependency_missing"
+    if any(token in text for token in ("429", "rate limit", "too many requests", "throttle")):
+        return "rate_limited"
+    if isinstance(error, (ConnectionError, TimeoutError, OSError)):
+        return "transport_error"
+    if any(token in text for token in (
+        "connection", "remote end closed", "urlopen", "timed out", "timeout",
+        "network", "socket", "ssl", "transport failed",
+    )):
+        return "transport_error"
+    return "provider_error"
+
+
 def fetch_source_records(
     *,
     requested_source: str,
@@ -98,7 +140,7 @@ def fetch_source_records(
     request_timeout_s: float | None = None,
 ) -> dict[str, Any]:
     """Fetch one source while preserving the actual fallback loader identity."""
-    loader_cls = get_loader(requested_source)
+    loader_cls = get_loader_strict(requested_source)
     loader = loader_cls()
     actual_source = str(getattr(loader, "name", requested_source))
     kwargs: dict[str, Any] = {"interval": interval}
@@ -108,6 +150,8 @@ def fetch_source_records(
         kwargs["adjustment"] = adjustment
     if request_timeout_s is not None and "request_timeout_s" in inspect.signature(loader.fetch).parameters:
         kwargs["request_timeout_s"] = request_timeout_s
+    if "strict" in inspect.signature(loader.fetch).parameters:
+        kwargs["strict"] = True
     data = loader.fetch([symbol], start_date, end_date, **kwargs)
     frame = data.get(symbol)
     if frame is None:
@@ -123,11 +167,12 @@ def fetch_source_records(
         "requested_source": requested_source,
         "actual_source": actual_source,
         "adapter_name": f"{loader_cls.__module__}.{loader_cls.__name__}",
-        "source_fingerprint": actual_source,
+        "source_fingerprint": _source_fingerprint(actual_source, symbol),
         "requested_adjustment": normalize_adjustment(adjustment),
         "actual_adjustment": actual_adjustment,
         "adjustment_confidence": confidence,
         "records": records,
+        "transport_events": list(getattr(loader, "transport_events", []) or []),
     }
 
 
@@ -135,10 +180,17 @@ def source_candidates(symbol: str, interval: str, adjustment: str) -> list[str]:
     upper = symbol.upper()
     if upper.endswith((".SH", ".SZ", ".BJ")):
         if interval in {"1m", "5m"}:
-            return ["eastmoney", "tencent", "mootdx"]
+            # Tencent + TDX are the fastest independent A-share pair in normal
+            # operation.  Eastmoney remains the third-source tie breaker, but
+            # no longer delays every symbol when its public endpoint is being
+            # throttled or temporarily closes connections.
+            return ["tencent", "mootdx", "eastmoney"]
         if adjustment == "qfq":
-            return ["tencent", "eastmoney", "akshare"]
-        return ["eastmoney", "tencent", "mootdx"]
+            # BaoStock is slower than Tencent but much less prone to public-HTTP
+            # throttling than Eastmoney.  Put the reliable quorum pair first;
+            # the remaining adapters are only needed for failure/conflict.
+            return ["tencent", "baostock", "eastmoney", "akshare"]
+        return ["tencent", "mootdx", "eastmoney"]
     if upper.endswith(".US"):
         return ["yahoo", "stooq"]
     if upper.endswith(".HK"):
@@ -153,6 +205,31 @@ def _spread(values: list[float]) -> float | None:
         return 0.0 if values else None
     median = statistics.median(values)
     return ((max(values) - min(values)) / median * 100.0) if median else None
+
+
+def _price_tolerance(*, price: float, interval: str, tick_size: float) -> float:
+    return max(2 * tick_size, abs(price) * (0.002 if interval != "1D" else 0.005))
+
+
+def _within_tolerance(left: float, right: float, *, interval: str, tick_size: float) -> bool:
+    reference = statistics.median([left, right])
+    return abs(left - right) <= _price_tolerance(
+        price=float(reference), interval=interval, tick_size=tick_size
+    )
+
+
+def _session_is_settled(session_date: str, symbol: str) -> bool:
+    """Return whether a session can safely reuse same-bar cached observations."""
+    local_now = datetime.now(_market_timezone(symbol))
+    try:
+        session = date.fromisoformat(str(session_date))
+    except ValueError:
+        return False
+    if session < local_now.date():
+        return True
+    if session > local_now.date():
+        return False
+    return local_now.time() >= datetime.strptime("15:10", "%H:%M").time()
 
 
 class MarketRefreshService:
@@ -278,7 +355,7 @@ class MarketRefreshService:
                     if result["status"] == "interrupted":
                         interrupted = True
                         break
-                    if result["status"] == "conflict":
+                    if result["status"] == "unresolved_conflict":
                         conflicts += 1
                     elif result["status"] == "unresolved":
                         failed += 1
@@ -298,7 +375,10 @@ class MarketRefreshService:
 
             completed_symbols = [
                 item["symbol"] for item in (self.store.get_run(run_id) or {}).get("items", [])
-                if item.get("status") in {"verified", "single_source", "conflict"}
+                if item.get("status") in {
+                    "verified", "single_source", "source_lag", "provisional_mix",
+                    "basis_mismatch", "unresolved_conflict",
+                }
             ]
             for symbol in set(completed_symbols):
                 self.store.refresh_latest_quote(symbol)
@@ -364,28 +444,39 @@ class MarketRefreshService:
         )
         actual_sources: list[str] = []
         source_errors: list[str] = []
+        attempts: list[dict[str, Any]] = []
+        successes: dict[str, dict[str, Any]] = {}
         rows_written = 0
-        primary_latest: float | None = None
-        needs_third_source = False
+        tick_size = float(self.store.instrument(symbol).get("tick_size") or 0.001)
+
+        def interrupted_result() -> dict[str, Any]:
+            self.store.update_item(
+                run_id, symbol, interval, adjustment,
+                status="interrupted",
+                actual_sources_json=json.dumps(actual_sources),
+                attempts_json=json.dumps(attempts, ensure_ascii=False),
+                rows_written=rows_written,
+                message="refresh deadline reached",
+                completed_at=utc_now(),
+            )
+            return {
+                "status": "interrupted",
+                "rows_written": rows_written,
+                "actual_sources": actual_sources,
+                "attempts": attempts,
+            }
 
         for index, requested_source in enumerate(requested_sources):
             if self._should_stop(deadline, should_cancel):
-                message = "refresh deadline reached"
-                self.store.update_item(
-                    run_id, symbol, interval, adjustment,
-                    status="interrupted", message=message, completed_at=utc_now(),
-                )
-                return {"status": "interrupted", "rows_written": rows_written, "actual_sources": actual_sources}
-            if index >= 2 and not needs_third_source:
-                break
+                return interrupted_result()
             self.store.update_run(run_id, current_symbol=symbol, current_source=requested_source)
-            checkpoint = index > 0 and not needs_third_source
+            checkpoint = index > 0
             fetch_start = (date.fromisoformat(end_date) - timedelta(days=7)).isoformat() if checkpoint else start_date
 
             if not force and not checkpoint:
                 actual_hint = requested_source
                 try:
-                    actual_hint = str(getattr(get_loader(requested_source), "name", requested_source))
+                    actual_hint = str(getattr(get_loader_strict(requested_source), "name", requested_source))
                 except Exception:  # The injected test fetcher may use synthetic source names.
                     pass
                 tail = self.store.tail_start(
@@ -396,6 +487,7 @@ class MarketRefreshService:
                     if tail_date > fetch_start:
                         fetch_start = tail_date
 
+            attempt_started = time.monotonic()
             try:
                 fetch_kwargs = {
                     "requested_source": requested_source,
@@ -411,19 +503,52 @@ class MarketRefreshService:
                     **fetch_kwargs,
                 )
             except Exception as exc:  # noqa: BLE001
-                source_errors.append(f"{requested_source}: {exc}")
+                category = _error_category(exc)
+                detail = f"{requested_source}: {type(exc).__name__}: {exc}"
+                source_errors.append(detail)
+                attempts.append(
+                    {
+                        "requested_source": requested_source,
+                        "actual_source": None,
+                        "upstream_source": None,
+                        "status": "failed",
+                        "error_category": category,
+                        "error": str(exc),
+                        "latency_ms": round((time.monotonic() - attempt_started) * 1000, 1),
+                    }
+                )
                 continue
             if self._should_stop(deadline, should_cancel):
-                self.store.update_item(
-                    run_id, symbol, interval, adjustment,
-                    status="interrupted", message="refresh deadline reached", completed_at=utc_now(),
-                )
-                return {"status": "interrupted", "rows_written": rows_written, "actual_sources": actual_sources}
+                return interrupted_result()
             actual_source = str(probe["actual_source"])
             actual_adjustment = str(probe["actual_adjustment"])
+            fingerprint = str(probe.get("source_fingerprint") or actual_source)
+            attempt: dict[str, Any] = {
+                "requested_source": requested_source,
+                "actual_source": actual_source,
+                "upstream_source": fingerprint,
+                "actual_adjustment": actual_adjustment,
+                "status": "success",
+                "error_category": None,
+                "error": None,
+                "latency_ms": round((time.monotonic() - attempt_started) * 1000, 1),
+                "transport_events": list(probe.get("transport_events") or []),
+            }
             if actual_adjustment != adjustment:
+                attempt.update(
+                    status="basis_mismatch",
+                    error_category="basis_mismatch",
+                    error=f"requested {adjustment}, provider returned {actual_adjustment}",
+                )
+                attempts.append(attempt)
                 continue
-            if actual_source in actual_sources:
+            if fingerprint in successes:
+                attempt.update(
+                    status="duplicate_upstream",
+                    error_category="duplicate_upstream",
+                    error=f"same upstream as {successes[fingerprint]['actual_source']}",
+                )
+                attempts.append(attempt)
                 continue
 
             normalized = self._normalize_records(
@@ -431,43 +556,46 @@ class MarketRefreshService:
                 acquisition_mode="checkpoint" if checkpoint else "network",
             )
             if not normalized:
+                attempt.update(
+                    status="no_coverage",
+                    error_category="no_coverage",
+                    error="provider returned no usable bars",
+                )
+                attempts.append(attempt)
                 continue
-            latest_close = normalized[-1]["close"]
-            if primary_latest is None:
-                primary_latest = latest_close
-            elif latest_close is not None:
-                tick_size = float(self.store.instrument(symbol).get("tick_size") or 0.001)
-                price_delta = abs(float(latest_close) - float(primary_latest))
-                tolerance = max(2 * tick_size, abs(float(primary_latest)) * (0.002 if interval != "1D" else 0.005))
-                needs_third_source = price_delta > tolerance
-                if needs_third_source and checkpoint:
-                    try:
-                        full_fetch_kwargs = {
-                            "requested_source": requested_source,
-                            "symbol": symbol,
-                            "start_date": start_date,
-                            "end_date": end_date,
-                            "interval": interval,
-                            "adjustment": adjustment,
-                        }
-                        if deadline is not None:
-                            full_fetch_kwargs["request_timeout_s"] = max(1.0, min(10.0, deadline - time.monotonic()))
-                        full_probe = self.fetcher(**full_fetch_kwargs)
-                        if self._should_stop(deadline, should_cancel):
-                            self.store.update_item(
-                                run_id, symbol, interval, adjustment,
-                                status="interrupted", message="refresh deadline reached", completed_at=utc_now(),
-                            )
-                            return {"status": "interrupted", "rows_written": rows_written, "actual_sources": actual_sources}
-                        normalized = self._normalize_records(
-                            full_probe, symbol=symbol, interval=interval, batch_id=run_id,
-                            acquisition_mode="conflict_backfill",
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        source_errors.append(f"{requested_source} backfill: {exc}")
-
             rows_written += self.store.upsert_source_bars(normalized)
-            actual_sources.append(actual_source)
+            if actual_source not in actual_sources:
+                actual_sources.append(actual_source)
+            latest = normalized[-1]
+            attempt.update(
+                rows=len(normalized),
+                latest_bar_time=latest["bar_time"],
+                latest_close=latest["close"],
+            )
+            attempts.append(attempt)
+            successes[fingerprint] = {
+                "actual_source": actual_source,
+                "fingerprint": fingerprint,
+                "bar_time": latest["bar_time"],
+                "close": float(latest["close"]),
+            }
+
+            grouped_successes: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for success in successes.values():
+                grouped_successes[str(success["bar_time"])].append(success)
+            has_quorum = any(
+                _within_tolerance(
+                    float(left["close"]), float(right["close"]),
+                    interval=interval, tick_size=tick_size,
+                )
+                for group in grouped_successes.values()
+                for left_index, left in enumerate(group)
+                for right in group[left_index + 1:]
+            )
+            if has_quorum:
+                break
+            if any(len(group) >= 3 for group in grouped_successes.values()):
+                break
 
         if interval == "5m" and adjustment == "raw":
             rows_written += self._derive_five_minute_bars(symbol, run_id)
@@ -476,7 +604,10 @@ class MarketRefreshService:
         consensus = self._recompute_consensus(symbol, interval, adjustment, run_id)
         self.store.prune_sessions(symbol, interval, adjustment, keep_sessions)
         latest = consensus[-1] if consensus else None
-        status = str(latest["status"]) if latest else "unresolved"
+        if not successes:
+            status = "basis_mismatch" if any(item["status"] == "basis_mismatch" for item in attempts) else "unresolved"
+        else:
+            status = str(latest["status"]) if latest else "unresolved"
         message = "; ".join(source_errors) if source_errors else None
         if not latest:
             message = f"No compatible bars were returned{'; ' + message if message else ''}"
@@ -484,11 +615,17 @@ class MarketRefreshService:
             run_id, symbol, interval, adjustment,
             status=status,
             actual_sources_json=json.dumps(actual_sources),
+            attempts_json=json.dumps(attempts, ensure_ascii=False),
             rows_written=rows_written,
             message=message,
             completed_at=utc_now(),
         )
-        return {"status": status, "rows_written": rows_written, "actual_sources": actual_sources}
+        return {
+            "status": status,
+            "rows_written": rows_written,
+            "actual_sources": actual_sources,
+            "attempts": attempts,
+        }
 
     def _normalize_records(
         self,
@@ -510,7 +647,7 @@ class MarketRefreshService:
             close = _float(record.get("close"))
             if timestamp is None or close is None:
                 continue
-            bar_time, session_date = _normalize_bar_time(timestamp, symbol)
+            bar_time, session_date = _normalize_bar_time(timestamp, symbol, interval)
             raw_volume = _float(record.get("volume"))
             volume = raw_volume * multiplier if raw_volume is not None and unit != "unknown" else None
             amount = _float(record.get("amount"))
@@ -608,52 +745,112 @@ class MarketRefreshService:
         self, symbol: str, interval: str, adjustment: str, batch_id: str
     ) -> list[dict[str, Any]]:
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in self.store.source_bars(symbol, interval, adjustment):
+        source_rows = self.store.source_bars(symbol, interval, adjustment)
+        for row in source_rows:
             grouped[row["bar_time"]].append(row)
+        if not grouped:
+            return []
         tick_size = float(self.store.instrument(symbol).get("tick_size") or 0.001)
+        latest_bar_time = max(grouped)
+        current_latest_by_source: dict[str, str] = {}
+        for row in source_rows:
+            if row.get("batch_id") != batch_id:
+                continue
+            fingerprint = str(row["source_fingerprint"])
+            current_latest_by_source[fingerprint] = max(
+                str(row["bar_time"]), current_latest_by_source.get(fingerprint, "")
+            )
+        current_max_time = max(current_latest_by_source.values(), default=None)
+        lagging_sources = {
+            fingerprint
+            for fingerprint, current_latest in current_latest_by_source.items()
+            if current_max_time is not None and current_latest < current_max_time
+        }
         rows: list[dict[str, Any]] = []
         for bar_time, candidates in grouped.items():
             independent: dict[str, dict[str, Any]] = {}
             for candidate in candidates:
-                independent[candidate["source_fingerprint"]] = candidate
+                fingerprint = str(candidate["source_fingerprint"])
+                previous = independent.get(fingerprint)
+                if previous is None or str(candidate["retrieved_at"]) >= str(previous["retrieved_at"]):
+                    independent[fingerprint] = candidate
             all_observations = list(independent.values())
-            closes = [float(row["close"]) for row in all_observations if row["close"] is not None]
+            current_observations = [row for row in all_observations if row.get("batch_id") == batch_id]
+            is_latest = bar_time == latest_bar_time
+            settled = _session_is_settled(str(all_observations[0]["session_date"]), symbol)
+            current_only = bool(is_latest and current_observations and not settled)
+            observations = current_observations if current_only else all_observations
+            closes = [float(row["close"]) for row in observations if row["close"] is not None]
             if not closes:
                 continue
             price_spread = _spread(closes)
             tolerance_pct = max((2 * tick_size / statistics.median(closes) * 100), 0.2 if interval != "1D" else 0.5)
-            observations = all_observations
             flags: list[str] = []
-            if len(all_observations) >= 3 and price_spread is not None and price_spread > tolerance_pct:
-                closest_pair = min(
-                    (
-                        (left, right)
-                        for index, left in enumerate(all_observations)
-                        for right in all_observations[index + 1:]
-                    ),
-                    key=lambda pair: abs(float(pair[0]["close"]) - float(pair[1]["close"])),
-                )
-                pair_spread = _spread([float(closest_pair[0]["close"]), float(closest_pair[1]["close"])])
-                if pair_spread is not None and pair_spread <= tolerance_pct:
-                    observations = list(closest_pair)
-                    closes = [float(row["close"]) for row in observations]
-                    price_spread = pair_spread
+            if current_only and len(all_observations) > len(current_observations):
+                flags.append("stale_observation_excluded")
+            elif (
+                is_latest
+                and settled
+                and current_observations
+                and len(all_observations) > len(current_observations)
+            ):
+                flags.append("cached_confirmation_reused")
+
+            included = list(observations)
+            if len(observations) == 1:
+                if is_latest and lagging_sources:
+                    status = "source_lag"
+                    flags.append("source_lag")
+                elif is_latest and len(all_observations) > len(observations):
+                    status = "provisional_mix"
+                    flags.append("provisional_mix")
+                else:
+                    status = "single_source"
+            elif price_spread is not None and price_spread <= tolerance_pct:
+                status = "verified"
+            else:
+                agreeing_pairs = [
+                    (left, right)
+                    for left_index, left in enumerate(observations)
+                    for right in observations[left_index + 1:]
+                    if _within_tolerance(
+                        float(left["close"]), float(right["close"]),
+                        interval=interval, tick_size=tick_size,
+                    )
+                ]
+                if len(observations) >= 3 and agreeing_pairs:
+                    pair = min(
+                        agreeing_pairs,
+                        key=lambda value: abs(float(value[0]["close"]) - float(value[1]["close"])),
+                    )
+                    included = [pair[0], pair[1]]
+                    closes = [float(row["close"]) for row in included]
+                    price_spread = _spread(closes)
+                    status = "verified"
                     flags.append("outlier_excluded")
-            status = "single_source" if len(closes) == 1 else (
-                "verified" if price_spread is not None and price_spread <= tolerance_pct else "conflict"
-            )
-            volumes = [float(row["volume"]) for row in observations if row["volume"] is not None]
-            amounts = [float(row["amount"]) for row in observations if row["amount"] is not None]
-            volume_spread = _spread(volumes) if len(volumes) == len(observations) else None
-            amount_spread = _spread(amounts) if len(amounts) == len(observations) else None
+                else:
+                    included = []
+                    status = "unresolved_conflict"
+                    flags.append("no_source_majority")
+
+            local_now = datetime.now(_market_timezone(symbol))
+            if (
+                interval == "1D"
+                and observations[0]["session_date"] == local_now.date().isoformat()
+                and local_now.time() < datetime.strptime("15:10", "%H:%M").time()
+            ):
+                flags.append("forming_bar")
+
+            volumes = [float(row["volume"]) for row in included if row["volume"] is not None]
+            amounts = [float(row["amount"]) for row in included if row["amount"] is not None]
+            volume_spread = _spread(volumes) if included and len(volumes) == len(included) else None
+            amount_spread = _spread(amounts) if included and len(amounts) == len(included) else None
             if volume_spread is not None and volume_spread > 5:
                 flags.append("volume_conflict")
             if amount_spread is not None and amount_spread > 5:
                 flags.append("amount_conflict")
 
-            def median_field(field: str) -> float | None:
-                values = [float(row[field]) for row in observations if row[field] is not None]
-                return statistics.median(values) if values else None
+            representative = max(included, key=lambda row: str(row["retrieved_at"])) if included else None
 
             public_observations = [
                 {
@@ -671,27 +868,42 @@ class MarketRefreshService:
                     "adjustment": row["actual_adjustment"],
                     "adjustment_confidence": row["adjustment_confidence"],
                     "acquisition_mode": row["acquisition_mode"],
-                    "included_in_consensus": row in observations,
-                    "exclude_reason": None if row in observations else "price_outlier",
+                    "retrieved_at": row["retrieved_at"],
+                    "batch_id": row["batch_id"],
+                    "included_in_consensus": row in included,
+                    "exclude_reason": (
+                        None if row in included
+                        else "stale_observation" if row not in observations
+                        else "price_outlier" if "outlier_excluded" in flags
+                        else "no_source_majority"
+                    ),
                 }
                 for row in all_observations
             ]
-            volume = median_field("volume") if len(volumes) == len(observations) else None
-            amount = median_field("amount") if len(amounts) == len(observations) else None
+            volume = float(representative["volume"]) if representative and representative["volume"] is not None else None
+            amount = float(representative["amount"]) if representative and representative["amount"] is not None else None
             rows.append(
                 {
                     "symbol": symbol.upper(), "interval": interval, "bar_time": bar_time,
                     "session_date": observations[0]["session_date"], "adjustment": adjustment,
-                    "open": median_field("open"), "high": median_field("high"),
-                    "low": median_field("low"), "close": statistics.median(closes),
+                    "open": representative["open"] if representative else None,
+                    "high": representative["high"] if representative else None,
+                    "low": representative["low"] if representative else None,
+                    "close": representative["close"] if representative else None,
                     "volume": volume, "amount": amount,
                     "vwap": amount / volume if amount is not None and volume not in (None, 0) else None,
                     "status": status, "price_spread_pct": price_spread,
                     "volume_spread_pct": volume_spread, "amount_spread_pct": amount_spread,
-                    "source_count": len(observations),
-                    "sources_json": json.dumps([row["actual_source"] for row in observations]),
+                    "source_count": len(included),
+                    "sources_json": json.dumps([row["actual_source"] for row in included]),
                     "observations_json": json.dumps(public_observations, ensure_ascii=False),
-                    "quality_flags": json.dumps(flags), "verified_at": utc_now(), "batch_id": batch_id,
+                    "quality_flags": json.dumps(flags),
+                    "verified_at": utc_now() if current_observations else max(
+                        str(row["retrieved_at"]) for row in all_observations
+                    ),
+                    "batch_id": batch_id if current_observations else max(
+                        all_observations, key=lambda row: str(row["retrieved_at"])
+                    )["batch_id"],
                 }
             )
         self.store.replace_consensus(rows)
@@ -715,7 +927,10 @@ class MarketRefreshService:
                 continue
             quote = quotes.get(symbol)
             diagnostic = latest_raw.get(symbol)
-            if diagnostic and diagnostic.get("status") in {"conflict", "stale", "unresolved"} and (
+            if diagnostic and diagnostic.get("status") in {
+                "unresolved_conflict", "source_lag", "provisional_mix", "basis_mismatch",
+                "single_source", "stale", "unresolved",
+            } and (
                 not quote or str(diagnostic.get("bar_time")) >= str(quote.get("bar_time"))
             ):
                 holding["market_status"] = diagnostic.get("status")
@@ -730,7 +945,7 @@ class MarketRefreshService:
                     changed = True
                 continue
             close = _float(quote.get("last_price"))
-            if close is None or quote.get("status") not in {"verified", "single_source"}:
+            if close is None or quote.get("status") != "verified":
                 continue
             quantity = _float(holding.get("quantity"))
             cost_price = _float(holding.get("cost_price"))

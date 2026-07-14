@@ -82,6 +82,36 @@ def test_reportlab_fallback_renders_markdown_table() -> None:
     assert len(pdf) > 1_000
 
 
+def test_reportlab_fallback_renders_colored_condition_table() -> None:
+    pdf = api_server._render_pdf_reportlab(
+        "组合晨会",
+        "# 条件建议\n\n"
+        "| 优先级 | 标的 | 触发条件 | 建议响应 |\n"
+        "|---|---|---|---|\n"
+        "| 🔴 高 | 格力电器（000651.SZ） | 跌破37.05（成本线） | 重新评估持仓逻辑 |\n"
+        "| 🔵 常规 | 招商银行（600036.SH） | 放量突破38.00 | 评估加仓机会 |",
+    )
+
+    assert pdf.startswith(b"%PDF-")
+    assert len(pdf) > 1_000
+
+
+def test_condition_table_blank_targets_become_one_rowspan() -> None:
+    body = (
+        "<table><thead><tr>"
+        "<th>优先级</th><th>标的</th><th>触发条件</th><th>建议响应</th>"
+        "</tr></thead><tbody>"
+        "<tr><td>🔴 高</td><td>格力电器（000651.SZ）</td><td>跌破37.05</td><td>重新评估</td></tr>"
+        "<tr><td>🔵 常规</td><td></td><td>突破38.00</td><td>评估加仓</td></tr>"
+        "</tbody></table>"
+    )
+
+    merged = api_server._merge_grouped_table_cells(body)
+
+    assert '<td rowspan="2">格力电器（000651.SZ）</td>' in merged
+    assert merged.count("格力电器（000651.SZ）") == 1
+
+
 def test_reportlab_fallback_replaces_emoji_with_text_badges() -> None:
     pdf = api_server._render_pdf_reportlab(
         "Signals",

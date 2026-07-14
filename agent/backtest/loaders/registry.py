@@ -224,3 +224,27 @@ def get_loader_cls_with_fallback(source: str) -> Type[Any]:
     raise NoAvailableSourceError(
         f"Data source '{source}' is unavailable and no fallback found."
     )
+
+
+def get_loader_cls_strict(source: str) -> Type[Any]:
+    """Return exactly the requested loader class or fail loudly.
+
+    Verification and provenance-sensitive callers must never accept the normal
+    same-market fallback: doing so can turn a missing independent provider into
+    a second adapter for a provider that was already queried.
+    """
+    _ensure_registered()
+    loader_cls = LOADER_REGISTRY.get(source)
+    if loader_cls is None:
+        raise NoAvailableSourceError(f"Unknown data source: {source}")
+    try:
+        instance = loader_cls()
+    except Exception as exc:
+        raise NoAvailableSourceError(
+            f"Data source '{source}' failed to initialize: {type(exc).__name__}: {exc}"
+        ) from exc
+    if not instance.is_available():
+        raise NoAvailableSourceError(
+            f"Data source '{source}' is unavailable; install or configure that exact provider."
+        )
+    return loader_cls

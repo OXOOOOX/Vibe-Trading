@@ -88,8 +88,27 @@ MSG_TYPE_MAP = {
 
 _NEW_RESEARCH_PATTERN = re.compile(r"^[\s\u3000]*(?:发起|开始|创建|做)?[\s\u3000]*新的?研究[\s\u3000！!。.]*(?:吧)?[\s\u3000]*$")
 _RESEARCH_FLOW = "new_research"
-_RESEARCH_ACTIONS = {"show_stock_picker", "premarket", "portfolio", "holding", "custom_stock"}
+_RESEARCH_ACTIONS = {
+    "morning_meeting",
+    "show_stock_picker",
+    "premarket",
+    "portfolio",
+    "holding",
+    "custom_stock",
+    "show_daily_reports",
+    "send_daily_report",
+    "send_daily_master",
+    "retry_daily_holding",
+    "rerun_daily",
+    "cancel_daily_run",
+    "resume_stock_session",
+    "send_stock_daily_report",
+    "continue_stock_daily_report",
+    "start_stock_research",
+}
 _DIRECT_RESEARCH_ACTIONS = {
+    "组合晨会": "morning_meeting",
+    "一键晨会": "morning_meeting",
     "盘前分析": "premarket",
     "盘前研究": "premarket",
     "全仓分析": "portfolio",
@@ -1047,6 +1066,7 @@ class FeishuChannel(BaseChannel):
             session_key=session_key,
         )
         choices = [
+            ("组合晨会", "morning_meeting", "primary", "research_morning_meeting"),
             ("盘前分析", "premarket", "primary", "research_premarket"),
             ("个股分析", "show_stock_picker", "default", "research_stock"),
             ("持仓分析", "portfolio", "default", "research_portfolio"),
@@ -1194,6 +1214,318 @@ class FeishuChannel(BaseChannel):
                 "title": _plain_text("选择个股"),
             },
             "body": {"elements": elements},
+        }
+
+    @classmethod
+    def _build_stock_reuse_card(
+        cls,
+        context: dict[str, Any],
+        *,
+        reply_chat_id: str,
+        chat_type: str,
+        session_key: str | None,
+    ) -> dict[str, Any]:
+        """Ask whether today's stock Session/report should be reused."""
+        route = cls._research_route(
+            reply_chat_id=reply_chat_id,
+            chat_type=chat_type,
+            session_key=session_key,
+        )
+        symbol = str(context.get("symbol") or "")
+        name = str(context.get("name") or symbol)
+        analysis_action = str(context.get("analysis_action") or "holding")
+        session = dict(context.get("session") or {})
+        report = dict(context.get("report") or {})
+        common = {
+            "symbol": symbol,
+            "name": name,
+            "analysis_action": analysis_action,
+        }
+
+        status_lines = ["已检查今天可复用的内容："]
+        if session:
+            created_time = str(session.get("created_time") or "今天")
+            title = str(session.get("title") or "个股研究 Session")
+            status_lines.append(f"- Session：{title}（{created_time} 创建）")
+        else:
+            status_lines.append("- Session：今天尚未创建")
+        if report:
+            status_lines.append(
+                f"- 个股日报：{report.get('market_date') or '今日'} · "
+                f"revision {report.get('revision') or 1}"
+            )
+        else:
+            status_lines.append("- 个股日报：今天尚未生成")
+        status_lines.append("发送或载入已有报告都不会重复生成；随后可直接继续提问。")
+
+        elements: list[dict[str, Any]] = [
+            {"tag": "markdown", "content": "\n".join(status_lines)}
+        ]
+        buttons: list[dict[str, Any]] = []
+        if session:
+            buttons.append(
+                cls._research_button(
+                    "继续今日 Session",
+                    "resume_stock_session",
+                    route,
+                    button_type="primary",
+                    element_id="stock_resume_session",
+                    session_id=str(session.get("session_id") or ""),
+                    **common,
+                )
+            )
+        if report:
+            report_common = {
+                "run_id": str(report.get("run_id") or ""),
+                "artifact_id": str(report.get("artifact_id") or ""),
+                "session_id": str(session.get("session_id") or ""),
+                **common,
+            }
+            buttons.extend(
+                [
+                    cls._research_button(
+                        "发送今日 PDF",
+                        "send_stock_daily_report",
+                        route,
+                        button_type="primary" if not session else "default",
+                        element_id="stock_send_daily_pdf",
+                        **report_common,
+                    ),
+                    cls._research_button(
+                        "载入报告继续研究",
+                        "continue_stock_daily_report",
+                        route,
+                        element_id="stock_continue_daily_report",
+                        **report_common,
+                    ),
+                ]
+            )
+        buttons.append(
+            cls._research_button(
+                "重新生成完整分析",
+                "start_stock_research",
+                route,
+                element_id="stock_start_new_research",
+                **common,
+            )
+        )
+        for index in range(0, len(buttons), 2):
+            elements.append(
+                {
+                    "tag": "column_set",
+                    "flex_mode": "flow",
+                    "horizontal_spacing": "8px",
+                    "columns": [
+                        {
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 1,
+                            "elements": [button],
+                        }
+                        for button in buttons[index : index + 2]
+                    ],
+                }
+            )
+        return {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {
+                "template": "turquoise",
+                "title": _plain_text(f"{name} · 今日已有研究"),
+            },
+            "body": {"elements": elements},
+        }
+
+    @classmethod
+    def _build_daily_complete_card(
+        cls,
+        content: str,
+        *,
+        run_id: str,
+        revision: int,
+        reply_chat_id: str,
+        chat_type: str,
+        session_key: str | None,
+    ) -> dict[str, Any]:
+        route = cls._research_route(
+            reply_chat_id=reply_chat_id,
+            chat_type=chat_type,
+            session_key=session_key,
+        )
+        buttons = [
+            cls._research_button(
+                "再次发送综合 PDF",
+                "send_daily_master",
+                route,
+                button_type="primary",
+                element_id="daily_master_pdf",
+                run_id=run_id,
+            ),
+            cls._research_button(
+                "查看个股报告",
+                "show_daily_reports",
+                route,
+                element_id="daily_holding_reports",
+                run_id=run_id,
+            ),
+            cls._research_button(
+                "按最新数据重新生成",
+                "rerun_daily",
+                route,
+                element_id="daily_rerun",
+                run_id=run_id,
+            ),
+        ]
+        return {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {
+                "template": "green",
+                "title": _plain_text(f"今日组合晨会已完成 · revision {revision}"),
+            },
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": content},
+                    {
+                        "tag": "column_set",
+                        "flex_mode": "flow",
+                        "horizontal_spacing": "8px",
+                        "columns": [
+                            {
+                                "tag": "column",
+                                "width": "weighted",
+                                "weight": 1,
+                                "elements": [button],
+                            }
+                            for button in buttons
+                        ],
+                    },
+                ]
+            },
+        }
+
+    @classmethod
+    def _build_daily_report_picker_card(
+        cls,
+        reports: list[dict[str, Any]],
+        *,
+        run_id: str,
+        revision: int,
+        reply_chat_id: str,
+        chat_type: str,
+        session_key: str | None,
+    ) -> dict[str, Any]:
+        route = cls._research_route(
+            reply_chat_id=reply_chat_id,
+            chat_type=chat_type,
+            session_key=session_key,
+        )
+        elements: list[dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": "发送会直接复用已生成 PDF，不会重新分析；只有“重试”会创建新 revision。",
+            }
+        ]
+        for index, report in enumerate(reports[:30]):
+            symbol = str(report.get("symbol") or "")
+            name = str(report.get("name") or symbol)
+            status = str(report.get("status") or "completed")
+            artifact_id = str(report.get("artifact_id") or "")
+            elements.extend(
+                [
+                    {
+                        "tag": "markdown",
+                        "content": f"**{name} · {symbol}**\n状态：{status}",
+                    },
+                    {
+                        "tag": "column_set",
+                        "flex_mode": "flow",
+                        "horizontal_spacing": "8px",
+                        "columns": [
+                            {
+                                "tag": "column",
+                                "width": "weighted",
+                                "weight": 1,
+                                "elements": [
+                                    cls._research_button(
+                                        "发送 PDF",
+                                        "send_daily_report",
+                                        route,
+                                        button_type="primary",
+                                        element_id=f"daily_report_{index}",
+                                        run_id=run_id,
+                                        artifact_id=artifact_id,
+                                        symbol=symbol,
+                                    )
+                                ],
+                            },
+                            {
+                                "tag": "column",
+                                "width": "weighted",
+                                "weight": 1,
+                                "elements": [
+                                    cls._research_button(
+                                        "重试此标的",
+                                        "retry_daily_holding",
+                                        route,
+                                        element_id=f"daily_retry_{index}",
+                                        run_id=run_id,
+                                        symbol=symbol,
+                                    )
+                                ],
+                            },
+                        ],
+                    },
+                ]
+            )
+        if not reports:
+            elements.append({"tag": "markdown", "content": "没有可发送的个股 PDF。"})
+        return {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {
+                "template": "turquoise",
+                "title": _plain_text(f"个股日报 · revision {revision}"),
+            },
+            "body": {"elements": elements},
+        }
+
+    @classmethod
+    def _build_daily_skipped_card(
+        cls,
+        content: str,
+        *,
+        run_id: str,
+        revision: int,
+        reply_chat_id: str,
+        chat_type: str,
+        session_key: str | None,
+    ) -> dict[str, Any]:
+        route = cls._research_route(
+            reply_chat_id=reply_chat_id,
+            chat_type=chat_type,
+            session_key=session_key,
+        )
+        return {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {
+                "template": "yellow",
+                "title": _plain_text(f"组合晨会已停止 · revision {revision}"),
+            },
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": content},
+                    cls._research_button(
+                        "数据恢复后重新获取",
+                        "rerun_daily",
+                        route,
+                        button_type="primary",
+                        element_id="daily_skipped_rerun",
+                        run_id=run_id,
+                    ),
+                ]
+            },
         }
 
     async def _send_research_card(
@@ -1406,13 +1738,27 @@ class FeishuChannel(BaseChannel):
                 self.logger.exception("Error handling research card action")
 
         future.add_done_callback(_log_callback_failure)
-        if value["action"] == "show_stock_picker":
-            return self._card_action_response("正在打开个股选择。")
+        if value["action"] in {"show_stock_picker", "show_daily_reports"}:
+            return self._card_action_response(
+                "正在打开个股日报。"
+                if value["action"] == "show_daily_reports"
+                else "正在打开个股选择。"
+            )
         label = {
+            "morning_meeting": "组合晨会",
             "premarket": "盘前分析",
             "portfolio": "持仓分析",
             "holding": "个股分析",
             "custom_stock": "个股分析",
+            "send_daily_report": "个股日报发送",
+            "send_daily_master": "综合报告发送",
+            "retry_daily_holding": "个股日报重试",
+            "rerun_daily": "组合晨会重跑",
+            "cancel_daily_run": "组合晨会取消",
+            "resume_stock_session": "今日 Session 切换",
+            "send_stock_daily_report": "今日个股日报发送",
+            "continue_stock_daily_report": "今日报告载入",
+            "start_stock_research": "完整个股分析",
         }.get(value["action"], "研究任务")
         return self._card_action_response(f"已提交{label}。")
 
@@ -1425,6 +1771,94 @@ class FeishuChannel(BaseChannel):
             or f"feishu:{reply_chat_id}"
         )
         try:
+            if payload["action"] in {
+                "resume_stock_session",
+                "send_stock_daily_report",
+                "continue_stock_daily_report",
+                "start_stock_research",
+            }:
+                analysis_action = str(payload.get("analysis_action") or "holding")
+                symbol = str(payload.get("symbol") or "")
+                prompt_payload = {
+                    "action": analysis_action,
+                    "symbol": symbol,
+                    "code": re.sub(r"\D", "", symbol)[:6],
+                }
+                prompt, label = self._build_research_prompt(prompt_payload)
+                route = await asyncio.to_thread(
+                    build_research_session_route,
+                    base_key=base_session_key,
+                    action=analysis_action,
+                    symbol=symbol,
+                    name=str(payload.get("name") or label.removesuffix("个股分析")),
+                )
+                await self._handle_message(
+                    sender_id=payload["sender_id"],
+                    chat_id=reply_chat_id,
+                    content=prompt if payload["action"] == "start_stock_research" else "",
+                    metadata={
+                        "message_id": payload.get("source_message_id", ""),
+                        "chat_type": chat_type,
+                        "msg_type": "interactive",
+                        "stock_research_action": payload["action"],
+                        "stock_session_id": payload.get("session_id", ""),
+                        "daily_run_id": payload.get("run_id", ""),
+                        "artifact_id": payload.get("artifact_id", ""),
+                        "research_action": analysis_action,
+                        "research_label": route.label,
+                        **route.metadata(),
+                    },
+                    session_key=route.route_key,
+                    is_dm=chat_type == "p2p",
+                )
+                return
+
+            if payload["action"] in {
+                "show_daily_reports",
+                "send_daily_report",
+                "send_daily_master",
+                "retry_daily_holding",
+                "rerun_daily",
+                "cancel_daily_run",
+            }:
+                await self._handle_message(
+                    sender_id=payload["sender_id"],
+                    chat_id=reply_chat_id,
+                    content="",
+                    metadata={
+                        "message_id": payload.get("source_message_id", ""),
+                        "chat_type": chat_type,
+                        "msg_type": "interactive",
+                        "daily_report_action": payload["action"],
+                        "daily_run_id": payload.get("run_id", ""),
+                        "artifact_id": payload.get("artifact_id", ""),
+                        "symbol": payload.get("symbol", ""),
+                        "research_base_session_key": base_session_key,
+                    },
+                    session_key=base_session_key,
+                    is_dm=chat_type == "p2p",
+                )
+                return
+
+            if payload["action"] == "morning_meeting":
+                await self._handle_message(
+                    sender_id=payload["sender_id"],
+                    chat_id=reply_chat_id,
+                    content="启动组合晨会",
+                    metadata={
+                        "message_id": payload.get("source_message_id", ""),
+                        "chat_type": chat_type,
+                        "msg_type": "interactive",
+                        "daily_portfolio_run": True,
+                        "research_action": "morning_meeting",
+                        "research_label": "组合晨会",
+                        "research_base_session_key": base_session_key,
+                    },
+                    session_key=base_session_key,
+                    is_dm=chat_type == "p2p",
+                )
+                return
+
             if payload["action"] == "show_stock_picker":
                 from src.portfolio.state import load_state
 
@@ -1459,6 +1893,11 @@ class FeishuChannel(BaseChannel):
                     "message_id": payload.get("source_message_id", ""),
                     "chat_type": chat_type,
                     "msg_type": "interactive",
+                    "stock_research_action": (
+                        "prepare"
+                        if payload["action"] in {"holding", "custom_stock"}
+                        else ""
+                    ),
                     "research_action": payload["action"],
                     "research_label": route.label,
                     **route.metadata(),
@@ -2203,6 +2642,7 @@ class FeishuChannel(BaseChannel):
         reply_message_id: str | None = None,
         *,
         reply_in_thread: bool = False,
+        metadata: dict[str, Any] | None = None,
     ) -> str | None:
         """Create a CardKit streaming card, send it to chat, return card_id.
 
@@ -2213,12 +2653,32 @@ class FeishuChannel(BaseChannel):
         """
         from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
 
+        elements: list[dict[str, Any]] = [
+            {"tag": "markdown", "content": "", "element_id": _STREAM_ELEMENT_ID}
+        ]
+        meta = metadata or {}
+        daily_run_id = str(meta.get("daily_run_id") or "")
+        if daily_run_id:
+            route = self._research_route(
+                reply_chat_id=chat_id,
+                chat_type=str(meta.get("chat_type") or "p2p"),
+                session_key=str(
+                    meta.get("research_base_session_key") or f"feishu:{chat_id}"
+                ),
+            )
+            elements.append(
+                self._research_button(
+                    "取消本次运行",
+                    "cancel_daily_run",
+                    route,
+                    element_id="daily_cancel",
+                    run_id=daily_run_id,
+                )
+            )
         card_json = {
             "schema": "2.0",
             "config": {"wide_screen_mode": True, "update_multi": True, "streaming_mode": True},
-            "body": {
-                "elements": [{"tag": "markdown", "content": "", "element_id": _STREAM_ELEMENT_ID}]
-            },
+            "body": {"elements": elements},
         }
         try:
             request = (
@@ -2473,6 +2933,7 @@ class FeishuChannel(BaseChannel):
                     chat_id,
                     reply_msg_id,
                     reply_in_thread=use_reply_in_thread,
+                    metadata=meta,
                 ),
             )
             if card_id:
@@ -2525,6 +2986,64 @@ class FeishuChannel(BaseChannel):
                 )
                 await self._send_research_card(
                     card=self._build_research_menu_card(
+                        reply_chat_id=msg.chat_id,
+                        chat_type=chat_type,
+                        session_key=base_key,
+                    ),
+                    reply_chat_id=msg.chat_id,
+                    chat_type=chat_type,
+                )
+                return
+
+            if msg.metadata.get("_stock_research_context"):
+                chat_type = str(msg.metadata.get("chat_type") or "p2p")
+                base_key = str(
+                    msg.metadata.get("research_base_session_key")
+                    or f"feishu:{msg.chat_id}"
+                )
+                await self._send_research_card(
+                    card=self._build_stock_reuse_card(
+                        dict(msg.metadata.get("stock_research_context") or {}),
+                        reply_chat_id=msg.chat_id,
+                        chat_type=chat_type,
+                        session_key=base_key,
+                    ),
+                    reply_chat_id=msg.chat_id,
+                    chat_type=chat_type,
+                )
+                return
+
+            if msg.metadata.get("_daily_report_picker"):
+                chat_type = str(msg.metadata.get("chat_type") or "p2p")
+                base_key = str(
+                    msg.metadata.get("research_base_session_key")
+                    or f"feishu:{msg.chat_id}"
+                )
+                await self._send_research_card(
+                    card=self._build_daily_report_picker_card(
+                        list(msg.metadata.get("holding_reports") or []),
+                        run_id=str(msg.metadata.get("daily_run_id") or ""),
+                        revision=int(msg.metadata.get("daily_run_revision") or 1),
+                        reply_chat_id=msg.chat_id,
+                        chat_type=chat_type,
+                        session_key=base_key,
+                    ),
+                    reply_chat_id=msg.chat_id,
+                    chat_type=chat_type,
+                )
+                return
+
+            if msg.metadata.get("portfolio_daily_skipped"):
+                chat_type = str(msg.metadata.get("chat_type") or "p2p")
+                base_key = str(
+                    msg.metadata.get("research_base_session_key")
+                    or f"feishu:{msg.chat_id}"
+                )
+                await self._send_research_card(
+                    card=self._build_daily_skipped_card(
+                        msg.content,
+                        run_id=str(msg.metadata.get("daily_run_id") or ""),
+                        revision=int(msg.metadata.get("daily_run_revision") or 1),
                         reply_chat_id=msg.chat_id,
                         chat_type=chat_type,
                         session_key=base_key,
@@ -2650,6 +3169,28 @@ class FeishuChannel(BaseChannel):
                             media_type,
                             json.dumps({"file_key": key}, ensure_ascii=False),
                         )
+
+            if msg.metadata.get("portfolio_daily_complete"):
+                chat_type = str(msg.metadata.get("chat_type") or "p2p")
+                base_key = str(
+                    msg.metadata.get("research_base_session_key")
+                    or f"feishu:{msg.chat_id}"
+                )
+                card = self._build_daily_complete_card(
+                    msg.content,
+                    run_id=str(msg.metadata.get("daily_run_id") or ""),
+                    revision=int(msg.metadata.get("daily_run_revision") or 1),
+                    reply_chat_id=msg.chat_id,
+                    chat_type=chat_type,
+                    session_key=base_key,
+                )
+                await loop.run_in_executor(
+                    None,
+                    _do_send,
+                    "interactive",
+                    json.dumps(card, ensure_ascii=False),
+                )
+                return
 
             if msg.content and msg.content.strip():
                 fmt = self._detect_msg_format(msg.content)
@@ -2908,7 +3449,14 @@ class FeishuChannel(BaseChannel):
                     chat_type=chat_type,
                 )
                 return
-            if direct_action in {"premarket", "portfolio"}:
+            if direct_action == "morning_meeting":
+                content = "启动组合晨会"
+                research_metadata = {
+                    "daily_portfolio_run": True,
+                    "research_action": "morning_meeting",
+                    "research_label": "组合晨会",
+                }
+            elif direct_action in {"premarket", "portfolio"}:
                 content, label = self._build_research_prompt(
                     {"action": direct_action}
                 )

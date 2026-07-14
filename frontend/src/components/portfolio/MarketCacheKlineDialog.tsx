@@ -260,6 +260,10 @@ function statusLabel(status: string): string {
   return ({
     verified: "已校核",
     single_source: "单一来源",
+    source_lag: "来源延迟",
+    provisional_mix: "盘中旧值已隔离",
+    basis_mismatch: "复权口径不符",
+    unresolved_conflict: "未解决冲突",
     stale: "已过期",
     conflict: "有冲突",
     unresolved: "未解析",

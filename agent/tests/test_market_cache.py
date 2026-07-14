@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from src.market_cache.service import MarketRefreshService
+from src.market_cache.service import MarketRefreshService, source_candidates
 from src.market_cache.storage import MarketCacheStore
 from src.portfolio.state import PortfolioState, load_state, save_state
 
@@ -74,6 +74,18 @@ def test_identical_active_refresh_is_deduplicated(tmp_path, monkeypatch) -> None
     assert first_deduplicated is False
     assert second_deduplicated is True
     assert second["run_id"] == first["run_id"]
+
+
+def test_a_share_raw_sources_try_fast_independent_pair_first() -> None:
+    assert source_candidates("588870.SH", "1m", "raw") == [
+        "tencent", "mootdx", "eastmoney",
+    ]
+    assert source_candidates("600036.SH", "1D", "raw") == [
+        "tencent", "mootdx", "eastmoney",
+    ]
+    assert source_candidates("600036.SH", "1D", "qfq") == [
+        "tencent", "baostock", "eastmoney", "akshare",
+    ]
 
 
 def test_second_refresh_only_requests_overlap_tail_without_duplicate_bars(tmp_path, monkeypatch) -> None:
@@ -187,6 +199,124 @@ def test_conflict_preserves_existing_holding_price(tmp_path, monkeypatch) -> Non
     )
     holding = load_state(state_path).holdings[0]
 
-    assert run["items"][0]["status"] == "conflict"
+    assert run["items"][0]["status"] == "unresolved_conflict"
     assert holding["last_price"] == 1.95
-    assert holding["market_status"] == "conflict"
+    assert holding["market_status"] == "unresolved_conflict"
+
+
+def test_failed_first_source_continues_until_two_fresh_sources_agree(tmp_path, monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fetcher(**kwargs):
+        source = kwargs["requested_source"]
+        calls.append(source)
+        if source == "source-a":
+            raise ConnectionError("first provider offline")
+        return _outcome(kwargs, close=2.0 if source == "source-b" else 2.001)
+
+    service = _service(tmp_path, monkeypatch, fetcher)
+    run = service.refresh_sync(
+        symbols=["588870.SH"], profile="test",
+        sources=["source-a", "source-b", "source-c"],
+        start_date="2026-07-10", end_date="2026-07-10", items=[("1D", "raw")],
+    )
+
+    assert calls == ["source-a", "source-b", "source-c"]
+    assert run["items"][0]["status"] == "verified"
+    assert run["items"][0]["attempts"][0]["error_category"] == "transport_error"
+
+
+def test_old_intraday_snapshot_is_excluded_from_current_batch(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("src.market_cache.service._session_is_settled", lambda *_: False)
+    service = _service(tmp_path, monkeypatch, lambda **kwargs: _outcome(kwargs, close=2.0))
+    service.refresh_sync(
+        symbols=["588870.SH"], profile="test", sources=["old-source"],
+        start_date="2026-07-10", end_date="2026-07-10", items=[("1D", "raw")],
+    )
+    service.fetcher = lambda **kwargs: _outcome(kwargs, close=2.2)
+    service.refresh_sync(
+        symbols=["588870.SH"], profile="test", sources=["closing-source"],
+        start_date="2026-07-10", end_date="2026-07-10", items=[("1D", "raw")],
+    )
+
+    summary = service.store.cache_summaries()[0]
+    assert summary["status"] == "provisional_mix"
+    excluded = next(row for row in summary["observations"] if row["actual_source"] == "old-source")
+    assert excluded["included_in_consensus"] is False
+    assert excluded["exclude_reason"] == "stale_observation"
+
+
+def test_settled_session_reuses_cached_independent_confirmation(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("src.market_cache.service._session_is_settled", lambda *_: True)
+    service = _service(tmp_path, monkeypatch, lambda **kwargs: _outcome(kwargs, close=2.0))
+    service.refresh_sync(
+        symbols=["588870.SH"], profile="test", sources=["old-source"],
+        start_date="2026-07-10", end_date="2026-07-10", items=[("1D", "raw")],
+    )
+    service.fetcher = lambda **kwargs: _outcome(kwargs, close=2.001)
+    run = service.refresh_sync(
+        symbols=["588870.SH"], profile="test", sources=["refresh-source"],
+        start_date="2026-07-10", end_date="2026-07-10", items=[("1D", "raw")],
+    )
+
+    summary = service.store.cache_summaries()[0]
+    assert run["items"][0]["status"] == "verified"
+    assert summary["status"] == "verified"
+    assert summary["source_count"] == 2
+    assert "cached_confirmation_reused" in summary["quality_flags"]
+
+
+def test_different_latest_trade_dates_are_source_lag_not_conflict(tmp_path, monkeypatch) -> None:
+    def fetcher(**kwargs):
+        outcome = _outcome(kwargs, close=2.0)
+        if kwargs["requested_source"] == "lagging-source":
+            outcome["records"] = outcome["records"][:-1]
+        return outcome
+
+    service = _service(tmp_path, monkeypatch, fetcher)
+    run = service.refresh_sync(
+        symbols=["588870.SH"], profile="test", sources=["current-source", "lagging-source"],
+        start_date="2026-07-09", end_date="2026-07-10", items=[("1D", "raw")],
+    )
+
+    assert run["items"][0]["status"] == "source_lag"
+    assert service.store.cache_summaries()[0]["status"] == "source_lag"
+
+
+def test_daily_midnight_and_close_timestamp_share_one_trading_session(tmp_path, monkeypatch) -> None:
+    def fetcher(**kwargs):
+        outcome = _outcome(kwargs, close=2.0)
+        if kwargs["requested_source"] == "close-stamped-source":
+            outcome["records"][-1]["trade_date"] = "2026-07-10 15:00:00"
+        return outcome
+
+    service = _service(tmp_path, monkeypatch, fetcher)
+    run = service.refresh_sync(
+        symbols=["588870.SH"], profile="test",
+        sources=["midnight-source", "close-stamped-source"],
+        start_date="2026-07-10", end_date="2026-07-10", items=[("1D", "raw")],
+    )
+
+    summary = service.store.cache_summaries()[0]
+    assert run["items"][0]["status"] == "verified"
+    assert summary["status"] == "verified"
+    assert summary["source_count"] == 2
+
+
+def test_three_sources_without_majority_leave_price_null(tmp_path, monkeypatch) -> None:
+    closes = {"source-a": 2.0, "source-b": 2.2, "source-c": 2.4}
+    service = _service(
+        tmp_path,
+        monkeypatch,
+        lambda **kwargs: _outcome(kwargs, close=closes[kwargs["requested_source"]]),
+    )
+    run = service.refresh_sync(
+        symbols=["588870.SH"], profile="test", sources=list(closes),
+        start_date="2026-07-10", end_date="2026-07-10", items=[("1D", "raw")],
+    )
+
+    summary = service.store.cache_summaries()[0]
+    assert run["items"][0]["status"] == "unresolved_conflict"
+    assert summary["status"] == "unresolved_conflict"
+    assert summary["consensus_close"] is None
+    assert summary["source_count"] == 0

@@ -174,6 +174,40 @@ export const api = {
     }),
   getPortfolioReview: (limit?: number) =>
     request<PortfolioReview>(`/portfolio/review${limit ? `?limit=${encodeURIComponent(String(limit))}` : ""}`),
+  updatePortfolioCash: (body: UpdatePortfolioCashRequest) =>
+    request<PortfolioReview>("/portfolio/cash", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  getPortfolioMandate: () => request<PortfolioMandate>("/portfolio/mandate"),
+  updatePortfolioMandate: (mandate: PortfolioMandate) =>
+    request<PortfolioMandate>("/portfolio/mandate", {
+      method: "PUT",
+      body: JSON.stringify({ mandate }),
+    }),
+  updatePortfolioAssignment: (symbol: string, sleeveId: string) =>
+    request<PortfolioMandate>(`/portfolio/mandate/assignments/${encodeURIComponent(symbol)}`, {
+      method: "PUT",
+      body: JSON.stringify({ sleeve_id: sleeveId, user_locked: true }),
+    }),
+  listPortfolioDailyRuns: (limit = 30) =>
+    request<{ runs: PortfolioDailyRun[] }>(`/portfolio/daily-runs?limit=${encodeURIComponent(String(limit))}`),
+  startPortfolioDailyRun: (body: StartPortfolioDailyRunRequest = {}) =>
+    request<PortfolioDailyRun>("/portfolio/daily-runs", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  getPortfolioDailyRun: (runId: string) =>
+    request<PortfolioDailyRun>(`/portfolio/daily-runs/${encodeURIComponent(runId)}`),
+  cancelPortfolioDailyRun: (runId: string) =>
+    request<PortfolioDailyRun>(`/portfolio/daily-runs/${encodeURIComponent(runId)}/cancel`, { method: "POST" }),
+  retryPortfolioDailyRun: (runId: string, symbol?: string) =>
+    request<PortfolioDailyRun>(`/portfolio/daily-runs/${encodeURIComponent(runId)}/retry`, {
+      method: "POST",
+      body: JSON.stringify(symbol ? { symbol } : {}),
+    }),
+  portfolioDailyRunArtifactUrl: (runId: string, artifactId: string) =>
+    withAuthQuery(`${BASE}/portfolio/daily-runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}`),
   lookupPortfolioSecurity: (code: string, signal?: AbortSignal) =>
     request<PortfolioSecurityLookup>(`/portfolio/security-lookup?code=${encodeURIComponent(code)}`, { signal }),
   updatePortfolioHoldings: (body: UpdatePortfolioHoldingsRequest) =>
@@ -407,6 +441,11 @@ export interface UpdatePortfolioHoldingsRequest {
   cash_currency?: string;
 }
 
+export interface UpdatePortfolioCashRequest {
+  cash: number;
+  cash_currency?: string;
+}
+
 export interface RecordPortfolioTradeRequest {
   code: string;
   symbol: string;
@@ -458,6 +497,17 @@ export interface MarketCacheRefreshItem {
   status: string;
   requested_sources: string[];
   actual_sources: string[];
+  attempts?: Array<{
+    requested_source: string;
+    actual_source?: string | null;
+    upstream_source?: string | null;
+    status: string;
+    error_category?: string | null;
+    error?: string | null;
+    latest_bar_time?: string | null;
+    latest_close?: number | null;
+    latency_ms?: number | null;
+  }>;
   rows_written: number;
   message?: string | null;
   started_at?: string | null;
@@ -544,6 +594,8 @@ export interface MarketCacheBar {
   source_count?: number;
   sources?: string[];
   verified_at?: string;
+  batch_id?: string;
+  quality_flags?: string[];
 }
 
 export interface MarketCacheBarsResponse {
@@ -602,6 +654,8 @@ export interface VerifiedMarketCacheRow {
   source_adjustments?: Record<string, { adjustment?: string; confidence?: string; note?: string }>;
   sources?: string[];
   observations?: Array<Record<string, unknown>>;
+  quality_flags?: string[];
+  batch_id?: string;
   interval?: string;
   bar_time?: string;
   source_count?: number;
@@ -627,6 +681,108 @@ export interface PortfolioReview {
   market_cache_coverage?: MarketCacheCoverage[];
   active_market_refresh?: MarketCacheRun | null;
   market_refresh?: Record<string, unknown> | null;
+}
+
+export interface PortfolioMandateBand {
+  configured: boolean;
+  target_amount: number;
+  min_amount: number;
+  max_amount: number | null;
+}
+
+export interface PortfolioSleeve extends PortfolioMandateBand {
+  id: string;
+  name: string;
+  parent_id?: string | null;
+  rebalance_band_amount: number;
+  single_position_max_amount: number | null;
+  sort_order: number;
+}
+
+export interface PortfolioAssignment {
+  active_sleeve_id: string;
+  assigned_by: "agent" | "user";
+  confidence: number;
+  rationale?: string;
+  user_locked: boolean;
+  suggested_sleeve_id?: string;
+  suggested_rationale?: string;
+  suggestion_run_count?: number;
+  needs_user_review?: boolean;
+  updated_at?: string;
+}
+
+export interface PortfolioMandate {
+  schema_version: number;
+  version: number;
+  suggestion_revision: number;
+  base_currency: string;
+  classification_policy: Record<string, unknown>;
+  cash_policy: PortfolioMandateBand;
+  sleeves: PortfolioSleeve[];
+  assignments: Record<string, PortfolioAssignment>;
+  classification_history: Array<Record<string, unknown>>;
+  updated_at: string;
+}
+
+export interface PortfolioDailyRunArtifact {
+  artifact_id: string;
+  kind: "master_pdf" | "holding_daily_pdf" | "master_markdown" | string;
+  symbol?: string | null;
+  filename: string;
+  media_type: string;
+  size_bytes: number;
+  sha256: string;
+  revision?: number;
+  superseded?: boolean;
+  expired?: boolean;
+}
+
+export interface PortfolioDailyRunAnalysisGate {
+  decision: "proceed" | "skip_report" | string;
+  minimum_coverage_ratio: number;
+  coverage_ratio: number;
+  eligible_count: number;
+  total_count: number;
+  eligible_symbols: string[];
+  missing_symbols: string[];
+  missing_market_symbols: string[];
+  missing_research_symbols: string[];
+  model_sessions_started: number;
+}
+
+export interface PortfolioDailyRun {
+  run_id: string;
+  market_date: string;
+  status: "queued" | "running" | "cancelling" | "completed" | "completed_with_warnings" | "failed" | "cancelled" | string;
+  stage: string;
+  progress: { completed: number; total: number; percent: number };
+  refresh_policy: "ensure_fresh" | "force" | "reuse";
+  report_profile: string;
+  data_status?: string;
+  analysis_gate?: PortfolioDailyRunAnalysisGate;
+  warnings?: string[];
+  error?: string | null;
+  summary?: { exit?: number; reduce?: number; add?: number; observe?: number };
+  artifacts?: PortfolioDailyRunArtifact[];
+  created_at: string;
+  completed_at?: string | null;
+  deduplicated?: boolean;
+  revision?: number;
+  artifact_revision?: number;
+  parent_run_id?: string | null;
+  retry_symbol?: string | null;
+  data_batch_id?: string;
+  reused_data_batch?: boolean;
+  input_outdated?: boolean;
+  input_outdated_reasons?: string[];
+}
+
+export interface StartPortfolioDailyRunRequest {
+  market_date?: string;
+  refresh_policy?: "ensure_fresh" | "force" | "reuse";
+  report_profile?: "master_with_holding_appendices";
+  force_new?: boolean;
 }
 
 export type PortfolioAnalysisScope = "holding" | "portfolio" | "market";
