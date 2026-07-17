@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import time
 from urllib.parse import urlsplit
 
 import requests
@@ -12,6 +13,7 @@ import requests
 from src.agent.progress import emit_progress
 from src.agent.tools import BaseTool
 from src.security.scanner import with_security_warnings
+from src.usage import record_current_resource
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +80,7 @@ def read_url(url: str, no_cache: bool = False) -> str:
     if not allowed:
         return json.dumps({"status": "error", "error": error}, ensure_ascii=False)
 
+    request_started = time.perf_counter()
     try:
         headers = {"Accept": "text/markdown"}
         if no_cache:
@@ -93,6 +96,17 @@ def read_url(url: str, no_cache: bool = False) -> str:
         )
         emit_progress("parsing", message="extracting markdown")
         if resp.status_code != 200:
+            record_current_resource(
+                provider="jina_reader",
+                category="web",
+                status="error",
+                elapsed_ms=int((time.perf_counter() - request_started) * 1000),
+                cache_mode="network",
+                query={"url": target_url},
+                network_request=True,
+                cache_access=False,
+                metadata={"http_status": resp.status_code},
+            )
             logger.warning("read_url upstream HTTP %s: %s", resp.status_code, resp.text[:500])
             return json.dumps({
                 "status": "error",
@@ -118,12 +132,45 @@ def read_url(url: str, no_cache: bool = False) -> str:
         }
         if _CACHED_MARKER in resp.text:
             result["cached"] = True
+        cached = bool(result.get("cached"))
+        record_current_resource(
+            provider="jina_reader",
+            category="web",
+            status="ok",
+            elapsed_ms=int((time.perf_counter() - request_started) * 1000),
+            cache_mode="cache_hit" if cached else ("cache_refresh" if no_cache else "network"),
+            query={"url": target_url},
+            network_request=True,
+            cache_access=cached,
+        )
         result = with_security_warnings(result, fields=("content",))
         return json.dumps(result, ensure_ascii=False)
 
     except requests.Timeout:
+        record_current_resource(
+            provider="jina_reader",
+            category="web",
+            status="error",
+            elapsed_ms=int((time.perf_counter() - request_started) * 1000),
+            cache_mode="network",
+            query={"url": target_url},
+            network_request=True,
+            cache_access=False,
+            metadata={"error_type": "timeout"},
+        )
         return json.dumps({"status": "error", "error": f"Request timed out ({_TIMEOUT}s)"}, ensure_ascii=False)
     except Exception as exc:
+        record_current_resource(
+            provider="jina_reader",
+            category="web",
+            status="error",
+            elapsed_ms=int((time.perf_counter() - request_started) * 1000),
+            cache_mode="network",
+            query={"url": target_url},
+            network_request=True,
+            cache_access=False,
+            metadata={"error_type": type(exc).__name__},
+        )
         logger.warning("read_url request failed: %s", exc)
         return json.dumps(
             {"status": "error", "error": f"remote reader request failed: {exc}"},

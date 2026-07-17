@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
-from pathlib import Path
 from typing import Any
 
-from src.channels.bus.events import InboundMessage, OutboundMessage
+from src.channels.bus.events import DeliveryReceipt, InboundMessage, OutboundMessage
 from src.channels.bus.queue import MessageBus
 from src.channels.pairing import (
     PAIRING_CODE_META_KEY,
@@ -70,7 +70,7 @@ class BaseChannel(ABC):
         """Stop the channel and clean up resources."""
 
     @abstractmethod
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage) -> DeliveryReceipt | None:
         """Send a message through this channel.
 
         Args:
@@ -185,7 +185,8 @@ class BaseChannel(ABC):
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
         is_dm: bool = False,
-    ) -> None:
+        source_event_id: str | None = None,
+    ) -> dict[str, Any] | None:
         """Handle an incoming message: check permissions, issue pairing codes in DMs, or forward to bus."""
         if not self.is_allowed(sender_id):
             if is_dm:
@@ -208,12 +209,17 @@ class BaseChannel(ABC):
                     "Add them to allow_from list in config to grant access.",
                     sender_id,
                 )
-            return
+            return None
 
         meta = metadata or {}
         if self.supports_streaming:
             meta = {**meta, "_wants_stream": True}
 
+        acceptance = (
+            asyncio.get_running_loop().create_future()
+            if self.bus.require_inbound_acceptance
+            else None
+        )
         msg = InboundMessage(
             channel=self.name,
             sender_id=str(sender_id),
@@ -222,9 +228,14 @@ class BaseChannel(ABC):
             media=media or [],
             metadata=meta,
             session_key_override=session_key,
+            source_event_id=source_event_id,
+            acceptance=acceptance,
         )
 
         await self.bus.publish_inbound(msg)
+        if acceptance is not None:
+            return await asyncio.shield(acceptance)
+        return None
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:

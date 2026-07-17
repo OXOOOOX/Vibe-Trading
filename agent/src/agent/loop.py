@@ -46,6 +46,7 @@ from src.portfolio.answer_guard import (
 from src.tools.background_tools import get_background_manager
 from src.tools.redaction import redact_payload
 from src.tools.swarm_tool import extract_explicit_preset_name
+from src.usage import TOKEN_FIELDS, UsageRecorder, bind_usage_recorder, classify_tool, normalize_usage
 
 RUNS_DIR = Path(__file__).resolve().parents[2] / "runs"
 SESSIONS_DIR = Path(__file__).resolve().parents[2] / "sessions"
@@ -72,36 +73,9 @@ TAIL_TOKEN_BUDGET = 20_000
 logger = logging.getLogger(__name__)
 
 
-def _coerce_usage_int(value: Any) -> int:
-    """Coerce provider token counts to non-negative ints."""
-    try:
-        return max(0, int(value or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _normalize_llm_usage(usage: Any) -> dict[str, int] | None:
+def _normalize_llm_usage(usage: Any) -> dict[str, int | None] | None:
     """Normalize provider-reported usage metadata without estimating tokens."""
-    if usage is None:
-        return None
-    if not isinstance(usage, dict):
-        try:
-            usage = dict(usage)
-        except (TypeError, ValueError):
-            return None
-
-    input_tokens = _coerce_usage_int(usage.get("input_tokens"))
-    output_tokens = _coerce_usage_int(usage.get("output_tokens"))
-    total_tokens = _coerce_usage_int(usage.get("total_tokens"))
-    if total_tokens == 0 and (input_tokens or output_tokens):
-        total_tokens = input_tokens + output_tokens
-    if not (input_tokens or output_tokens or total_tokens):
-        return None
-    return {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": total_tokens,
-    }
+    return normalize_usage(usage)
 
 
 def _new_llm_usage_summary(llm: Any) -> dict[str, Any]:
@@ -117,6 +91,7 @@ def _new_llm_usage_summary(llm: Any) -> dict[str, Any]:
             "total_tokens": 0,
             "calls": 0,
         },
+        "reported_fields": {field: 0 for field in TOKEN_FIELDS},
         "per_iteration": [],
     }
 
@@ -126,18 +101,23 @@ def _record_llm_usage(
     summary: dict[str, Any],
     usage: Any,
     iteration: int,
-) -> dict[str, int] | None:
+) -> dict[str, int | None] | None:
     """Accumulate and persist one provider-reported usage event."""
     normalized = _normalize_llm_usage(usage)
     if normalized is None:
         return None
 
     totals = summary.setdefault("totals", {})
-    totals["input_tokens"] = int(totals.get("input_tokens") or 0) + normalized["input_tokens"]
-    totals["output_tokens"] = int(totals.get("output_tokens") or 0) + normalized["output_tokens"]
-    totals["total_tokens"] = int(totals.get("total_tokens") or 0) + normalized["total_tokens"]
+    reported_fields = summary.setdefault("reported_fields", {})
+    for field in TOKEN_FIELDS:
+        value = normalized.get(field)
+        if value is None:
+            continue
+        totals[field] = int(totals.get(field) or 0) + value
+        reported_fields[field] = int(reported_fields.get(field) or 0) + 1
     totals["calls"] = int(totals.get("calls") or 0) + 1
-    summary.setdefault("per_iteration", []).append({"iter": iteration, **normalized})
+    reported_usage = {field: value for field, value in normalized.items() if value is not None}
+    summary.setdefault("per_iteration", []).append({"iter": iteration, **reported_usage})
     summary["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     try:
@@ -454,6 +434,7 @@ class AgentLoop:
         event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         max_iterations: int = 50,
         persistent_memory: Optional[Any] = None,
+        usage_recorder: Optional[UsageRecorder] = None,
     ) -> None:
         """Initialize AgentLoop.
 
@@ -475,6 +456,7 @@ class AgentLoop:
         self._previous_summary: str = ""
         self._persistent_memory = persistent_memory
         self._run_iteration: int = 0
+        self._usage_recorder = usage_recorder
 
     def cancel(self) -> None:
         """Cancel the current loop.
@@ -1125,15 +1107,36 @@ class AgentLoop:
             args = _normalize_tool_run_dir(tc.arguments, self.memory.run_dir)
             redacted_args = redact_payload(args)
             event_args = {k: str(v)[:200] for k, v in redacted_args.items()}
-            self._emit("tool_call", {"tool": tc.name, "arguments": event_args, "iter": iteration})
+            self._emit(
+                "tool_call",
+                {
+                    "tool": tc.name,
+                    "tool_call_id": tc.id,
+                    "arguments": event_args,
+                    "iter": iteration,
+                },
+            )
             trace.write({"type": "tool_call", "iter": iteration, "tool": tc.name, "call_id": tc.id, "args": redacted_args})
-            runnable.append((tc, args))
+            usage_event_id = None
+            if self._usage_recorder is not None:
+                tool_def = self.registry.get(tc.name)
+                usage_event_id = self._usage_recorder.start_tool(
+                    tc.id,
+                    tc.name,
+                    args,
+                    category=classify_tool(tc.name, tool_def),
+                )
+            runnable.append((tc, args, usage_event_id))
 
         # Execute in parallel — each worker gets its own heartbeat + progress emitter.
         def _run(tc_args: tuple) -> tuple:
-            tc, args = tc_args
-            result, elapsed_ms = self._invoke_tool(tc.name, args)
-            return tc, result, elapsed_ms
+            tc, args, usage_event_id = tc_args
+            result, elapsed_ms = self._invoke_tool(
+                tc.name,
+                args,
+                tool_call_id=tc.id,
+            )
+            return tc, result, elapsed_ms, usage_event_id
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(runnable), 8)) as pool:
             futures = [pool.submit(_run, item) for item in runnable]
@@ -1143,11 +1146,14 @@ class AgentLoop:
                     results.append(f.result())
                 except Exception as exc:
                     tc = runnable[i][0]
-                    results.append((tc, json.dumps({"status": "error", "error": str(exc)}), 0))
+                    results.append((tc, json.dumps({"status": "error", "error": str(exc)}), 0, runnable[i][2]))
 
         # Process results in order
-        for tc, result, elapsed_ms in results:
-            self._finalize_tool_result(tc, result, elapsed_ms, context, messages, trace, react_trace, iteration)
+        for tc, result, elapsed_ms, usage_event_id in results:
+            self._finalize_tool_result(
+                tc, result, elapsed_ms, context, messages, trace, react_trace, iteration,
+                usage_event_id=usage_event_id,
+            )
 
     def _execute_single(
         self,
@@ -1172,15 +1178,51 @@ class AgentLoop:
 
         redacted_args = redact_payload(args)
         event_args = {k: str(v)[:200] for k, v in redacted_args.items()}
-        self._emit("tool_call", {"tool": tc.name, "arguments": event_args, "iter": iteration})
+        self._emit(
+            "tool_call",
+            {
+                "tool": tc.name,
+                "tool_call_id": tc.id,
+                "arguments": event_args,
+                "iter": iteration,
+            },
+        )
         trace.write({"type": "tool_call", "iter": iteration, "tool": tc.name, "call_id": tc.id, "args": redacted_args})
         logger.info(f"Tool call: {tc.name}({list(args.keys())})")
 
-        result, elapsed_ms = self._invoke_tool(tc.name, args)
+        usage_event_id = None
+        if self._usage_recorder is not None:
+            tool_def = self.registry.get(tc.name)
+            usage_event_id = self._usage_recorder.start_tool(
+                tc.id,
+                tc.name,
+                args,
+                category=classify_tool(tc.name, tool_def),
+            )
 
-        self._finalize_tool_result(tc, result, elapsed_ms, context, messages, trace, react_trace, iteration)
+        try:
+            result, elapsed_ms = self._invoke_tool(
+                tc.name,
+                args,
+                tool_call_id=tc.id,
+            )
+        except Exception:
+            if self._usage_recorder is not None and usage_event_id:
+                self._usage_recorder.finish_tool(usage_event_id, status="error", elapsed_ms=0)
+            raise
 
-    def _invoke_tool(self, tool_name: str, args: Dict[str, Any]) -> tuple[str, int]:
+        self._finalize_tool_result(
+            tc, result, elapsed_ms, context, messages, trace, react_trace, iteration,
+            usage_event_id=usage_event_id,
+        )
+
+    def _invoke_tool(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        *,
+        tool_call_id: str = "",
+    ) -> tuple[str, int]:
         """Execute a tool with heartbeat + structured progress emission.
 
         Installs a thread-local progress emitter so the tool may call
@@ -1193,6 +1235,8 @@ class AgentLoop:
         Args:
             tool_name: Tool name to execute.
             args: Tool arguments dict.
+            tool_call_id: Stable provider call ID used to correlate concurrent
+                invocations of the same tool across SSE events.
 
         Returns:
             Tuple of (result_str, elapsed_ms).
@@ -1205,12 +1249,17 @@ class AgentLoop:
                 return
             payload = event.to_dict()
             payload["tool"] = tool_name
+            if tool_call_id:
+                payload["tool_call_id"] = tool_call_id
             self._emit("tool_progress", payload)
 
         def _on_heartbeat(payload: Dict[str, Any]) -> None:
             if timed_out.is_set():
                 return
-            self._emit("tool_heartbeat", payload)
+            event_payload = dict(payload)
+            if tool_call_id:
+                event_payload["tool_call_id"] = tool_call_id
+            self._emit("tool_heartbeat", event_payload)
 
         t0 = _time.perf_counter()
         timeout = TOOL_TIMEOUT_SECONDS if TOOL_TIMEOUT_SECONDS > 0 else None
@@ -1254,6 +1303,8 @@ class AgentLoop:
                 "message": message,
                 "elapsed_s": round(elapsed_ms / 1000, 2),
             }
+            if tool_call_id:
+                payload["tool_call_id"] = tool_call_id
             payload.update(extra)
             self._emit("tool_progress", payload)
             return elapsed_ms
@@ -1284,7 +1335,8 @@ class AgentLoop:
             _set_emitter(_on_progress)
             try:
                 with _heartbeat_timer():
-                    result = self.registry.execute(tool_name, args)
+                    with bind_usage_recorder(self._usage_recorder, tool_call_id or None):
+                        result = self.registry.execute(tool_name, args)
             finally:
                 finished.set()
                 _set_emitter(None)
@@ -1298,7 +1350,8 @@ class AgentLoop:
         def _worker() -> None:
             _set_emitter(_on_progress)
             try:
-                result_queue.put((self.registry.execute(tool_name, args), None))
+                with bind_usage_recorder(self._usage_recorder, tool_call_id or None):
+                    result_queue.put((self.registry.execute(tool_name, args), None))
             except BaseException as exc:  # noqa: BLE001 - propagate through caller thread
                 result_queue.put((None, exc))
             finally:
@@ -1356,6 +1409,7 @@ class AgentLoop:
         trace: TraceWriter,
         react_trace: list,
         iteration: int,
+        usage_event_id: str | None = None,
     ) -> None:
         """Record a tool result: update memory, append message, write trace, emit event.
 
@@ -1375,7 +1429,13 @@ class AgentLoop:
         if success:
             self._called_ok.add(tc.name)
 
-        status = "ok" if success else "error"
+        status = "cancelled" if self._cancel_event.is_set() else ("ok" if success else "error")
+        if self._usage_recorder is not None and usage_event_id:
+            self._usage_recorder.finish_tool(
+                usage_event_id,
+                status=status,
+                elapsed_ms=elapsed_ms,
+            )
         truncated = (
             compact_portfolio_tool_result(result, limit=TOOL_RESULT_LIMIT)
             if tc.name == "portfolio_state"
@@ -1394,7 +1454,16 @@ class AgentLoop:
         )
         preview = trace_result[:200]
         react_trace.append({"type": "tool_call", "tool": tc.name, "result_preview": preview})
-        self._emit("tool_result", {"tool": tc.name, "status": status, "elapsed_ms": elapsed_ms, "preview": preview})
+        self._emit(
+            "tool_result",
+            {
+                "tool": tc.name,
+                "tool_call_id": tc.id,
+                "status": status,
+                "elapsed_ms": elapsed_ms,
+                "preview": preview,
+            },
+        )
 
     # -- Context compression ---------------------------------------------------
 

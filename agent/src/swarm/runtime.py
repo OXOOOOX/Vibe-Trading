@@ -41,6 +41,11 @@ from src.swarm.task_store import (
 )
 from src.tools.redaction import redact_internal_paths
 from src.swarm.worker import run_worker
+from src.usage import (
+    bind_usage_recorder,
+    get_current_parent_tool_call_id,
+    get_current_usage_recorder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +93,7 @@ class SwarmRuntime:
         user_vars: dict[str, str],
         live_callback: Callable | None = None,
         include_shell_tools: bool = False,
+        parent_tool_call_id: str | None = None,
     ) -> SwarmRun:
         """Start a swarm run. Returns immediately, execution happens in background.
 
@@ -135,9 +141,15 @@ class SwarmRuntime:
             if live_callback is not None:
                 self._live_callbacks[run.id] = live_callback
 
+        usage_recorder = get_current_usage_recorder()
+        inherited_parent = parent_tool_call_id or get_current_parent_tool_call_id()
+
+        def _execute_scoped_run() -> None:
+            with bind_usage_recorder(usage_recorder, inherited_parent):
+                self._execute_run(run, cancel_event, include_shell_tools)
+
         thread = threading.Thread(
-            target=self._execute_run,
-            args=(run, cancel_event, include_shell_tools),
+            target=_execute_scoped_run,
             name=f"swarm-{run.id}",
             daemon=True,
         )
@@ -501,6 +513,13 @@ class SwarmRuntime:
         # the CLI return immediately. Running workers finish naturally.
         executor = ThreadPoolExecutor(max_workers=self._max_workers)
         futures: dict[Future[WorkerResult], str] = {}
+        usage_recorder = get_current_usage_recorder()
+        parent_tool_call_id = get_current_parent_tool_call_id()
+
+        def _run_scoped_worker(**kwargs) -> WorkerResult:
+            with bind_usage_recorder(usage_recorder, parent_tool_call_id):
+                return self._run_worker_with_retries(**kwargs)
+
         layer_budget = 0  # seconds — max per-task (retries × timeout) across layer
         try:
             for tid in layer_task_ids:
@@ -573,7 +592,7 @@ class SwarmRuntime:
                         upstream[context_key] = task_summaries[source_task_id]
 
                 future = executor.submit(
-                    self._run_worker_with_retries,
+                    _run_scoped_worker,
                     agent_spec=agent_spec,
                     task=task,
                     upstream_summaries=upstream,

@@ -45,6 +45,7 @@ class CodexAIMessage:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     additional_kwargs: dict[str, Any] = field(default_factory=dict)
     response_metadata: dict[str, Any] = field(default_factory=lambda: {"finish_reason": "stop"})
+    usage_metadata: dict[str, Any] | None = None
 
     def __add__(self, other: "CodexAIMessage") -> "CodexAIMessage":
         finish_reason = other.response_metadata.get(
@@ -60,6 +61,7 @@ class CodexAIMessage:
             tool_calls=[*self.tool_calls, *other.tool_calls],
             additional_kwargs={"reasoning_content": reasoning} if reasoning else {},
             response_metadata={"finish_reason": finish_reason},
+            usage_metadata=other.usage_metadata or self.usage_metadata,
         )
 
 
@@ -327,8 +329,19 @@ def _message_chunks_from_events(events: Iterable[dict[str, Any]]) -> Iterable[Co
                 )
                 yield CodexAIMessage(tool_calls=[tool.as_langchain_tool_call()])
         elif event_type == "response.completed":
-            status = (event.get("response") or {}).get("status")
-            yield CodexAIMessage(response_metadata={"finish_reason": _map_finish_reason(status)})
+            response = event.get("response") or {}
+            status = response.get("status")
+            usage = response.get("usage")
+            try:
+                from src.usage import normalize_usage
+
+                usage = normalize_usage(usage)
+            except Exception:
+                usage = None
+            yield CodexAIMessage(
+                response_metadata={"finish_reason": _map_finish_reason(status)},
+                usage_metadata=usage,
+            )
         elif event_type in {"error", "response.failed"}:
             detail = event.get("error") or event.get("message") or event
             raise RuntimeError(f"OpenAI Codex response failed: {str(detail)[:500]}")

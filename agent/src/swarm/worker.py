@@ -29,6 +29,12 @@ from src.swarm.models import (
 from src.tools import build_swarm_registry
 from src.tools.mcp import MCPRemoteTool
 from src.tools.redaction import is_sensitive_arg, redact_payload
+from src.usage import (
+    bind_usage_recorder,
+    classify_tool,
+    get_current_parent_tool_call_id,
+    get_current_usage_recorder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -591,9 +597,22 @@ def run_worker(
         # Execute each tool call — inject run_dir so tools write inside artifact_dir
         for tc in response.tool_calls:
             mcp_meta = _remote_tool_metadata(registry, tc.name)
+            usage_recorder = get_current_usage_recorder()
+            usage_event_id = None
+            if usage_recorder is not None:
+                tool_def = registry.get(tc.name)
+                usage_event_id = usage_recorder.start_tool(
+                    tc.id,
+                    tc.name,
+                    tc.arguments,
+                    event_id=usage_recorder.tool_event_id(tc.id, prefix=f"swarm:{task_id}"),
+                    parent_tool_call_id=get_current_parent_tool_call_id(),
+                    category=classify_tool(tc.name, tool_def),
+                    metadata={"swarm_agent_id": agent_id, "swarm_task_id": task_id},
+                )
             _emit(
                 event_callback, "tool_call", agent_id, task_id,
-                {"tool": tc.name, "iteration": iteration,
+                {"tool": tc.name, "tool_call_id": tc.id, "iteration": iteration,
                  "arguments": _preview_tool_arguments(tc.arguments),
                  **mcp_meta},
             )
@@ -613,18 +632,34 @@ def run_worker(
                     {**payload, "iteration": iteration, "phase": "tool"},
                 )
 
-            with HeartbeatTimer(
-                tool_name=tc.name,
-                interval=_HEARTBEAT_INTERVAL_S,
-                emit=_on_heartbeat,
-            ):
-                result = registry.execute(tc.name, args)
+            try:
+                with HeartbeatTimer(
+                    tool_name=tc.name,
+                    interval=_HEARTBEAT_INTERVAL_S,
+                    emit=_on_heartbeat,
+                ):
+                    with bind_usage_recorder(usage_recorder, tc.id):
+                        result = registry.execute(tc.name, args)
+            except Exception:
+                if usage_recorder is not None and usage_event_id:
+                    usage_recorder.finish_tool(
+                        usage_event_id,
+                        status="error",
+                        elapsed_ms=int((time.monotonic() - tc_start) * 1000),
+                    )
+                raise
             if tc.name != "load_skill" and not _is_error_result(result):
                 data_tool_calls += 1
             tc_elapsed = time.monotonic() - tc_start
+            if usage_recorder is not None and usage_event_id:
+                usage_recorder.finish_tool(
+                    usage_event_id,
+                    status="error" if _is_error_result(result) else "ok",
+                    elapsed_ms=int(tc_elapsed * 1000),
+                )
             _emit(
                 event_callback, "tool_result", agent_id, task_id,
-                {"tool": tc.name, "elapsed_ms": int(tc_elapsed * 1000),
+                {"tool": tc.name, "tool_call_id": tc.id, "elapsed_ms": int(tc_elapsed * 1000),
                  "status": "ok", "iteration": iteration,
                   "result_preview": _preview_tool_result(result),
                  **mcp_meta},

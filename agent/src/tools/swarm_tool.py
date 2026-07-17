@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from src.agent.tools import BaseTool
+from src.usage import get_current_parent_tool_call_id
 
 logger = logging.getLogger(__name__)
 
@@ -778,12 +779,14 @@ class SwarmTool(BaseTool):
                     {"run_id": current_run_id, "event": payload},
                 )
 
-            run = runtime.start_run(
-                preset,
-                variables,
-                live_callback=_live_callback if self._event_callback is not None else None,
-                include_shell_tools=self.include_shell_tools,
-            )
+            start_kwargs: dict[str, Any] = {
+                "live_callback": _live_callback if self._event_callback is not None else None,
+                "include_shell_tools": self.include_shell_tools,
+            }
+            parent_tool_call_id = get_current_parent_tool_call_id()
+            if parent_tool_call_id:
+                start_kwargs["parent_tool_call_id"] = parent_tool_call_id
+            run = runtime.start_run(preset, variables, **start_kwargs)
         except FileNotFoundError as exc:
             return json.dumps(
                 {"status": "error", "error": f"Preset not found: {exc}"},

@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+import asyncio
+
 
 # Optional OutboundMessage.metadata key for structured, channel-agnostic UI
 # payloads. Value is JSON-serializable with at least ``kind``; rich clients may
@@ -15,6 +17,39 @@ OUTBOUND_META_AGENT_UI = "_agent_ui"
 INBOUND_META_RUNTIME_CONTROL = "_runtime_control"
 RUNTIME_CONTROL_ACK = "_ack"
 RUNTIME_CONTROL_MCP_RELOAD = "mcp_reload"
+
+
+class DeliveryRejectedError(RuntimeError):
+    """The provider returned a definitive rejection before accepting a message."""
+
+
+class DeliveryUncertainError(RuntimeError):
+    """The provider may have accepted a message, but no durable receipt was obtained."""
+
+
+@dataclass(frozen=True)
+class DeliveryReceipt:
+    """Provider acknowledgement for one externally visible delivery.
+
+    ``delivered`` means that the provider accepted the request and returned a
+    stable message identifier.  It deliberately does not claim that the human
+    recipient has read the message.
+    """
+
+    provider: str
+    remote_message_id: str
+    provider_request_id: str | None
+    accepted_at: str
+    status: str = "delivered"
+
+    def as_dict(self) -> dict[str, str | None]:
+        return {
+            "provider": self.provider,
+            "remote_message_id": self.remote_message_id,
+            "provider_request_id": self.provider_request_id,
+            "accepted_at": self.accepted_at,
+            "status": self.status,
+        }
 
 
 @dataclass
@@ -29,11 +64,27 @@ class InboundMessage:
     media: list[str] = field(default_factory=list)  # Media URLs
     metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data
     session_key_override: str | None = None  # Optional override for thread-scoped sessions
+    source_event_id: str | None = None  # Provider event/message id used for durable deduplication
+    acceptance: asyncio.Future[dict[str, Any]] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     @property
     def session_key(self) -> str:
         """Unique key for session identification."""
         return self.session_key_override or f"{self.channel}:{self.chat_id}"
+
+    def accept(self, result: dict[str, Any] | None = None) -> None:
+        """Confirm that this inbound event crossed its durable handling boundary."""
+        if self.acceptance is not None and not self.acceptance.done():
+            self.acceptance.set_result(dict(result or {}))
+
+    def reject(self, exc: BaseException) -> None:
+        """Reject an inbound event so its provider can retry it."""
+        if self.acceptance is not None and not self.acceptance.done():
+            self.acceptance.set_exception(exc)
 
 
 @dataclass

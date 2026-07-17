@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import threading
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Coroutine, Iterable, Protocol, TypeVar
@@ -16,6 +17,7 @@ from typing import Any, Awaitable, Callable, Coroutine, Iterable, Protocol, Type
 from fastmcp.client import Client
 from fastmcp.client.auth import OAuth
 from fastmcp.client.client import CallToolResult
+from src.usage import record_current_resource
 try:
     from fastmcp.client.transports.http import StreamableHttpTransport
     from fastmcp.client.transports.sse import SSETransport
@@ -382,6 +384,9 @@ class MCPServerAdapter:
         Returns:
             Normalized result payload ready for JSON serialization.
         """
+        request_started = time.perf_counter()
+        is_network = self.server_config.resolved_transport() != "stdio"
+        cache_mode = "network" if is_network else "unknown"
         try:
             result = _run_sync(lambda: self._call_tool(remote_name, arguments))
             payload = _normalize_call_tool_result(result)
@@ -390,8 +395,30 @@ class MCPServerAdapter:
                 "remote_tool": remote_name,
                 "tool": local_name or remote_name,
             })
+            record_current_resource(
+                provider=self.server_name,
+                category="mcp",
+                status="error" if payload.get("status") == "error" else "ok",
+                elapsed_ms=int((time.perf_counter() - request_started) * 1000),
+                cache_mode=cache_mode,
+                query=arguments,
+                network_request=is_network,
+                cache_access=False,
+                metadata={"remote_tool": remote_name},
+            )
             return payload
         except Exception as exc:
+            record_current_resource(
+                provider=self.server_name,
+                category="mcp",
+                status="error",
+                elapsed_ms=int((time.perf_counter() - request_started) * 1000),
+                cache_mode=cache_mode,
+                query=arguments,
+                network_request=is_network,
+                cache_access=False,
+                metadata={"remote_tool": remote_name, "error_type": type(exc).__name__},
+            )
             return {
                 "status": "error",
                 "server": self.server_name,

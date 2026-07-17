@@ -89,11 +89,15 @@ def test_agent_loop_executes_dsml_textual_tool_call(tmp_path: Path) -> None:
 
     assert result["status"] == "success"
     assert result["content"] == "final answer"
-    assert any(
-        event_type == "tool_call" and payload["tool"] == "echo_probe"
+    tool_call = next(
+        payload
         for event_type, payload in events
+        if event_type == "tool_call" and payload["tool"] == "echo_probe"
     )
-    assert any(
-        event_type == "tool_result" and payload["tool"] == "echo_probe"
+    tool_result = next(
+        payload
         for event_type, payload in events
+        if event_type == "tool_result" and payload["tool"] == "echo_probe"
     )
+    assert tool_call["tool_call_id"]
+    assert tool_result["tool_call_id"] == tool_call["tool_call_id"]

@@ -8,10 +8,16 @@ from __future__ import annotations
 import html
 import os
 import re
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from src.providers.llm import build_llm
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _dedupe_finish_reason(raw: str) -> str:
@@ -55,15 +61,15 @@ class LLMResponse:
         usage_metadata: Real token counts reported by the provider, when
             available. Mirrors LangChain's ``AIMessage.usage_metadata`` —
             ``{"input_tokens": int, "output_tokens": int, "total_tokens": int}``.
-            ``None`` if the provider did not return usage information; callers
-            should fall back to a heuristic in that case.
+            ``None`` if the provider did not return usage information. Missing
+            usage is preserved as unreported and must not be estimated.
     """
 
     content: Optional[str] = None
     tool_calls: List[ToolCallRequest] = field(default_factory=list)
     reasoning_content: Optional[str] = None
     finish_reason: str = "stop"
-    usage_metadata: Optional[Dict[str, int]] = None
+    usage_metadata: Optional[Dict[str, Any]] = None
 
     @property
     def has_tool_calls(self) -> bool:
@@ -232,10 +238,23 @@ class ChatLLM:
         Returns:
             LLMResponse.
         """
-        llm = self._llm.bind_tools(tools) if tools else self._llm
-        config = {"timeout": timeout} if timeout else {}
-        ai_message = llm.invoke(messages, config=config)
-        return self._parse_response(ai_message)
+        started = time.perf_counter()
+        started_at = _utc_now()
+        try:
+            llm = self._llm.bind_tools(tools) if tools else self._llm
+            config = {"timeout": timeout} if timeout else {}
+            ai_message = llm.invoke(messages, config=config)
+            response = self._parse_response(ai_message)
+        except Exception:
+            self._record_usage(None, status="error", started=started, started_at=started_at)
+            raise
+        self._record_usage(
+            response.usage_metadata,
+            status="ok",
+            started=started,
+            started_at=started_at,
+        )
+        return response
 
     def stream_chat(
         self,
@@ -265,6 +284,8 @@ class ChatLLM:
         Returns:
             Parsed ``LLMResponse``.
         """
+        started = time.perf_counter()
+        started_at = _utc_now()
         try:
             llm = self._llm.bind_tools(tools) if tools else self._llm
             config = {"timeout": timeout} if timeout else {}
@@ -290,15 +311,59 @@ class ChatLLM:
                     on_reasoning_chunk(reasoning)
                 accumulated = chunk if accumulated is None else accumulated + chunk
             if accumulated is None:
-                return LLMResponse(content="", tool_calls=[], finish_reason="stop")
+                response = LLMResponse(content="", tool_calls=[], finish_reason="stop")
+                self._record_usage(
+                    None,
+                    status="cancelled" if should_cancel and should_cancel() else "ok",
+                    started=started,
+                    started_at=started_at,
+                )
+                return response
             response = self._parse_response(accumulated)
             if pending_text and not (response.has_tool_calls and response.content == ""):
                 on_text_chunk(pending_text)
+            self._record_usage(
+                response.usage_metadata,
+                status="cancelled" if should_cancel and should_cancel() else "ok",
+                started=started,
+                started_at=started_at,
+            )
             return response
         except Exception as exc:
+            self._record_usage(None, status="error", started=started, started_at=started_at)
             provider = os.getenv("LANGCHAIN_PROVIDER", "openai").strip().lower() or "openai"
             model = self.model_name or os.getenv("LANGCHAIN_MODEL_NAME", "").strip() or "(unset)"
             raise ProviderStreamError(provider=provider, model=model, original=exc) from exc
+
+    def _record_usage(
+        self,
+        usage: Any,
+        *,
+        status: str,
+        started: float,
+        started_at: str,
+    ) -> None:
+        """Write one provider-boundary call into the active usage scope."""
+        try:
+            from src.usage import get_current_usage_recorder
+
+            recorder = get_current_usage_recorder()
+            if recorder is None:
+                return
+            provider = os.getenv("LANGCHAIN_PROVIDER", "openai").strip().lower() or "openai"
+            model = self.model_name or os.getenv("LANGCHAIN_MODEL_NAME", "").strip() or "unknown"
+            recorder.record_llm(
+                usage,
+                provider=provider,
+                model=model,
+                status=status,
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+                started_at=started_at,
+            )
+        except Exception:
+            # Usage accounting must never turn a successful provider response
+            # into a failed Agent turn.
+            return
 
     @staticmethod
     def _tool_call_thought_signature_maps(ai_message: Any) -> tuple[dict[str, str], dict[int, str]]:

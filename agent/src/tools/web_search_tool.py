@@ -19,6 +19,7 @@ from typing import Any
 
 from src.agent.tools import BaseTool
 from src.security.scanner import with_security_warnings
+from src.usage import record_current_resource
 
 logger = logging.getLogger(__name__)
 
@@ -187,8 +188,19 @@ class WebSearchTool(BaseTool):
         # ~1s, structured + snippet, best quality). Skip ddgs entirely when IQS
         # is available — ddgs engines are unreachable from typical CN egress.
         if os.getenv("ALIYUN_IQS_API_KEY", "").strip():
+            request_started = time.perf_counter()
             try:
                 raw = _aliyun_iqs_search(query, max_results=max_results)
+                record_current_resource(
+                    provider="aliyun_iqs",
+                    category="web",
+                    status="ok",
+                    elapsed_ms=int((time.perf_counter() - request_started) * 1000),
+                    cache_mode="network",
+                    query={"query": query},
+                    network_request=True,
+                    cache_access=False,
+                )
                 if raw:
                     payload = {
                         "status": "ok",
@@ -205,6 +217,16 @@ class WebSearchTool(BaseTool):
                     return json.dumps(payload, ensure_ascii=False)
                 logger.warning("aliyun_iqs returned no results, falling through to ddgs")
             except Exception as exc:  # noqa: BLE001
+                record_current_resource(
+                    provider="aliyun_iqs",
+                    category="web",
+                    status="error",
+                    elapsed_ms=int((time.perf_counter() - request_started) * 1000),
+                    cache_mode="network",
+                    query={"query": query},
+                    network_request=True,
+                    cache_access=False,
+                )
                 logger.warning("aliyun_iqs failed: %s, falling through to ddgs", exc)
 
         try:
@@ -226,6 +248,8 @@ class WebSearchTool(BaseTool):
 
         last_error: Exception | None = None
         for attempt in range(1, _MAX_ATTEMPTS + 1):
+            request_started = time.perf_counter()
+            provider = f"ddgs:{backends}" if supports_backend else "duckduckgo"
             try:
                 with DDGS() as client:
                     if supports_backend:
@@ -233,10 +257,32 @@ class WebSearchTool(BaseTool):
                     else:
                         raw = list(client.text(query, max_results=max_results))
             except TypeError:
+                record_current_resource(
+                    provider=provider,
+                    category="web",
+                    status="error",
+                    elapsed_ms=int((time.perf_counter() - request_started) * 1000),
+                    cache_mode="network",
+                    query={"query": query},
+                    network_request=True,
+                    cache_access=False,
+                    metadata={"attempt": attempt, "error_type": "unsupported_backend_argument"},
+                )
                 # Older ddgs/duckduckgo_search without the backend kwarg.
                 supports_backend = False
                 continue
             except Exception as exc:  # noqa: BLE001 — surface a clean error to the agent
+                record_current_resource(
+                    provider=provider,
+                    category="web",
+                    status="error",
+                    elapsed_ms=int((time.perf_counter() - request_started) * 1000),
+                    cache_mode="network",
+                    query={"query": query},
+                    network_request=True,
+                    cache_access=False,
+                    metadata={"attempt": attempt, "error_type": type(exc).__name__},
+                )
                 last_error = exc
                 # "No results found" is a definitive empty answer, not a transient
                 # failure — retrying or switching engines won't change it.
@@ -262,6 +308,17 @@ class WebSearchTool(BaseTool):
                     time.sleep(_BACKOFF_BASE_SECONDS * attempt)
                 continue
 
+            record_current_resource(
+                provider=provider,
+                category="web",
+                status="ok",
+                elapsed_ms=int((time.perf_counter() - request_started) * 1000),
+                cache_mode="network",
+                query={"query": query},
+                network_request=True,
+                cache_access=False,
+                metadata={"attempt": attempt},
+            )
             results = [
                 {
                     "title": r.get("title", ""),
@@ -289,8 +346,20 @@ class WebSearchTool(BaseTool):
         fb_err = "disabled"
         if os.getenv("VIBE_TRADING_SEARCH_BING_FALLBACK", "1").strip().lower() in ("1", "true", "yes"):
             for fb_name, fb_fn in (("sogou", _sogou_search), ("bing_cn", _bing_cn_search)):
+                request_started = time.perf_counter()
                 try:
                     raw = fb_fn(query, max_results=max_results)
+                    record_current_resource(
+                        provider=fb_name,
+                        category="web",
+                        status="ok",
+                        elapsed_ms=int((time.perf_counter() - request_started) * 1000),
+                        cache_mode="network",
+                        query={"query": query},
+                        network_request=True,
+                        cache_access=False,
+                        metadata={"fallback": True},
+                    )
                     if raw:
                         payload = {
                             "status": "ok",
@@ -307,6 +376,17 @@ class WebSearchTool(BaseTool):
                         return json.dumps(payload, ensure_ascii=False)
                     fb_err = f"{fb_name} returned no results"
                 except Exception as exc:  # noqa: BLE001
+                    record_current_resource(
+                        provider=fb_name,
+                        category="web",
+                        status="error",
+                        elapsed_ms=int((time.perf_counter() - request_started) * 1000),
+                        cache_mode="network",
+                        query={"query": query},
+                        network_request=True,
+                        cache_access=False,
+                        metadata={"fallback": True, "error_type": type(exc).__name__},
+                    )
                     logger.warning("%s fallback failed: %s", fb_name, exc)
                     fb_err = f"{fb_name}: {exc}"
                     continue

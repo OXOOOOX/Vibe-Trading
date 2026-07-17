@@ -51,7 +51,11 @@ def test_tool_timeout_returns_error_and_stops_heartbeats(monkeypatch) -> None:
         max_iterations=1,
     )
 
-    result, elapsed_ms = agent._invoke_tool("slow_tool", {})
+    result, elapsed_ms = agent._invoke_tool(
+        "slow_tool",
+        {},
+        tool_call_id="call-slow-tool",
+    )
     event_count_at_return = len(events)
     time.sleep(0.08)
 
@@ -61,6 +65,13 @@ def test_tool_timeout_returns_error_and_stops_heartbeats(monkeypatch) -> None:
     assert payload["tool"] == "slow_tool"
     assert elapsed_ms >= 40
     assert len(events) == event_count_at_return
+    correlated_events = [
+        data
+        for event_type, data in events
+        if event_type in {"tool_progress", "tool_heartbeat"}
+    ]
+    assert correlated_events
+    assert all(data["tool_call_id"] == "call-slow-tool" for data in correlated_events)
 
 
 def test_write_tool_timeout_warns_but_does_not_return_before_completion(monkeypatch) -> None:

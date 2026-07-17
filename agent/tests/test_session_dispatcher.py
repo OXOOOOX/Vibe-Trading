@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
-from src.session.dispatcher import DispatchStore, SessionDispatcher
+from src.session.dispatcher import DispatchJob, DispatchStore, SessionDispatcher
 from src.session.models import AttemptStatus
 
 
@@ -78,8 +79,6 @@ def test_dispatcher_serializes_each_session_and_runs_sessions_in_parallel(tmp_pa
 
 def test_dispatch_store_recovers_running_without_replaying(tmp_path: Path) -> None:
     store = DispatchStore(tmp_path / "dispatch.db")
-    from src.session.dispatcher import DispatchJob
-
     pending = store.add(DispatchJob(session_id="s1", content="pending"))
     running = store.add(DispatchJob(session_id="s2", content="running"))
     store.update(running.job_id, "running")
@@ -103,3 +102,95 @@ def test_cancel_session_clears_all_pending_jobs(tmp_path: Path) -> None:
         assert store.get(second["job_id"]).status == "cancelled"
 
     asyncio.run(scenario())
+
+
+def test_feishu_source_event_is_durable_and_idempotent_for_burst_messages(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        service = _FakeService(delay=0.01)
+        store = DispatchStore(tmp_path / "dispatch.db")
+        dispatcher = SessionDispatcher(service, store=store, max_concurrency=1)
+
+        payloads = ["你好", "请详细分析 513120 的风险与机会", "继续，重点说估值"]
+        submitted = [
+            await dispatcher.submit(
+                "s1",
+                content,
+                source="feishu",
+                source_event_id=f"om-{index}",
+                source_metadata={"channel_chat_id": "ou-user"},
+            )
+            for index, content in enumerate(payloads)
+        ]
+        duplicate = await dispatcher.submit(
+            "s1",
+            payloads[1],
+            source="feishu",
+            source_event_id="om-1",
+            source_metadata={"channel_chat_id": "ou-user"},
+        )
+
+        assert len({item["job_id"] for item in submitted}) == 3
+        assert all(item["deduplicated"] is False for item in submitted)
+        assert duplicate["deduplicated"] is True
+        assert duplicate["job_id"] == submitted[1]["job_id"]
+        assert store.get(submitted[1]["job_id"]).source_event_id == "om-1"
+        assert store.get(submitted[1]["job_id"]).delivery_status == "pending"
+
+        dispatcher.start()
+        await _wait_terminal(store, [item["job_id"] for item in submitted])
+        await dispatcher.stop()
+        starts = [content for kind, _sid, content in service.events if kind == "start"]
+        assert starts == payloads
+
+    asyncio.run(scenario())
+
+
+def test_dispatch_store_migrates_existing_sqlite_in_place(tmp_path: Path) -> None:
+    path = tmp_path / "dispatch.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """CREATE TABLE dispatch_jobs (
+            job_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL,
+            source TEXT NOT NULL, source_metadata TEXT NOT NULL, message_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
+            started_at TEXT, completed_at TEXT, error TEXT)"""
+        )
+        connection.execute(
+            """INSERT INTO dispatch_jobs VALUES
+            ('legacy', 's1', 'old', 'api', '{}', 'm1', 'a1', 'pending',
+             '2026-01-01T00:00:00', NULL, NULL, NULL)"""
+        )
+
+    store = DispatchStore(path)
+    legacy = store.get("legacy")
+
+    assert legacy is not None
+    assert legacy.content == "old"
+    assert legacy.source_event_id is None
+    assert legacy.delivery_status == "not_required"
+    assert legacy.delivery_attempts == 0
+
+
+def test_dispatch_store_resumes_an_uncertain_delivery_with_same_logical_attempt(
+    tmp_path: Path,
+) -> None:
+    store = DispatchStore(tmp_path / "dispatch.db")
+    job = store.add(
+        DispatchJob(
+            session_id="s1",
+            content="answer",
+            source="feishu",
+            source_event_id="om-uncertain",
+            status="completed",
+            delivery_status="delivering",
+            delivery_attempts=3,
+        )
+    )
+
+    assert [item.job_id for item in store.undelivered_terminal()] == [job.job_id]
+    resumed = store.start_delivery_attempt(job.job_id)
+    assert resumed is not None
+    assert resumed.delivery_attempts == 3
+    assert resumed.delivery_status == "delivering"

@@ -9,7 +9,7 @@ from contextlib import suppress
 from typing import Any
 
 from src.channels.base import BaseChannel
-from src.channels.bus.events import OutboundMessage
+from src.channels.bus.events import DeliveryReceipt, OutboundMessage
 from src.channels.bus.queue import MessageBus
 from src.channels.registry import (
     discover_channel_names,
@@ -346,7 +346,10 @@ class ChannelManager:
                 break
 
     @staticmethod
-    async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
+    async def _send_once(
+        channel: BaseChannel,
+        msg: OutboundMessage,
+    ) -> DeliveryReceipt | None:
         """Send one outbound message without retry policy."""
         if msg.metadata.get("_reasoning_end"):
             await channel.send_reasoning_end(msg.chat_id, msg.metadata)
@@ -364,7 +367,8 @@ class ChannelManager:
         elif msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
             await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
         elif not msg.metadata.get("_streamed"):
-            await channel.send(msg)
+            return await channel.send(msg)
+        return None
 
     def _coalesce_stream_deltas(
         self, first_msg: OutboundMessage,
@@ -455,7 +459,7 @@ class ChannelManager:
         """Get a channel by name."""
         return self.channels.get(name)
 
-    async def send_direct(self, msg: OutboundMessage) -> None:
+    async def send_direct(self, msg: OutboundMessage) -> DeliveryReceipt | None:
         """Attempt one externally visible delivery and surface ambiguity.
 
         Scheduled delivery uses its own durable state machine.  Retrying here
@@ -478,7 +482,7 @@ class ChannelManager:
             metadata={**dict(msg.metadata or {}), "_require_delivery_receipt": True},
             buttons=list(msg.buttons),
         )
-        await self._send_once(channel, strict)
+        return await self._send_once(channel, strict)
 
     def get_status(self) -> dict[str, Any]:
         """Get status of all channels."""
@@ -493,6 +497,9 @@ class ChannelManager:
                     "display_name": getattr(channel, "display_name", name),
                 }
             )
+            health_status = getattr(channel, "health_status", None)
+            if callable(health_status):
+                status[name].update(health_status())
         return status
 
     @property
