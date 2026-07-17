@@ -153,7 +153,7 @@ class TestFallbackChains:
             "tencent", "mootdx", "eastmoney", "baostock", "akshare", "tushare", "local",
         ]
         assert FALLBACK_CHAINS["us_equity"] == [
-            "yahoo", "stooq", "sina", "eastmoney", "yfinance", "tiingo", "fmp",
+            "yahoo", "nasdaq", "stooq", "sina", "eastmoney", "yfinance", "tiingo", "fmp",
             "finnhub", "alphavantage", "akshare", "local",
         ]
         assert FALLBACK_CHAINS["hk_equity"] == [

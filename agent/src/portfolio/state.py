@@ -42,13 +42,18 @@ def _number(value: Any) -> float | None:
         return None
 
 
+_BARE_US_TICKER_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}(?:\.[A-Z])?$")
+
+
 def normalize_symbol(code: str) -> str:
-    """Normalize common China security codes to source-ready symbols."""
+    """Normalize common portfolio codes to source-ready symbols."""
     text = str(code or "").strip().upper().replace(" ", "")
     if not text:
         return text
     if re.search(r"\.(SH|SZ|BJ|US|HK)$", text, re.I):
         return text
+    if _BARE_US_TICKER_RE.fullmatch(text):
+        return f"{text}.US"
     if not re.fullmatch(r"\d{6}", text):
         return text
 
@@ -174,11 +179,20 @@ class PortfolioState:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "PortfolioState":
+        holdings = [dict(item) for item in (payload.get("holdings") or [])]
+        for holding in holdings:
+            symbol = normalize_symbol(str(holding.get("symbol") or holding.get("code") or ""))
+            if symbol:
+                holding["symbol"] = symbol
         recent_trades = [dict(item) for item in (payload.get("recent_trades") or [])]
+        for trade in recent_trades:
+            symbol = normalize_symbol(str(trade.get("symbol") or trade.get("code") or ""))
+            if symbol:
+                trade["symbol"] = symbol
         for index, trade in enumerate(recent_trades):
             trade.setdefault("trade_id", _legacy_trade_id(trade, index))
         return cls(
-            holdings=list(payload.get("holdings") or []),
+            holdings=holdings,
             recent_trades=recent_trades,
             cash=_number(payload.get("cash")),
             cash_currency=str(payload.get("cash_currency") or "CNY"),
@@ -358,18 +372,18 @@ def delete_trade(*, trade_id: str, path: Path | None = None) -> PortfolioState:
 def record_trade(*, trade: dict[str, Any], path: Path | None = None) -> PortfolioState:
     state = load_state(path)
     entry = dict(trade)
-    code = str(entry.get("code") or "").strip()
+    code = str(entry.get("code") or "").strip().upper()
     name = str(entry.get("name") or "").strip()
     symbol = str(entry.get("symbol") or "").strip()
-    if not re.fullmatch(r"\d{6}", code):
-        raise ValueError("Trade requires a complete 6-digit security code.")
+    if not (re.fullmatch(r"\d{6}", code) or _BARE_US_TICKER_RE.fullmatch(code.upper())):
+        raise ValueError("Trade requires a complete A-share code or U.S. ticker.")
     if not name:
         raise ValueError("Trade requires a security name.")
     if not symbol:
         raise ValueError("Trade requires a complete security symbol.")
     normalized_symbol = normalize_symbol(str(symbol))
     if normalized_symbol != normalize_symbol(code):
-        raise ValueError("Trade symbol does not match the 6-digit security code.")
+        raise ValueError("Trade symbol does not match the security code.")
 
     side_aliases = {"buy": "buy", "买": "buy", "买入": "buy", "sell": "sell", "卖": "sell", "卖出": "sell"}
     side = side_aliases.get(str(entry.get("side") or "").strip().lower())

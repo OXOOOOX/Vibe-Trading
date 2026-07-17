@@ -10,7 +10,14 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import pytest
+
 from src.tools import symbol_search_tool as ss
+
+
+@pytest.fixture(autouse=True)
+def _disable_live_tencent_search(monkeypatch):
+    monkeypatch.setattr(ss.tencent_client, "search", lambda query: [])
 
 
 def _eastmoney_payload() -> dict:
@@ -97,6 +104,7 @@ class TestSymbolSearchSuccess:
         data = payload["data"]
         assert data["query"] == "apple"
         assert data["sources"]["eastmoney"] == "ok"
+        assert data["sources"]["tencent"] == "ok"
         assert data["sources"]["yahoo"] == "ok"
         assert data["sources"]["sec_edgar"] == "ok"
 
@@ -160,6 +168,69 @@ class TestSymbolSearchSuccess:
         payload = json.loads(out)
         assert "sec_edgar" not in payload["data"]["sources"]
         mock_cik.assert_not_called()
+
+    def test_qualified_symbol_keeps_exchange_when_bare_code_is_ambiguous(self):
+        candidates = [
+            {
+                "symbol": "000905.SZ",
+                "name": "厦门港务",
+                "market": "cn",
+                "source": "eastmoney",
+            },
+            {
+                "symbol": "000905.SH",
+                "name": "中证500",
+                "market": "cn",
+                "source": "eastmoney",
+            },
+        ]
+        with patch.object(
+            ss, "_search_eastmoney", return_value=(candidates, "ok")
+        ), patch.object(ss, "_search_yahoo", return_value=([], "ok")):
+            exact, status = ss.lookup_exact_security("000905.SH")
+
+        assert status == "ok"
+        assert exact is not None
+        assert exact["symbol"] == "000905.SH"
+        assert exact["name"] == "中证500"
+
+    def test_tencent_fuzzy_name_search_resolves_taijing_technology(self, monkeypatch):
+        monkeypatch.setattr(
+            ss.tencent_client,
+            "search",
+            lambda query: ["sh~603738~泰晶科技~tjkj~GP-A"],
+        )
+        with patch.object(
+            ss.eastmoney_client, "get_json", side_effect=ValueError("invalid JSON")
+        ), patch.object(
+            ss.yahoo_client, "search", return_value=[]
+        ):
+            out = ss.SymbolSearchTool().execute(query="泰晶")
+
+        payload = json.loads(out)
+        assert payload["ok"] is True
+        assert payload["data"]["sources"]["tencent"] == "ok"
+        assert payload["data"]["candidates"] == [{
+            "symbol": "603738.SH",
+            "name": "泰晶科技",
+            "market": "cn",
+            "type": "equity",
+            "source": "tencent",
+        }]
+
+    def test_tencent_filters_non_company_suggestions(self, monkeypatch):
+        monkeypatch.setattr(
+            ss.tencent_client,
+            "search",
+            lambda query: [
+                "sh~512800~银行ETF华宝~yhetfhb~ETF",
+                "sh~601988~中国银行~zgyh~GP-A",
+            ],
+        )
+        hits, status = ss._search_tencent("银行")
+
+        assert status == "ok"
+        assert [item["symbol"] for item in hits] == ["601988.SH"]
 
 
 class TestSymbolSearchErrors:

@@ -9,16 +9,19 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import suppress
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 from src.market_cache import get_market_refresh_service
+from src.market_verification import PRICE_BASIS_DEFINITIONS
 from src.portfolio.state import load_state, normalize_symbol
 from src.tools.financial_statements_tool import FinancialStatementsTool
 from src.tools.research_reports_tool import ResearchReportsTool
 from src.tools.stock_news_tool import StockNewsTool
+from src.usage import record_current_resource
 
 from .store import DataControlStore, ResearchCacheStore, utc_now
 
@@ -32,7 +35,17 @@ _EVICT_AT_BYTES = int(_SOFT_LIMIT_BYTES * 0.9)
 # The profile is a lower bound. Callers may request a longer lookback, but
 # cannot downgrade a task to a coarser interval or fewer history bars.
 PROFILES: dict[str, dict[str, Any]] = {
-    "latest_price": {"items": [("1m", "raw")], "lookback_days": 2, "live": True},
+    # Deep research can run before the exchange opens. Keep the live intraday
+    # quote first, but also fetch a raw daily close so a verified latest-session
+    # price remains usable for timestamped market-cap calculations pre-open.
+    # Raw is required here because adjusted closes must never be multiplied by
+    # current shares outstanding.
+    "latest_price": {
+        "items": [("1m", "raw"), ("1D", "raw")],
+        "lookback_days": 7,
+        "item_lookback_days": {"1m:raw": 2, "1D:raw": 7},
+        "live": True,
+    },
     # Analysis sessions are cache-first.  Timed prewarm jobs own live refreshes
     # so a report never serially re-fetches every holding and spends its entire
     # data budget waiting on a slow public provider.  ``force_live=True`` keeps
@@ -235,6 +248,8 @@ class UnifiedDataService:
             # not begin another source or symbol after this point.
             pool.shutdown(wait=False, cancel_futures=True)
         status = self._overall_status(market, research)
+        decision_scopes = self._decision_scopes(symbols, market, research)
+        provider_health = self._context_provider_health(market)
         self.control.log_event(request_id, "context", status, f"purpose={purpose}")
         self._enforce_retention()
         return {
@@ -246,6 +261,8 @@ class UnifiedDataService:
             "deadline_seconds": _LIVE_TIMEOUT_SECONDS,
             "market": market,
             "research": research,
+            "decision_scopes": decision_scopes,
+            "provider_health": provider_health,
             "policy": {
                 "historical": "cache_first_fill_gaps",
                 "mutable_tail": "scheduled_prewarm_cache_first_force_live_on_demand",
@@ -271,54 +288,145 @@ class UnifiedDataService:
         cancel_event: threading.Event,
     ) -> dict[str, Any]:
         result: dict[str, Any] = {"status": "offline", "series": [], "bars_handles": [], "quotes": [], "runs": []}
-        for interval, adjustment in profile["items"]:
+        for interval, profile_adjustment in profile["items"]:
             if cancel_event.is_set() or time.monotonic() - started >= _LIVE_TIMEOUT_SECONDS:
                 result["status"] = "partial"
                 result.setdefault("warnings", []).append("live request deadline reached")
                 break
             item_live = live
             item_defaults = profile.get("item_lookback_days") or {}
-            item_default_days = int(item_defaults.get(f"{interval}:{adjustment}", days))
+            item_default_days = int(
+                item_defaults.get(f"{interval}:{profile_adjustment}", days)
+            )
             item_days = max(requested_days, item_default_days)
             target_start = (date.today() - timedelta(days=item_days)).isoformat()
-            cache_complete = self._has_coverage(symbols, interval, adjustment, target_start)
-            run: dict[str, Any] | None = None
-            # Settled historical data does not refetch merely because it was read.
-            # Mutable intraday tails always revalidate, and any coverage gap is filled.
-            if item_live or not cache_complete:
-                run = self.market_service.refresh_sync(
-                    symbols=symbols,
-                    profile="unified_data",
-                    force=False,
-                    start_date=target_start,
-                    end_date=date.today().isoformat(),
-                    items=[(interval, adjustment)],
-                    deadline=started + _LIVE_TIMEOUT_SECONDS,
-                    should_cancel=cancel_event.is_set,
-                )
-                self._record_market_sources(run)
-                result["runs"].append({"run_id": run.get("run_id"), "status": run.get("status"), "interval": interval, "adjustment": adjustment})
-                if run.get("status") == "interrupted":
-                    result["status"] = "partial"
-                    result.setdefault("warnings", []).append("market refresh reached its source budget")
+            symbols_by_adjustment: dict[str, list[str]] = {}
             for symbol in symbols:
-                bars = self.market_service.store.query_bars(
-                    symbol=symbol, interval=interval, adjustment=adjustment,
-                    start=target_start, limit=max(_AGENT_BAR_PREVIEW, 2500 if interval == "1D" else 5000),
+                # Adjustment names are a market-neutral contract. Never weaken
+                # qfq/hfq to source_default merely because a provider uses
+                # different terminology; the adapter must prove an exact mapping.
+                symbols_by_adjustment.setdefault(profile_adjustment, []).append(symbol)
+
+            for adjustment, item_symbols in symbols_by_adjustment.items():
+                cache_complete = self._has_coverage(
+                    item_symbols, interval, adjustment, target_start
                 )
-                summary = self._series_summary(symbol, interval, adjustment, bars, run, item_live)
-                handle = uuid.uuid4().hex
-                self.control.put_handle(handle, {"symbol": symbol, "interval": interval, "adjustment": adjustment, "start": target_start})
-                summary["handle"] = handle
-                # Never stride-sample technical bars: this is the latest contiguous window.
-                summary["bars"] = bars[-_AGENT_BAR_PREVIEW:]
-                result["series"].append(summary)
-                result["bars_handles"].append({
-                    "symbol": symbol,
-                    "interval": interval,
-                    "adjustment": adjustment,
-                    "handle": handle,
-                })
+                run: dict[str, Any] | None = None
+                # Settled historical data does not refetch merely because it was read.
+                # Mutable intraday tails always revalidate, and any coverage gap is filled.
+                if item_live or not cache_complete:
+                    run = self.market_service.refresh_sync(
+                        symbols=item_symbols,
+                        profile="unified_data",
+                        force=False,
+                        start_date=target_start,
+                        end_date=date.today().isoformat(),
+                        items=[(interval, adjustment)],
+                        deadline=started + _LIVE_TIMEOUT_SECONDS,
+                        should_cancel=cancel_event.is_set,
+                    )
+                    self._record_market_sources(run)
+                    result["runs"].append(
+                        {
+                            "run_id": run.get("run_id"),
+                            "status": run.get("status"),
+                            "interval": interval,
+                            "adjustment": adjustment,
+                            "symbols": item_symbols,
+                        }
+                    )
+                    if run.get("status") == "interrupted":
+                        result["status"] = "partial"
+                        result.setdefault("warnings", []).append(
+                            "market refresh reached its source budget"
+                        )
+                repair_attempted = False
+                for symbol in item_symbols:
+                    bars = self.market_service.store.query_bars(
+                        symbol=symbol,
+                        interval=interval,
+                        adjustment=adjustment,
+                        start=target_start,
+                        limit=max(_AGENT_BAR_PREVIEW, 2500 if interval == "1D" else 5000),
+                    )
+                    summary = self._series_summary(
+                        symbol, interval, adjustment, bars, run, item_live
+                    )
+                    retryable_reasons = {
+                        "insufficient_independent_sources",
+                        "live_refresh_not_verified",
+                        "unresolved",
+                        "unresolved_conflict",
+                    }
+                    if (
+                        run
+                        and not repair_attempted
+                        and summary.get("actionability") == "analysis_only"
+                        and retryable_reasons.intersection(
+                            summary.get("blocked_reasons") or []
+                        )
+                        and not cancel_event.is_set()
+                        and _LIVE_TIMEOUT_SECONDS - (time.monotonic() - started) > 2.0
+                    ):
+                        repair_attempted = True
+                        time.sleep(0.25)
+                        repair_run = self.market_service.refresh_sync(
+                            symbols=item_symbols,
+                            profile="unified_data_repair",
+                            force=True,
+                            start_date=target_start,
+                            end_date=date.today().isoformat(),
+                            items=[(interval, adjustment)],
+                            deadline=started + _LIVE_TIMEOUT_SECONDS,
+                            should_cancel=cancel_event.is_set,
+                        )
+                        self._record_market_sources(repair_run)
+                        result["runs"].append(
+                            {
+                                "run_id": repair_run.get("run_id"),
+                                "status": repair_run.get("status"),
+                                "interval": interval,
+                                "adjustment": adjustment,
+                                "symbols": item_symbols,
+                                "repair_attempt": 1,
+                            }
+                        )
+                        run = repair_run
+                        bars = self.market_service.store.query_bars(
+                            symbol=symbol,
+                            interval=interval,
+                            adjustment=adjustment,
+                            start=target_start,
+                            limit=max(
+                                _AGENT_BAR_PREVIEW,
+                                2500 if interval == "1D" else 5000,
+                            ),
+                        )
+                        summary = self._series_summary(
+                            symbol, interval, adjustment, bars, run, item_live
+                        )
+                    handle = uuid.uuid4().hex
+                    self.control.put_handle(
+                        handle,
+                        {
+                            "symbol": symbol,
+                            "interval": interval,
+                            "adjustment": adjustment,
+                            "start": target_start,
+                        },
+                    )
+                    summary["handle"] = handle
+                    # Never stride-sample technical bars: this is the latest contiguous window.
+                    summary["bars"] = bars[-_AGENT_BAR_PREVIEW:]
+                    result["series"].append(summary)
+                    result["bars_handles"].append(
+                        {
+                            "symbol": symbol,
+                            "interval": interval,
+                            "adjustment": adjustment,
+                            "handle": handle,
+                        }
+                    )
         quotes = self.market_service.store.list_quotes(symbols)
         preferred_series: dict[str, dict[str, Any]] = {}
         for series in result["series"]:
@@ -409,9 +517,12 @@ class UnifiedDataService:
             blocked_reasons.append("insufficient_independent_sources")
         if forming:
             blocked_reasons.append("forming_bar_before_15_10")
+        preopen_intraday = self._is_preopen_intraday_bar(symbol, interval, latest)
         if latest is not None and not fresh:
-            blocked_reasons.append("stale_verification")
-        if live_requested and not current_batch:
+            blocked_reasons.append(
+                "intraday_not_started" if preopen_intraday else "stale_verification"
+            )
+        if live_requested and not current_batch and not preopen_intraday:
             blocked_reasons.append("live_refresh_not_verified")
         actionability = "price_actionable" if not blocked_reasons else "analysis_only"
         selected_quote = None
@@ -425,6 +536,23 @@ class UnifiedDataService:
                 "sources": latest.get("sources", []),
                 "verified_at": latest.get("verified_at"),
             }
+        if mode in {"cache", "cache_fallback"}:
+            record_current_resource(
+                provider="verified_market_cache",
+                category="market",
+                status="ok",
+                elapsed_ms=0,
+                cache_mode="stale_fallback" if mode == "cache_fallback" else "cache_hit",
+                query={
+                    "code": symbol,
+                    "interval": interval,
+                    "source": ",".join(
+                        str(source) for source in ((latest or {}).get("sources") or [])
+                    ),
+                },
+                network_request=False,
+                cache_access=True,
+            )
         return {
             "symbol": symbol,
             "interval": interval,
@@ -447,7 +575,7 @@ class UnifiedDataService:
             },
             "source_attempts": source_attempts,
             "retrieval": {
-                "mode": mode,
+                "mode": "preopen" if preopen_intraday else mode,
                 "live_requested": live_requested,
                 "live_sources": live_sources,
                 "cache_fallback_used": mode == "cache_fallback",
@@ -457,6 +585,28 @@ class UnifiedDataService:
                 "verified_at": latest.get("verified_at") if latest else None,
             },
         }
+
+    @staticmethod
+    def _is_preopen_intraday_bar(
+        symbol: str, interval: str, latest: dict[str, Any] | None
+    ) -> bool:
+        """Distinguish a normal pre-open previous bar from a stale live failure."""
+
+        if interval == "1D" or not latest or not latest.get("bar_time"):
+            return False
+        if not symbol.upper().endswith((".SH", ".SZ", ".BJ", ".HK")):
+            return False
+        market_tz = ZoneInfo("Asia/Shanghai")
+        now = datetime.now(market_tz)
+        if now.weekday() >= 5 or now.time() >= datetime.strptime("09:30", "%H:%M").time():
+            return False
+        try:
+            bar_local = datetime.fromisoformat(
+                str(latest["bar_time"]).replace("Z", "+00:00")
+            ).astimezone(market_tz)
+        except (TypeError, ValueError):
+            return False
+        return bar_local.date() < now.date()
 
     @staticmethod
     def _is_fresh_market_bar(symbol: str, interval: str, latest: dict[str, Any] | None) -> bool:
@@ -519,17 +669,21 @@ class UnifiedDataService:
             if cancel_event.is_set() or time.monotonic() - started >= _LIVE_TIMEOUT_SECONDS:
                 output["status"] = "partial"
                 break
+            if kind == "report" and not symbol.upper().endswith((".SH", ".SZ", ".BJ")):
+                output["items"][symbol] = {
+                    "mode": "not_applicable",
+                    "documents": [],
+                    "reason_code": "market_not_supported",
+                    "warning": "A股研报源不适用于该市场",
+                    "provider_attempts": [],
+                }
+                continue
+            attempt_log: list[dict[str, Any]] = []
             try:
                 before = time.monotonic()
-                if kind == "news":
-                    raw = self.news_tool.execute(code=symbol, limit=20)
-                elif kind == "report":
-                    raw = self.reports_tool.execute(code=symbol, limit=20)
-                else:
-                    raw = self.fundamentals_tool.execute(code=symbol, statement="indicators", period="annual")
-                envelope = _parse_json(raw)
-                if not envelope.get("ok"):
-                    raise RuntimeError(str(envelope.get("error") or "research source failed"))
+                envelope, attempt_log = self._fetch_research_with_retry(
+                    kind, symbol, started=started, cancel_event=cancel_event
+                )
                 data = envelope.get("data") or {}
                 documents = data.get("articles") or data.get("reports") or data.get("matches") or []
                 if kind == "fundamental":
@@ -538,17 +692,132 @@ class UnifiedDataService:
                 self._record_research_sources(kind, symbol, source, succeeded=True, latency_ms=round((time.monotonic() - before) * 1000, 1))
                 self._record_declared_source_statuses(kind, data.get("source_statuses"))
                 self.research.replace_documents(kind, symbol, [item for item in documents if isinstance(item, dict)], source=str(source) if source else None)
-                output["items"][symbol] = {"mode": "live", "source": source, "documents": self.research.latest(kind, symbol)}
+                output["items"][symbol] = {
+                    "mode": "live",
+                    "source": source,
+                    "documents": self.research.latest(kind, symbol),
+                    "provider_attempts": attempt_log,
+                }
             except Exception as exc:
+                attempt_log = list(getattr(exc, "provider_attempts", attempt_log) or [])
                 self._record_research_sources(kind, symbol, None, succeeded=False, error=str(exc))
                 cached = self.research.latest(kind, symbol)
+                if cached:
+                    record_current_resource(
+                        provider="research_cache",
+                        category="financial" if kind == "fundamental" else "web",
+                        status="ok",
+                        elapsed_ms=0,
+                        cache_mode="stale_fallback",
+                        query={"code": symbol, "source": kind},
+                        network_request=False,
+                        cache_access=True,
+                    )
                 output["status"] = "partial"
                 output["items"][symbol] = {
                     "mode": "historical_background" if cached else "unavailable",
                     "documents": cached,
                     "warning": "latest live research unavailable; cached material is historical background only" if cached else str(exc),
+                    "provider_attempts": attempt_log,
                 }
         return output
+
+    def _fetch_research_with_retry(
+        self,
+        kind: str,
+        symbol: str,
+        *,
+        started: float,
+        cancel_event: threading.Event,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Run at most two research attempts while honoring circuit and request budgets."""
+
+        default_provider = (
+            "eastmoney"
+            if kind != "news" or symbol.upper().endswith((".SH", ".SZ", ".BJ"))
+            else "yahoo"
+        )
+        health = {
+            str(item.get("source") or ""): item for item in self.control.source_health()
+        }
+        circuit = health.get(f"{default_provider}:{kind}") or {}
+        if circuit.get("circuit_open"):
+            raise RuntimeError(
+                f"provider circuit open: {default_provider}:{kind} until "
+                f"{circuit.get('circuit_open_until') or 'cooldown'}"
+            )
+
+        attempts: list[dict[str, Any]] = []
+        last_error: Exception | None = None
+        for attempt_number in (1, 2):
+            if cancel_event.is_set() or time.monotonic() - started >= _LIVE_TIMEOUT_SECONDS:
+                break
+            attempt_started = time.monotonic()
+            try:
+                if kind == "news":
+                    raw = self.news_tool.execute(code=symbol, limit=20)
+                elif kind == "report":
+                    raw = self.reports_tool.execute(code=symbol, limit=20)
+                else:
+                    raw = self.fundamentals_tool.execute(
+                        code=symbol, statement="indicators", period="annual"
+                    )
+                envelope = _parse_json(raw)
+                if not envelope.get("ok"):
+                    raise RuntimeError(
+                        str(envelope.get("error") or "research source failed")
+                    )
+            except Exception as exc:  # noqa: BLE001 - bounded provider repair
+                last_error = exc
+                elapsed_ms = int((time.monotonic() - attempt_started) * 1000)
+                record_current_resource(
+                    provider=default_provider,
+                    category="financial" if kind == "fundamental" else "web",
+                    status="error",
+                    elapsed_ms=elapsed_ms,
+                    cache_mode="network",
+                    query={"code": symbol, "source": kind},
+                    network_request=True,
+                    cache_access=False,
+                    metadata={"attempt": attempt_number, "error_type": type(exc).__name__},
+                )
+                attempts.append(
+                    {
+                        "attempt": attempt_number,
+                        "status": "failed",
+                        "latency_ms": round((time.monotonic() - attempt_started) * 1000, 1),
+                        "error": str(exc),
+                    }
+                )
+                remaining = _LIVE_TIMEOUT_SECONDS - (time.monotonic() - started)
+                if attempt_number == 2 or remaining <= 0.35 or cancel_event.is_set():
+                    break
+                time.sleep(min(0.25 * attempt_number, max(0.0, remaining - 0.1)))
+                continue
+            attempts.append(
+                {
+                    "attempt": attempt_number,
+                    "status": "success",
+                    "latency_ms": round((time.monotonic() - attempt_started) * 1000, 1),
+                }
+            )
+            record_current_resource(
+                provider=str(envelope.get("source") or default_provider),
+                category="financial" if kind == "fundamental" else "web",
+                status="ok",
+                elapsed_ms=int((time.monotonic() - attempt_started) * 1000),
+                cache_mode="network",
+                query={"code": symbol, "source": kind},
+                network_request=True,
+                cache_access=False,
+                metadata={"attempt": attempt_number},
+            )
+            return envelope, attempts
+        if last_error is not None:
+            with suppress(Exception):
+                setattr(last_error, "provider_attempts", attempts)
+            raise last_error
+        raise RuntimeError("research request deadline reached before provider attempt")
 
     def _record_research_sources(
         self,
@@ -579,10 +848,18 @@ class UnifiedDataService:
         if not isinstance(statuses, dict):
             return
         for provider, status in statuses.items():
-            if str(status).lower() in {"live", "ok", "success"}:
+            normalized_status = str(status).lower()
+            if normalized_status in {"live", "ok", "success"}:
                 continue
             self.control.record_source(
-                f"{provider}:{kind}", succeeded=False, error=f"provider declared {status}"
+                f"{provider}:{kind}",
+                succeeded=False,
+                status="unavailable",
+                error=f"provider declared {normalized_status}",
+                error_category="provider_unavailable",
+                requested_source=str(provider),
+                actual_source=str(provider),
+                upstream_source=str(provider),
             )
 
     @staticmethod
@@ -593,6 +870,162 @@ class UnifiedDataService:
         if any(status == "partial" for status in statuses if status):
             return "partial"
         return "live"
+
+    @staticmethod
+    def _scope_from_series(
+        series: list[dict[str, Any]], *, intraday: bool
+    ) -> dict[str, Any]:
+        candidates = [
+            item
+            for item in series
+            if (str(item.get("interval") or "") != "1D") == intraday
+        ]
+        actionable = [
+            item for item in candidates if item.get("actionability") == "price_actionable"
+        ]
+        chosen = actionable[0] if actionable else (candidates[0] if candidates else {})
+        reasons = list(chosen.get("blocked_reasons") or [])
+        if actionable:
+            status = "verified"
+        elif intraday and "intraday_not_started" in reasons:
+            status = "not_started"
+        elif candidates:
+            status = "unavailable"
+        else:
+            status = "not_requested"
+        selected = chosen.get("selected_quote") or {}
+        freshness = chosen.get("freshness") or {}
+        return {
+            "status": status,
+            "actionability": "price_actionable" if actionable else "analysis_only",
+            "as_of": selected.get("bar_time") or freshness.get("bar_time"),
+            "verified_at": selected.get("verified_at") or freshness.get("verified_at"),
+            "interval": chosen.get("interval"),
+            "adjustment": chosen.get("adjustment"),
+            "reason": ", ".join(reasons) or None,
+            "blocked_reasons": reasons,
+        }
+
+    @staticmethod
+    def _research_scope(
+        research: dict[str, Any], domain: str, symbol: str
+    ) -> dict[str, Any]:
+        domain_payload = research.get(domain) or {}
+        items = domain_payload.get("items") if isinstance(domain_payload, dict) else {}
+        item: dict[str, Any] = {}
+        if isinstance(items, dict):
+            direct = items.get(symbol)
+            if isinstance(direct, dict):
+                item = direct
+            else:
+                for raw_symbol, candidate in items.items():
+                    if str(raw_symbol).upper() == symbol and isinstance(candidate, dict):
+                        item = candidate
+                        break
+        documents = list(item.get("documents") or [])
+        mode = str(item.get("mode") or "")
+        if mode == "not_applicable":
+            status = "not_applicable"
+        elif documents and mode == "live":
+            status = "verified"
+        elif documents:
+            status = "partial"
+        elif item or domain_payload:
+            status = "unavailable"
+        else:
+            status = "not_requested"
+        newest = next(
+            (
+                str(document.get("published_at") or document.get("date") or "")
+                for document in documents
+                if isinstance(document, dict)
+                and (document.get("published_at") or document.get("date"))
+            ),
+            "",
+        )
+        return {
+            "status": status,
+            "actionability": "analysis_only",
+            "as_of": newest or None,
+            "document_count": len(documents),
+            "mode": mode or None,
+            "reason": str(item.get("warning") or domain_payload.get("error") or "") or None,
+        }
+
+    def _decision_scopes(
+        self,
+        symbols: list[str],
+        market: dict[str, Any],
+        research: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        """Project broad context health into conclusion-specific safety scopes."""
+
+        output: dict[str, dict[str, Any]] = {}
+        all_series = list(market.get("series") or []) if isinstance(market, dict) else []
+        for raw_symbol in symbols:
+            symbol = str(raw_symbol).upper()
+            series = [
+                item
+                for item in all_series
+                if str(item.get("symbol") or "").upper() == symbol
+            ]
+            daily = self._scope_from_series(series, intraday=False)
+            intraday = self._scope_from_series(series, intraday=True)
+            exact_basis = next(
+                (
+                    scope
+                    for scope in (intraday, daily)
+                    if scope.get("actionability") == "price_actionable"
+                ),
+                None,
+            )
+            output[symbol] = {
+                "daily_trend": daily,
+                "intraday": intraday,
+                "condition_order": {
+                    "status": "verified" if exact_basis else (
+                        "not_started" if intraday.get("status") == "not_started" else "unavailable"
+                    ),
+                    "actionability": "price_actionable" if exact_basis else "analysis_only",
+                    "basis": (
+                        "intraday"
+                        if exact_basis is intraday
+                        else "daily"
+                        if exact_basis is daily
+                        else None
+                    ),
+                    "as_of": (exact_basis or {}).get("as_of"),
+                    "reason": None if exact_basis else (
+                        intraday.get("reason") or daily.get("reason") or "no verified price scope"
+                    ),
+                },
+                "fund_flow": {
+                    "status": "not_requested",
+                    "actionability": "analysis_only",
+                    "as_of": None,
+                    "reason": "fund flow is provided by a separate live tool",
+                },
+                "news": self._research_scope(research, "news", symbol),
+                "fundamentals": self._research_scope(research, "fundamentals", symbol),
+                "reports": self._research_scope(research, "reports", symbol),
+            }
+        return output
+
+    def _context_provider_health(self, market: dict[str, Any]) -> list[dict[str, Any]]:
+        """Attach provider diagnostics relevant to the current context request."""
+
+        attempts: dict[str, int] = {}
+        for series in market.get("series") or []:
+            for attempt in series.get("source_attempts") or []:
+                source = str(attempt.get("requested_source") or "unknown")
+                attempts[source] = attempts.get(source, 0) + 1
+        health = []
+        for item in self.sources().get("sources") or []:
+            row = dict(item)
+            source = str(row.get("requested_source") or row.get("source") or "")
+            row["request_attempt_count"] = attempts.get(source, 0)
+            health.append(row)
+        return health
 
     def read_bars(self, handle: str, cursor: int = 0) -> dict[str, Any]:
         params = self.control.get_handle(handle)
@@ -616,16 +1049,66 @@ class UnifiedDataService:
 
     def coverage(self) -> dict[str, Any]:
         rows = self.market_service.store.list_coverage()
+        holding_names: dict[str, str] = {}
+        for item in load_state().holdings:
+            symbols = _normalize_symbols(
+                [str(item.get("symbol") or item.get("code") or "")]
+            )
+            name = str(item.get("name") or "").strip()
+            if symbols and name:
+                holding_names[symbols[0]] = name
+        rows = [
+            {
+                **row,
+                "name": row.get("name") or holding_names.get(str(row.get("symbol") or "")),
+            }
+            for row in rows
+        ]
         return {"status": "ok", "coverage": rows, "watchlist": self.control.list_watchlist(), "retention": self._retention_policy()}
 
     def sources(self) -> dict[str, Any]:
-        stored = {row["source"]: row for row in self.control.source_health()}
+        stored = {
+            row["source"]: row
+            for row in self.control.source_health()
+            if str(row.get("requested_source") or "").lower() != "auto"
+        }
         for current in self._latest_market_source_health():
             stored[current["source"]] = {**stored.get(current["source"], {}), **current}
+        scoped_providers = {
+            str(row.get("requested_source") or "")
+            for row in stored.values()
+            if row.get("capability") not in {None, "", "general"}
+        }
+        rows = []
+        for row in stored.values():
+            normalized = dict(row)
+            requested = str(normalized.get("requested_source") or "")
+            if normalized.get("capability") == "general" and requested in scoped_providers:
+                continue
+            error = str(normalized.get("last_error") or "")
+            if "research reports are China A-share only" in error:
+                normalized.update(
+                    last_status="not_applicable",
+                    effective_status="not_applicable",
+                    error_category="not_applicable",
+                    stale=False,
+                )
+            elif error.startswith("provider declared unavailable"):
+                normalized.update(
+                    last_status="unavailable",
+                    effective_status="unavailable",
+                    error_category="provider_unavailable",
+                )
+            rows.append(normalized)
         return {
             "status": "ok",
-            "sources": [stored[key] for key in sorted(stored)],
+            "sources": sorted(rows, key=lambda row: str(row.get("source") or "")),
             "quorum": "two fresh independent sources; a third independent source decides disagreements",
+            "price_basis_definitions": PRICE_BASIS_DEFINITIONS,
+            "price_basis_rule": (
+                "Only observations with the same canonical price basis may enter "
+                "one consensus; source_default and unknown are never comparable."
+            ),
         }
 
     def _latest_market_source_health(self) -> list[dict[str, Any]]:
@@ -635,66 +1118,57 @@ class UnifiedDataService:
         persisted run here keeps Data Center accurate without rewriting history or
         treating an old endpoint failure as a current outage.
         """
-        latest_run = getattr(self.market_service.store, "latest_finished_run", lambda: None)()
-        if not latest_run:
-            return []
-        updated_at = str(latest_run.get("completed_at") or latest_run.get("created_at") or utc_now())
-        try:
-            completed = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-        except ValueError:
-            completed = datetime.now(timezone.utc)
-        stale = datetime.now(timezone.utc) - completed.astimezone(timezone.utc) > timedelta(minutes=30)
-        grouped: dict[str, dict[str, Any]] = {}
-        for item in latest_run.get("items") or []:
-            for attempt in item.get("attempts") or []:
-                requested = str(attempt.get("requested_source") or "unknown")
-                group = grouped.setdefault(requested, {"successes": [], "failures": []})
-                target = "successes" if attempt.get("status") == "success" else "failures"
-                group[target].append(attempt)
-
         records: list[dict[str, Any]] = []
-        for requested, group in grouped.items():
-            successes = group["successes"]
-            failures = group["failures"]
-            representative = successes[-1] if successes else failures[-1]
-            failure = failures[-1] if failures else None
-            fallback_event = None
-            for attempt in reversed(successes):
-                events = list(attempt.get("transport_events") or [])
-                if events:
-                    fallback_event = events[-1]
-                    break
-            if successes and failures:
-                status = "degraded"
-            elif successes and fallback_event:
+        latest_attempts = getattr(
+            self.market_service.store, "latest_source_attempts", lambda: []
+        )()
+        for attempt in latest_attempts:
+            requested = str(attempt.get("requested_source") or "").strip()
+            if not requested or requested.lower() == "auto":
+                continue
+            updated_at = str(attempt.get("updated_at") or utc_now())
+            try:
+                completed = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                if completed.tzinfo is None:
+                    completed = completed.replace(tzinfo=timezone.utc)
+            except ValueError:
+                completed = datetime.now(timezone.utc)
+            stale = (
+                datetime.now(timezone.utc) - completed.astimezone(timezone.utc)
+                > timedelta(minutes=30)
+            )
+            transport_events = list(attempt.get("transport_events") or [])
+            fallback_event = transport_events[-1] if transport_events else None
+            raw_status = str(attempt.get("status") or "failed")
+            if raw_status == "success" and fallback_event:
                 status = "ok_with_transport_fallback"
-            elif successes:
+            elif raw_status == "success":
                 status = "ok"
             else:
-                status = str(representative.get("status") or "failed")
+                status = raw_status
             error = (
-                failure.get("error") if failure
-                else fallback_event.get("primary_error") if fallback_event
-                else None
+                fallback_event.get("primary_error")
+                if fallback_event
+                else attempt.get("error")
             )
             category = (
-                failure.get("error_category") if failure
-                else "transport_fallback" if fallback_event
-                else None
+                "transport_fallback"
+                if fallback_event
+                else attempt.get("error_category")
             )
             records.append({
                 "source": f"{requested}:market",
                 "requested_source": requested,
-                "actual_source": representative.get("actual_source"),
-                "upstream_source": representative.get("upstream_source"),
+                "actual_source": attempt.get("actual_source") or requested,
+                "upstream_source": attempt.get("upstream_source") or requested,
                 "capability": "market",
-                "consecutive_failures": len(failures) if not successes else 0,
+                "consecutive_failures": 0 if raw_status == "success" else 1,
                 "circuit_open": False,
                 "circuit_open_until": None,
                 "last_status": status,
                 "effective_status": "stale" if stale else status,
                 "stale": stale,
-                "last_latency_ms": representative.get("latency_ms"),
+                "last_latency_ms": attempt.get("latency_ms"),
                 "error_category": category,
                 "last_error": error,
                 "updated_at": updated_at,

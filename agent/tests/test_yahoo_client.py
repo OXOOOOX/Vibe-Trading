@@ -98,7 +98,10 @@ class TestGetChart:
                                         "close": [10.2, 11.2, None],
                                         "volume": [1000, 2000, None],
                                     }
-                                ]
+                                ],
+                                "adjclose": [
+                                    {"adjclose": [9.18, 10.08, None]}
+                                ],
                             },
                         }
                     ],
@@ -120,6 +123,7 @@ class TestGetChart:
             "low": 9.5,
             "close": 10.2,
             "volume": 1000.0,
+            "adjusted_close": 9.18,
         }
         assert rows[1]["trade_date"] == 1700086400
 

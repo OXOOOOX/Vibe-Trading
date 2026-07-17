@@ -1,12 +1,14 @@
 """Read-only symbol-search tool: resolve a name/ticker to symbols + market.
 
-Backed by three frozen, IP-throttled public-API clients so the agent never
+Backed by four frozen, IP-throttled public-API clients so the agent never
 hits a provider un-throttled and never re-implements transport plumbing:
 
 * :mod:`backtest.loaders.eastmoney_client` — Eastmoney's free suggest endpoint
   matches Chinese/English names and tickers across A-shares (.SH/.SZ/.BJ),
   Hong Kong (.HK) and U.S. (.US) listings, each carrying a fully-qualified
   ``secid`` already in ``<market>.<code>`` form.
+* :mod:`backtest.loaders.tencent_client` — Tencent smartbox provides a fast
+  fuzzy company-name fallback for A-share, Hong Kong, and U.S. equities.
 * :mod:`backtest.loaders.yahoo_client` — Yahoo's v1 search endpoint matches
   global tickers/company names (US, HK, crypto, indices, FX, ...).
 * :mod:`backtest.loaders.sec_edgar_client` — the SEC company-tickers table
@@ -20,11 +22,13 @@ recorded under ``sources`` and the surviving candidates still return.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
-from backtest.loaders import eastmoney_client, sec_edgar_client, yahoo_client
+from backtest.loaders import eastmoney_client, sec_edgar_client, tencent_client, yahoo_client
 from src.agent.tools import BaseTool
 
 logger = logging.getLogger(__name__)
@@ -74,8 +78,8 @@ class SymbolSearchTool(BaseTool):
         "Resolve a company name or ticker fragment to candidate trading symbols "
         "with their market, in the project's symbol convention (A-shares "
         "600519.SH, Hong Kong 00700.HK, U.S. AAPL.US, plus crypto/index/FX from "
-        "Yahoo). Searches Eastmoney (China/HK/US names and tickers) and Yahoo "
-        "(global) and, for U.S. equities, attaches the SEC CIK. Use this to turn "
+        "Yahoo). Searches Eastmoney and Tencent (China/HK/US names and tickers) "
+        "plus Yahoo (global) and, for U.S. equities, attaches the SEC CIK. Use this to turn "
         "an ambiguous name into a concrete symbol before calling get_market_data "
         'or get_sec_filings. Example: search_symbol(query="apple", limit=5).'
     )
@@ -123,14 +127,21 @@ class SymbolSearchTool(BaseTool):
 
         limit = _clamp_limit(kwargs.get("limit", _DEFAULT_LIMIT))
 
+        # These providers are independent. Fan them out so a blocked source does
+        # not add its full timeout to an otherwise successful name lookup.
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [
+                ("eastmoney", executor.submit(_search_eastmoney, query)),
+                ("tencent", executor.submit(_search_tencent, query)),
+                ("yahoo", executor.submit(_search_yahoo, query)),
+            ]
+            results = [(source, future.result()) for source, future in futures]
+
         candidates: List[Dict[str, Any]] = []
         sources: Dict[str, str] = {}
-
-        em_hits, sources["eastmoney"] = _search_eastmoney(query)
-        candidates.extend(em_hits)
-
-        yh_hits, sources["yahoo"] = _search_yahoo(query)
-        candidates.extend(yh_hits)
+        for source, (hits, status) in results:
+            sources[source] = status
+            candidates.extend(hits)
 
         merged = _merge_candidates(candidates)
         merged, sources["sec_edgar"] = _enrich_us_cik(merged)
@@ -164,11 +175,16 @@ def _clamp_limit(value: Any) -> int:
 
 
 def lookup_exact_ashare(code: str) -> tuple[Optional[Dict[str, Any]], str]:
-    """Resolve one complete A-share code through Eastmoney's live suggest API."""
+    """Resolve one complete A-share code through live symbol providers."""
     normalized_code = str(code or "").strip()
     if len(normalized_code) != 6 or not normalized_code.isdigit():
         return None, "code must contain exactly 6 digits"
-    candidates, status = _search_eastmoney(normalized_code)
+    candidates: List[Dict[str, Any]] = []
+    statuses: List[str] = []
+    for search in (_search_eastmoney, _search_tencent):
+        hits, status = search(normalized_code)
+        candidates.extend(hits)
+        statuses.append(status)
     exact = next(
         (
             candidate
@@ -179,7 +195,70 @@ def lookup_exact_ashare(code: str) -> tuple[Optional[Dict[str, Any]], str]:
         ),
         None,
     )
-    return exact, status
+    if exact is not None:
+        return exact, "ok"
+    if all(status != "ok" for status in statuses):
+        return None, "; ".join(statuses)
+    return None, "ok"
+
+
+def lookup_exact_security(code: str) -> tuple[Optional[Dict[str, Any]], str]:
+    """Resolve one exact A-share code or U.S. equity ticker."""
+    normalized = str(code or "").strip().upper()
+    if normalized.isdigit():
+        return lookup_exact_ashare(normalized)
+
+    qualified_market = re.fullmatch(r"(\d{5,6})\.(SH|SZ|BJ|HK)", normalized)
+    if qualified_market:
+        bare_code = qualified_market.group(1)
+        candidates: List[Dict[str, Any]] = []
+        source_statuses: List[str] = []
+        for search in (_search_eastmoney, _search_tencent, _search_yahoo):
+            hits, status = search(bare_code)
+            candidates.extend(hits)
+            source_statuses.append(status)
+        exact = next(
+            (
+                candidate
+                for candidate in _merge_candidates(candidates)
+                if str(candidate.get("symbol") or "").upper() == normalized
+                and str(candidate.get("name") or "").strip()
+            ),
+            None,
+        )
+        if exact is not None:
+            return exact, "ok"
+        if all(status != "ok" for status in source_statuses):
+            return None, "; ".join(source_statuses)
+        return None, "ok"
+
+    ticker = normalized[:-3] if normalized.endswith(".US") else normalized
+    if not re.fullmatch(r"[A-Z][A-Z0-9]{0,9}(?:\.[A-Z])?", ticker):
+        return None, "code must be a 6-digit A-share code or U.S. ticker"
+
+    candidates: List[Dict[str, Any]] = []
+    source_statuses: List[str] = []
+    for search in (_search_eastmoney, _search_tencent, _search_yahoo):
+        hits, status = search(ticker)
+        candidates.extend(hits)
+        source_statuses.append(status)
+
+    expected_symbol = f"{ticker}.US"
+    exact = next(
+        (
+            candidate
+            for candidate in _merge_candidates(candidates)
+            if str(candidate.get("symbol") or "").upper() == expected_symbol
+            and candidate.get("market") == "us"
+            and str(candidate.get("name") or "").strip()
+        ),
+        None,
+    )
+    if exact is not None:
+        return exact, "ok"
+    if all(status != "ok" for status in source_statuses):
+        return None, "; ".join(source_statuses)
+    return None, "ok"
 
 
 def _search_eastmoney(query: str) -> tuple[List[Dict[str, Any]], str]:
@@ -204,6 +283,67 @@ def _search_eastmoney(query: str) -> tuple[List[Dict[str, Any]], str]:
     rows = _eastmoney_data_rows(payload)
     candidates = [c for c in (_eastmoney_candidate(r) for r in rows) if c is not None]
     return candidates, "ok"
+
+
+def _search_tencent(query: str) -> tuple[List[Dict[str, Any]], str]:
+    """Query Tencent smartbox and normalize supported listed equities."""
+    try:
+        rows = tencent_client.search(query)
+    except Exception as exc:  # noqa: BLE001 - one source failing is non-fatal
+        logger.warning("tencent symbol search failed for %r: %s", query, exc)
+        return [], f"tencent search failed: {exc}"
+
+    candidates = [
+        candidate
+        for candidate in (_tencent_candidate(row) for row in rows[:_PER_SOURCE_CAP])
+        if candidate is not None
+    ]
+    return candidates, "ok"
+
+
+def _tencent_candidate(row: str) -> Optional[Dict[str, Any]]:
+    """Map one ``market~code~name~pinyin~type`` smartbox row."""
+    parts = row.split("~")
+    if len(parts) < 5:
+        return None
+    raw_market, raw_code, name, _pinyin, security_type = parts[:5]
+    market = raw_market.strip().lower()
+    code = raw_code.strip().upper()
+    name = name.strip()
+    security_type = security_type.strip().upper()
+    if not name or not security_type.startswith("GP"):
+        return None
+
+    if market in {"sh", "sz", "bj"}:
+        if not re.fullmatch(r"\d{6}", code):
+            return None
+        symbol = f"{code}.{market.upper()}"
+        normalized_market = "cn"
+    elif market == "hk":
+        if not code.isdigit():
+            return None
+        symbol = f"{code.zfill(5)}.HK"
+        normalized_market = "hk"
+    elif market == "us":
+        # Tencent appends its exchange route (AAPL.OQ, BRK.B.N). Remove only
+        # that final route component while preserving a dotted class ticker.
+        code_parts = code.split(".")
+        if len(code_parts) > 1 and code_parts[-1] in {"A", "N", "OQ", "PK", "P"}:
+            code = ".".join(code_parts[:-1])
+        if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", code):
+            return None
+        symbol = f"{code}.US"
+        normalized_market = "us"
+    else:
+        return None
+
+    return {
+        "symbol": symbol,
+        "name": name,
+        "market": normalized_market,
+        "type": "equity",
+        "source": "tencent",
+    }
 
 
 def _eastmoney_data_rows(payload: Any) -> List[Dict[str, Any]]:

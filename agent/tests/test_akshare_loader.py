@@ -17,11 +17,8 @@ import pytest
 
 from backtest.loaders.akshare_loader import (
     DataLoader,
-    _is_a_share,
     _is_etf_listed,
     _is_forex,
-    _is_hk,
-    _is_us,
 )
 
 
@@ -119,6 +116,7 @@ def fake_akshare(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         fund_etf_hist_sina=MagicMock(return_value=_stub_etf_response()),
         forex_hist_em=MagicMock(return_value=_stub_forex_response()),
         stock_zh_a_hist=MagicMock(return_value=_stub_a_share_response()),
+        stock_zh_a_daily=MagicMock(return_value=_stub_a_share_response().rename(columns={"日期": "date", "开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume"})),
         stock_us_hist=MagicMock(return_value=pd.DataFrame()),
         stock_hk_hist=MagicMock(return_value=pd.DataFrame()),
     )
@@ -170,3 +168,21 @@ class TestRouting:
         fake_akshare.stock_zh_a_hist.assert_called_once()
         fake_akshare.fund_etf_hist_sina.assert_not_called()
         fake_akshare.forex_hist_em.assert_not_called()
+
+    def test_a_share_falls_back_to_sina_without_changing_provider_identity(
+        self, fake_akshare: SimpleNamespace
+    ) -> None:
+        fake_akshare.stock_zh_a_hist.side_effect = ConnectionError("remote closed")
+        loader = DataLoader()
+
+        frame = loader._fetch_one("600519.SH", "2024-01-01", "2024-12-31", "1D")
+
+        assert frame is not None
+        fake_akshare.stock_zh_a_daily.assert_called_once_with(
+            symbol="sh600519",
+            start_date="20240101",
+            end_date="20241231",
+            adjust="qfq",
+        )
+        assert loader.source_fingerprint == "sina_a_daily"
+        assert loader.transport_events[0]["primary_error"] == "remote closed"

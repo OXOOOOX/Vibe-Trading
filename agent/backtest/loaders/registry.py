@@ -44,6 +44,7 @@ VALID_SOURCES: set[str] = {
     "sina",
     "stooq",
     "yahoo",
+    "nasdaq",
     "finnhub",
     "alphavantage",
     "tiingo",
@@ -88,6 +89,7 @@ def _ensure_registered() -> None:
         "backtest.loaders.sina_loader",
         "backtest.loaders.stooq_loader",
         "backtest.loaders.yahoo_loader",
+        "backtest.loaders.nasdaq_loader",
         "backtest.loaders.finnhub_loader",
         "backtest.loaders.alphavantage_loader",
         "backtest.loaders.tiingo_loader",
@@ -123,7 +125,7 @@ _NO_NETWORK_FALLBACK_SOURCES: frozenset[str] = frozenset({"local"})
 # REST fallbacks placed deeper in the chain.
 FALLBACK_CHAINS: dict[str, list[str]] = {
     "a_share":   ["tencent", "mootdx", "eastmoney", "baostock", "akshare", "tushare", "local"],
-    "us_equity": ["yahoo", "stooq", "sina", "eastmoney", "yfinance", "tiingo", "fmp", "finnhub", "alphavantage", "akshare", "local"],
+    "us_equity": ["yahoo", "nasdaq", "stooq", "sina", "eastmoney", "yfinance", "tiingo", "fmp", "finnhub", "alphavantage", "akshare", "local"],
     "hk_equity": ["eastmoney", "yahoo", "futu", "yfinance", "akshare", "local"],
     "crypto":    ["okx", "ccxt", "yfinance", "local"],
     "futures":   ["tushare", "akshare", "local"],

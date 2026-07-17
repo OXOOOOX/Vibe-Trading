@@ -21,6 +21,8 @@ from typing import Callable, Protocol, TypeVar, runtime_checkable
 
 import pandas as pd
 
+from src.usage import record_current_resource
+
 logger = logging.getLogger(__name__)
 
 
@@ -375,6 +377,11 @@ def cached_loader_fetch(
     otherwise call ``fetch`` and cache a non-empty result. Cache read/write
     failures are non-fatal and fall back to ``fetch``.
     """
+    request_started = time.perf_counter()
+    query = {"code": symbol, "timeframe": timeframe, "source": source}
+    category = "local_data" if str(source).lower() in {"local", "csv", "file"} else "market"
+    is_network = category != "local_data"
+    cache_enabled = loader_cache_enabled() and loader_cache_range_is_final(end_date)
     cached = loader_cache_get(
         source=source,
         symbol=symbol,
@@ -384,9 +391,34 @@ def cached_loader_fetch(
         fields=fields,
     )
     if cached is not None:
+        record_current_resource(
+            provider=source,
+            category=category,
+            status="ok",
+            elapsed_ms=int((time.perf_counter() - request_started) * 1000),
+            cache_mode="cache_hit",
+            query=query,
+            network_request=False,
+            cache_access=True,
+        )
         return cached
 
-    frame = fetch()
+    fetch_started = time.perf_counter()
+    try:
+        frame = fetch()
+    except Exception as exc:
+        record_current_resource(
+            provider=source,
+            category=category,
+            status="error",
+            elapsed_ms=int((time.perf_counter() - fetch_started) * 1000),
+            cache_mode="cache_refresh" if cache_enabled else "network",
+            query=query,
+            network_request=is_network,
+            cache_access=cache_enabled,
+            metadata={"error_type": type(exc).__name__},
+        )
+        raise
     loader_cache_put(
         source=source,
         symbol=symbol,
@@ -395,6 +427,16 @@ def cached_loader_fetch(
         end_date=end_date,
         fields=fields,
         frame=frame,
+    )
+    record_current_resource(
+        provider=source,
+        category=category,
+        status="ok",
+        elapsed_ms=int((time.perf_counter() - fetch_started) * 1000),
+        cache_mode="cache_refresh" if cache_enabled else "network",
+        query=query,
+        network_request=is_network,
+        cache_access=cache_enabled,
     )
     return frame
 

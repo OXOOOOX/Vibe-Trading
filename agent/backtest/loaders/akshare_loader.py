@@ -96,7 +96,8 @@ class DataLoader:
             return False
 
     def __init__(self) -> None:
-        pass
+        self.transport_events: list[dict[str, object]] = []
+        self.source_fingerprint: str | None = None
 
     def fetch(
         self,
@@ -121,6 +122,8 @@ class DataLoader:
             Mapping symbol -> OHLCV DataFrame.
         """
         validate_date_range(start_date, end_date)
+        self.transport_events = []
+        self.source_fingerprint = None
 
         result: Dict[str, pd.DataFrame] = {}
         for code in codes:
@@ -165,21 +168,54 @@ class DataLoader:
     def _fetch_a_share(
         self, ak, code: str, start_date: str, end_date: str, interval: str,
     ) -> Optional[pd.DataFrame]:
-        """Fetch A-share via stock_zh_a_hist."""
+        """Fetch A-share via Eastmoney, then Sina within the same AKShare provider."""
         symbol = code.split(".")[0]
         period = _INTERVAL_MAP_DAILY.get(interval, "daily")
         sd = start_date.replace("-", "")
         ed = end_date.replace("-", "")
-        df = ak.stock_zh_a_hist(
-            symbol=symbol,
-            period=period,
-            start_date=sd,
-            end_date=ed,
-            adjust="qfq",
-        )
-        if df is None or df.empty:
+        primary_error: Exception | str | None = None
+        try:
+            df = ak.stock_zh_a_hist(
+                symbol=symbol,
+                period=period,
+                start_date=sd,
+                end_date=ed,
+                adjust="qfq",
+            )
+            if df is not None and not df.empty:
+                self.source_fingerprint = "eastmoney_push2his"
+                return self._normalize(df, date_col="日期")
+            primary_error = "stock_zh_a_hist returned no rows"
+        except Exception as exc:  # noqa: BLE001 - switch AKShare upstream endpoint
+            primary_error = exc
+
+        exchange = code.upper().rpartition(".")[2].lower()
+        sina_symbol = f"{exchange}{symbol}"
+        try:
+            fallback = ak.stock_zh_a_daily(
+                symbol=sina_symbol,
+                start_date=sd,
+                end_date=ed,
+                adjust="qfq",
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve both endpoint failures
+            raise RuntimeError(
+                f"AKShare Eastmoney endpoint failed ({primary_error}); "
+                f"Sina fallback failed ({exc})"
+            ) from exc
+        if fallback is None or fallback.empty:
+            if isinstance(primary_error, Exception):
+                raise primary_error
             return None
-        return self._normalize(df, date_col="日期")
+        self.source_fingerprint = "sina_a_daily"
+        self.transport_events.append(
+            {
+                "primary": "akshare.stock_zh_a_hist",
+                "fallback": "akshare.stock_zh_a_daily",
+                "primary_error": str(primary_error),
+            }
+        )
+        return self._normalize(fallback, date_col="date")
 
     def _fetch_us(self, ak, code: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
         """Fetch US stock via stock_us_hist."""

@@ -29,7 +29,6 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from backtest.loaders._http import (
-    DEFAULT_USER_AGENT,
     resolve_min_interval,
     throttled_get,
     throttled_get_json,
@@ -170,9 +169,11 @@ def get_chart(
         range_: Relative range string; takes precedence over period1/period2.
 
     Returns:
-        Ascending list of ``{trade_date, open, high, low, close, volume}`` dicts
-        (``trade_date`` is the bar's epoch-second timestamp). Empty when Yahoo
-        reports no data for the symbol/window.
+        Ascending list of ``{trade_date, open, high, low, close, volume,
+        adjusted_close}`` dicts (``trade_date`` is the bar's epoch-second
+        timestamp). ``adjusted_close`` is Yahoo's dividend-and-split adjusted
+        close when the endpoint supplies it. Empty when Yahoo reports no data
+        for the symbol/window.
 
     Raises:
         requests.RequestException: On a network/HTTP failure.
@@ -212,7 +213,9 @@ def _parse_chart(payload: Any, yahoo_symbol: str) -> List[Dict[str, Any]]:
     result = results[0] or {}
 
     timestamps = result.get("timestamp") or []
-    quotes = (((result.get("indicators") or {}).get("quote")) or [{}])[0] or {}
+    indicators = result.get("indicators") or {}
+    quotes = ((indicators.get("quote") or [{}])[0]) or {}
+    adjusted = ((indicators.get("adjclose") or [{}])[0]) or {}
 
     rows: List[Dict[str, Any]] = []
     for index, ts in enumerate(timestamps):
@@ -222,6 +225,7 @@ def _parse_chart(payload: Any, yahoo_symbol: str) -> List[Dict[str, Any]]:
             continue
         row: Dict[str, Any] = {"trade_date": ts}
         row.update({field: _to_float(values[field]) for field in _QUOTE_FIELDS})
+        row["adjusted_close"] = _to_float(_at(adjusted.get("adjclose"), index))
         rows.append(row)
     return rows
 

@@ -78,3 +78,26 @@ def test_verify_market_data_marks_source_default_adjustment_for_etf_source(tmp_p
     assert item["requested_adjustment"] == "source_default"
     assert item["source_adjustments"]["akshare"]["adjustment"] == "source_default"
     assert item["observations"][0]["adjustment_confidence"] == "loader_code"
+    assert item["status"] == "unresolved_basis"
+    assert item["observations"][0]["included_in_consensus"] is False
+
+
+def test_verify_market_data_never_mixes_different_price_bases(tmp_path) -> None:
+    out = verify_market_data(
+        codes=["AAPL.US"],
+        start_date="2026-06-30",
+        end_date="2026-07-01",
+        sources=["yahoo", "sina"],
+        adjustment="source_default",
+        fetcher=_fetcher_factory({"yahoo": 200.0, "sina": 100.0}),
+        cache_dir=tmp_path,
+    )
+
+    item = out["results"]["AAPL.US"]
+    assert item["status"] == "unresolved_basis"
+    assert item["consensus_close"] is None
+    assert item["actual_adjustment"] is None
+    assert all(
+        observation["included_in_consensus"] is False
+        for observation in item["observations"]
+    )

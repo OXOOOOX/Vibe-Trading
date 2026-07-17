@@ -205,6 +205,48 @@ class TestRowsToFrame:
         assert len(df) == 1
         assert df.index[0].strftime("%Y-%m-%d") == "2024-01-02"
 
+    def test_qfq_scales_every_price_field_from_adjusted_close(self):
+        rows = [
+            {
+                **_row("2024-01-02", 100.0, 110.0, 90.0, 100.0, 1000),
+                "adjusted_close": 80.0,
+            },
+            {
+                **_row("2024-01-03", 120.0, 132.0, 108.0, 120.0, 2000),
+                "adjusted_close": 120.0,
+            },
+        ]
+
+        df = _rows_to_frame(
+            rows,
+            "2024-01-01",
+            "2024-01-31",
+            "1D",
+            "qfq",
+        )
+
+        assert df.iloc[0][["open", "high", "low", "close"]].tolist() == [
+            80.0,
+            88.0,
+            72.0,
+            80.0,
+        ]
+        assert df.iloc[1]["close"] == 120.0
+        assert df.iloc[0]["volume"] == 1000.0
+
+    def test_qfq_drops_rows_without_a_proven_adjusted_close_factor(self):
+        rows = [_row("2024-01-02", 100.0, 110.0, 90.0, 100.0, 1000)]
+
+        df = _rows_to_frame(
+            rows,
+            "2024-01-01",
+            "2024-01-31",
+            "1D",
+            "qfq",
+        )
+
+        assert df.empty
+
 
 class TestFetch:
     """fetch dispatches per symbol, mocks get_chart, isolates failures."""
@@ -228,6 +270,26 @@ class TestFetch:
         assert kwargs["period1"] == _epoch("2024-01-01")
         assert kwargs["period2"] == _epoch("2024-01-31") + 86400
         assert kwargs["interval"] == "1d"
+
+    def test_qfq_request_is_forwarded_to_frame_conversion(self):
+        rows = [
+            {
+                **_row("2024-01-02", 100.0, 110.0, 90.0, 100.0, 1000),
+                "adjusted_close": 80.0,
+            }
+        ]
+        with patch(
+            "backtest.loaders.yahoo_loader.yahoo_client.get_chart",
+            return_value=rows,
+        ):
+            out = DataLoader().fetch(
+                ["AAPL.US"],
+                "2024-01-01",
+                "2024-01-31",
+                adjustment="qfq",
+            )
+
+        assert out["AAPL.US"].iloc[0]["close"] == 80.0
 
     def test_non_us_hk_symbol_skipped(self):
         with patch(

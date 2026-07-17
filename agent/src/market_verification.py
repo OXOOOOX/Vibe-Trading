@@ -16,6 +16,70 @@ from src.market_data import fetch_market_data
 FetchMarketData = Callable[..., dict[str, Any]]
 
 
+# Canonical price-basis contract shared by every market. Provider terminology
+# is mapped into these definitions; a series is never relabelled merely to make
+# a request succeed.
+PRICE_BASIS_DEFINITIONS: dict[str, dict[str, str | bool]] = {
+    "raw": {
+        "label": "unadjusted event-time price",
+        "corporate_actions": "none",
+        "anchor": "event_time",
+        "cross_source_comparable": True,
+        "definition": (
+            "OHLC as traded on each historical date, with no split, dividend, "
+            "rights, or other corporate-action adjustment."
+        ),
+    },
+    "qfq": {
+        "label": "latest-anchored total-return adjusted price",
+        "corporate_actions": "splits_and_distributions",
+        "anchor": "latest_available_bar",
+        "cross_source_comparable": True,
+        "definition": (
+            "OHLC scaled for share-count changes and cash distributions, anchored "
+            "so the latest adjusted close equals the latest unadjusted close."
+        ),
+    },
+    "hfq": {
+        "label": "earliest-anchored corporate-action adjusted price",
+        "corporate_actions": "splits_and_distributions",
+        "anchor": "listing_or_full_history_start",
+        "cross_source_comparable": True,
+        "definition": (
+            "OHLC scaled for share-count changes and cash distributions while "
+            "preserving the earliest full-history price basis."
+        ),
+    },
+    "split_adjusted": {
+        "label": "latest-share-unit split-adjusted price",
+        "corporate_actions": "splits_only",
+        "anchor": "latest_share_unit",
+        "cross_source_comparable": True,
+        "definition": (
+            "Historical OHLC restated for splits or consolidations but not for "
+            "cash dividends; this must not be mixed with raw or qfq."
+        ),
+    },
+    "source_default": {
+        "label": "unclassified provider price basis",
+        "corporate_actions": "unknown",
+        "anchor": "unknown",
+        "cross_source_comparable": False,
+        "definition": (
+            "The adapter has not proved the provider's adjustment semantics; "
+            "the series is excluded from cross-source price consensus."
+        ),
+    },
+    "unknown": {
+        "label": "unknown price basis",
+        "corporate_actions": "unknown",
+        "anchor": "unknown",
+        "cross_source_comparable": False,
+        "definition": "No reliable price-basis metadata is available.",
+    },
+}
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -47,7 +111,14 @@ def normalize_adjustment(value: str | None) -> str:
         "auto": "source_default",
     }
     text = aliases.get(text, text)
-    if text not in {"raw", "qfq", "hfq", "source_default", "unknown"}:
+    if text not in {
+        "raw",
+        "qfq",
+        "hfq",
+        "split_adjusted",
+        "source_default",
+        "unknown",
+    }:
         return "source_default"
     return text
 
@@ -76,6 +147,27 @@ def source_adjustment_policy(source: str, symbol: str) -> dict[str, Any]:
             "adjustment": "qfq",
             "confidence": "loader_code",
             "note": "Current AKShare A-share path requests adjust='qfq'.",
+        }
+    if src == "akshare" and upper.endswith((".US", ".HK")):
+        return {
+            "adjustment": "qfq",
+            "confidence": "loader_code",
+            "note": "Current AKShare overseas-equity path requests adjust='qfq'.",
+        }
+    if src in {"yahoo", "yfinance"} and upper.endswith((".US", ".HK")):
+        return {
+            "adjustment": "split_adjusted",
+            "confidence": "loader_contract",
+            "note": (
+                "Yahoo quote OHLC is restated for splits but excludes the cash-"
+                "distribution adjustment carried by adjusted_close."
+            ),
+        }
+    if src == "sina" and upper.endswith(".US"):
+        return {
+            "adjustment": "raw",
+            "confidence": "loader_contract",
+            "note": "Sina US daily K-line OHLC preserves event-time prices.",
         }
     return {
         "adjustment": "source_default",
@@ -173,8 +265,40 @@ def verify_market_data(
                 obs["adjustment_confidence"] = policy["confidence"]
                 observations.append(obs)
 
-        closes = [obs["close"] for obs in observations]
-        status = "unresolved"
+        comparable_bases = {
+            name
+            for name, definition in PRICE_BASIS_DEFINITIONS.items()
+            if definition["cross_source_comparable"]
+        }
+        actual_adjustment: str | None = None
+        compatible: list[dict[str, Any]] = []
+        if requested_adjustment in comparable_bases:
+            actual_adjustment = requested_adjustment
+            compatible = [
+                obs
+                for obs in observations
+                if obs.get("adjustment") == requested_adjustment
+            ]
+        else:
+            groups: dict[str, list[dict[str, Any]]] = {}
+            for obs in observations:
+                basis = str(obs.get("adjustment") or "unknown")
+                if basis in comparable_bases:
+                    groups.setdefault(basis, []).append(obs)
+            ranked = sorted(groups.items(), key=lambda item: len(item[1]), reverse=True)
+            if ranked and (
+                len(ranked) == 1 or len(ranked[0][1]) > len(ranked[1][1])
+            ):
+                actual_adjustment, compatible = ranked[0]
+
+        for obs in observations:
+            obs["included_in_consensus"] = obs in compatible
+            obs["exclude_reason"] = (
+                None if obs in compatible else "price_basis_mismatch_or_unclassified"
+            )
+
+        closes = [obs["close"] for obs in compatible]
+        status = "unresolved_basis" if observations and not compatible else "unresolved"
         spread_pct = None
         consensus_close = None
         if len(closes) == 1:
@@ -194,11 +318,12 @@ def verify_market_data(
             "spread_pct": spread_pct,
             "tolerance_pct": tolerance_pct,
             "requested_adjustment": requested_adjustment,
+            "actual_adjustment": actual_adjustment,
             "source_adjustments": source_adjustments,
             "adjustment_warning": (
-                "Requested adjustment is metadata only in this cache layer; "
-                "current loaders may use their own fixed/source-default adjustment."
-                if requested_adjustment not in {"source_default", "unknown"}
+                "Observations with a different or unclassified price basis were "
+                "excluded from consensus."
+                if len(compatible) != len(observations)
                 else None
             ),
             "start_date": start_date,

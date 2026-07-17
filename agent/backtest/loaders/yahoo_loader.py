@@ -7,8 +7,11 @@ IP-rate-limiting us. Covers US equities (``AAPL.US``) and HK equities
 (``00700.HK``); the client maps each project symbol to Yahoo's ticker form.
 
 The chart endpoint returns each bar's ``trade_date`` as an epoch-second
-timestamp; this loader converts those to a tz-naive ``DatetimeIndex`` and clips
-the ascending series to the requested inclusive date window.
+timestamp and supplies both its historical close and ``adjusted_close``. The
+historical close is split-normalized but does not include cash distributions,
+so it is not silently called ``raw``. For a canonical ``qfq`` request this
+loader applies ``adjusted_close / close`` to every OHLC field, matching the
+project's latest-anchored total-return price definition.
 """
 
 from __future__ import annotations
@@ -26,6 +29,8 @@ from backtest.loaders.registry import register
 logger = logging.getLogger(__name__)
 
 _OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
+_PRICE_COLUMNS = ("open", "high", "low", "close")
+_SUPPORTED_ADJUSTMENTS = {"source_default", "raw", "qfq"}
 
 # Project interval -> Yahoo chart interval. Daily is the only granularity this
 # loader exposes for equities; anything else falls back to lowercasing so an
@@ -106,7 +111,11 @@ def _epoch_seconds(date_str: str) -> int:
 
 
 def _rows_to_frame(
-    rows: List[dict], start_date: str, end_date: str, interval: str = "1D"
+    rows: List[dict],
+    start_date: str,
+    end_date: str,
+    interval: str = "1D",
+    adjustment: str = "source_default",
 ) -> pd.DataFrame:
     """Build the OHLCV frame from chart rows, clipped to the inclusive window.
 
@@ -123,6 +132,9 @@ def _rows_to_frame(
         end_date: Inclusive window end (``YYYY-MM-DD``).
         interval: Backtest interval such as ``1D`` or ``1H``; selects whether the
             index is normalized to midnight.
+        adjustment: ``qfq`` applies Yahoo's adjusted-close factor to OHLC.
+            ``raw`` and ``source_default`` preserve Yahoo's quote fields; the
+            cache layer classifies daily quote fields as ``split_adjusted``.
 
     Returns:
         DataFrame indexed by a tz-naive ``trade_date`` with float OHLCV columns,
@@ -143,9 +155,31 @@ def _rows_to_frame(
         if column not in frame.columns:
             frame[column] = 0.0 if column == "volume" else pd.NA
 
-    frame = frame.loc[:, list(_OHLCV_COLUMNS)].apply(pd.to_numeric, errors="coerce")
+    if adjustment not in _SUPPORTED_ADJUSTMENTS:
+        raise ValueError(f"Yahoo adjustment is unsupported: {adjustment}")
+
+    working_columns = [*_OHLCV_COLUMNS]
+    if adjustment == "qfq":
+        working_columns.append("adjusted_close")
+    for column in working_columns:
+        if column not in frame.columns:
+            frame[column] = pd.NA
+    frame = frame.loc[:, working_columns].apply(pd.to_numeric, errors="coerce")
     frame["volume"] = frame["volume"].fillna(0.0)
     frame = frame.dropna(subset=["open", "high", "low", "close"])
+
+    if adjustment == "qfq":
+        # Yahoo's adjusted close includes splits and cash distributions. Scaling
+        # all four price fields by the same factor preserves candle geometry and
+        # yields the project's canonical latest-anchored total-return series.
+        factor = frame["adjusted_close"] / frame["close"]
+        valid = factor.notna() & (factor > 0) & frame["close"].ne(0)
+        frame = frame.loc[valid].copy()
+        factor = factor.loc[valid]
+        frame.loc[:, list(_PRICE_COLUMNS)] = frame.loc[
+            :, list(_PRICE_COLUMNS)
+        ].mul(factor, axis=0)
+        frame = frame.drop(columns=["adjusted_close"])
 
     lower = pd.Timestamp(start_date).normalize()
     upper = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
@@ -177,6 +211,7 @@ class DataLoader:
         *,
         interval: str = "1D",
         fields: Optional[List[str]] = None,
+        adjustment: str = "source_default",
     ) -> Dict[str, pd.DataFrame]:
         """Fetch OHLCV history keyed by the original project symbols.
 
@@ -186,6 +221,8 @@ class DataLoader:
             end_date: Inclusive end date (``YYYY-MM-DD``).
             interval: Backtest interval such as ``1D`` or ``1H``.
             fields: Ignored; included for interface compatibility.
+            adjustment: ``qfq`` requests canonical latest-anchored total-return
+                OHLC. ``source_default``/``raw`` preserve Yahoo quote fields.
 
         Returns:
             Mapping of input symbol to a normalized OHLCV DataFrame. A symbol
@@ -196,6 +233,13 @@ class DataLoader:
         if not codes:
             return {}
         validate_date_range(start_date, end_date)
+        normalized_adjustment = str(adjustment or "source_default").strip().lower()
+        if normalized_adjustment not in _SUPPORTED_ADJUSTMENTS:
+            raise ValueError(
+                "Yahoo loader adjustment must be 'source_default', 'raw', or 'qfq'"
+            )
+        if normalized_adjustment == "qfq" and _is_intraday_interval(interval):
+            raise ValueError("Yahoo qfq is available only for daily-or-coarser bars")
 
         result: Dict[str, pd.DataFrame] = {}
         for code in codes:
@@ -206,9 +250,13 @@ class DataLoader:
                     timeframe=interval,
                     start_date=start_date,
                     end_date=end_date,
-                    fields=None,
+                    fields=[f"adjustment:{normalized_adjustment}"],
                     fetch=lambda code=code: self._fetch_one(
-                        code, start_date, end_date, interval
+                        code,
+                        start_date,
+                        end_date,
+                        interval,
+                        normalized_adjustment,
                     ),
                 )
                 if df is not None and not df.empty:
@@ -218,7 +266,12 @@ class DataLoader:
         return result
 
     def _fetch_one(
-        self, code: str, start_date: str, end_date: str, interval: str
+        self,
+        code: str,
+        start_date: str,
+        end_date: str,
+        interval: str,
+        adjustment: str = "source_default",
     ) -> Optional[pd.DataFrame]:
         """Fetch and normalize one symbol's chart, or ``None`` when unusable.
 
@@ -246,5 +299,11 @@ class DataLoader:
             period1=period1,
             period2=period2,
         )
-        frame = _rows_to_frame(rows, start_date, end_date, interval)
+        frame = _rows_to_frame(
+            rows,
+            start_date,
+            end_date,
+            interval,
+            adjustment,
+        )
         return frame if not frame.empty else None

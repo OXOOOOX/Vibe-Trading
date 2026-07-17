@@ -30,6 +30,12 @@ def test_normalize_symbol_for_china_etf_and_stock_codes() -> None:
     assert normalize_symbol("430139") == "430139.BJ"
 
 
+def test_normalize_symbol_for_us_tickers() -> None:
+    assert normalize_symbol("AAPL") == "AAPL.US"
+    assert normalize_symbol("aapl.us") == "AAPL.US"
+    assert normalize_symbol("BRK.B") == "BRK.B.US"
+
+
 def test_parse_holdings_text_preserves_exact_names_and_symbols() -> None:
     rows = parse_holdings_text(HOLDINGS_TEXT)
 
@@ -88,6 +94,14 @@ HK创新药 513120 6600 1.171
     assert {row["original_code_text"] for row in inferred} == {"个股无ETF"}
 
 
+def test_parse_simple_us_holding_uses_project_symbol_convention() -> None:
+    rows = parse_holdings_text("Apple Inc. AAPL 100 317.31")
+
+    assert rows[0]["code"] == "AAPL"
+    assert rows[0]["symbol"] == "AAPL.US"
+    assert rows[0]["name"] == "Apple Inc."
+
+
 def test_portfolio_state_tool_update_get_and_record_trade(tmp_path, monkeypatch) -> None:
     path = tmp_path / "portfolio_state.json"
     monkeypatch.setenv("VIBE_TRADING_PORTFOLIO_STATE_PATH", str(path))
@@ -112,3 +126,25 @@ def test_portfolio_state_tool_update_get_and_record_trade(tmp_path, monkeypatch)
     get_payload = json.loads(tool.execute(action="get"))
     assert get_payload["state"]["holdings"][6]["symbol"] == "600036.SH"
     assert get_payload["state"]["recent_trades"][0]["side"] == "sell"
+
+
+def test_portfolio_state_tool_records_us_equity_trade(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "portfolio_state.json"
+    monkeypatch.setenv("VIBE_TRADING_PORTFOLIO_STATE_PATH", str(path))
+
+    payload = json.loads(
+        PortfolioStateTool().execute(
+            action="record_trade",
+            trade={
+                "code": "AAPL",
+                "symbol": "AAPL.US",
+                "name": "Apple Inc.",
+                "side": "buy",
+                "quantity": 2,
+                "price": 210.5,
+            },
+        )
+    )
+
+    assert payload["state"]["holdings"][0]["symbol"] == "AAPL.US"
+    assert payload["state"]["recent_trades"][0]["code"] == "AAPL"

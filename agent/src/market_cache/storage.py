@@ -12,7 +12,7 @@ from typing import Any, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_now() -> str:
@@ -166,6 +166,24 @@ class MarketCacheStore:
                     PRIMARY KEY(symbol, actual_source, interval, actual_adjustment)
                 );
 
+                CREATE TABLE IF NOT EXISTS source_poll_state (
+                    symbol TEXT NOT NULL,
+                    requested_source TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    adjustment TEXT NOT NULL,
+                    actual_source TEXT,
+                    source_fingerprint TEXT,
+                    last_attempt_at TEXT NOT NULL,
+                    last_status TEXT NOT NULL,
+                    last_success_at TEXT,
+                    latest_bar_time TEXT,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at TEXT,
+                    error_category TEXT,
+                    error TEXT,
+                    PRIMARY KEY(symbol, requested_source, interval, adjustment)
+                );
+
                 CREATE TABLE IF NOT EXISTS refresh_runs (
                     run_id TEXT PRIMARY KEY,
                     dedupe_key TEXT NOT NULL,
@@ -244,6 +262,90 @@ class MarketCacheStore:
                 (now,),
             )
             return int(cursor.rowcount)
+
+    def migrate_price_basis_contract_v2(self) -> list[str]:
+        """Remove legacy overseas daily bars that were mislabelled as ``raw``.
+
+        Yahoo's daily quote OHLC is split-adjusted. Older cache versions stored
+        it as raw, while the old Nasdaq and Stooq paths did not prove their
+        corporate-action semantics. Retaining any of those rows would
+        contaminate newly strict raw consensus. The migration removes those
+        source rows and all derived raw-daily consensus for affected symbols;
+        the service then rebuilds consensus from remaining classified sources.
+        """
+
+        migration_key = "price_basis_contract_v2"
+        with self.transaction() as conn:
+            completed = conn.execute(
+                "SELECT value FROM schema_meta WHERE key=?",
+                (migration_key,),
+            ).fetchone()
+            if completed:
+                return []
+
+            rows = conn.execute(
+                """
+                SELECT DISTINCT symbol
+                FROM source_bars
+                WHERE interval='1D' AND actual_adjustment='raw'
+                  AND LOWER(actual_source) IN ('yahoo', 'yfinance', 'nasdaq', 'stooq')
+                  AND (UPPER(symbol) LIKE '%.US' OR UPPER(symbol) LIKE '%.HK')
+                """
+            ).fetchall()
+            symbols = [str(row["symbol"]).upper() for row in rows]
+            if symbols:
+                placeholders = ",".join("?" for _ in symbols)
+                conn.execute(
+                    f"""
+                    DELETE FROM source_bars
+                    WHERE symbol IN ({placeholders}) AND interval='1D'
+                      AND actual_adjustment='raw'
+                      AND LOWER(actual_source) IN ('yahoo', 'yfinance', 'nasdaq', 'stooq')
+                    """,
+                    symbols,
+                )
+                conn.execute(
+                    f"""
+                    DELETE FROM cache_coverage
+                    WHERE symbol IN ({placeholders}) AND interval='1D'
+                      AND actual_adjustment='raw'
+                      AND LOWER(actual_source) IN ('yahoo', 'yfinance', 'nasdaq', 'stooq')
+                    """,
+                    symbols,
+                )
+                conn.execute(
+                    f"""
+                    DELETE FROM source_poll_state
+                    WHERE symbol IN ({placeholders}) AND interval='1D'
+                      AND adjustment='raw'
+                      AND LOWER(requested_source) IN ('yahoo', 'yfinance', 'nasdaq', 'stooq')
+                    """,
+                    symbols,
+                )
+                # Consensus rows embed source observations as JSON. Rebuilding
+                # the whole raw-daily path is safer than editing those blobs.
+                conn.execute(
+                    f"""
+                    DELETE FROM consensus_bars
+                    WHERE symbol IN ({placeholders}) AND interval='1D'
+                      AND adjustment='raw'
+                    """,
+                    symbols,
+                )
+                conn.execute(
+                    f"""
+                    DELETE FROM latest_quotes
+                    WHERE symbol IN ({placeholders}) AND interval='1D'
+                      AND adjustment='raw'
+                    """,
+                    symbols,
+                )
+
+            conn.execute(
+                "INSERT INTO schema_meta(key, value) VALUES(?, ?)",
+                (migration_key, utc_now()),
+            )
+        return symbols
 
     def upsert_instrument(self, symbol: str, *, name: str | None = None) -> None:
         upper = symbol.upper()
@@ -363,6 +465,54 @@ class MarketCacheStore:
             ).fetchone()
         return self.get_run(row["run_id"]) if row else None
 
+    def latest_source_attempts(self, limit: int = 2000) -> list[dict[str, Any]]:
+        """Return the newest real network attempt for each requested provider.
+
+        Source health is provider-scoped, while refresh runs are symbol- and
+        interval-scoped.  Reading only the single newest run drops a provider's
+        newer failure as soon as another symbol finishes refreshing.  Scan a
+        bounded set of finished items instead and keep the newest actual attempt
+        for every requested source.  Cache reuse/backoff rows are deliberately
+        skipped because they are decisions, not new upstream requests.
+        """
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT attempts_json, completed_at, id
+                FROM refresh_items
+                WHERE completed_at IS NOT NULL
+                  AND attempts_json IS NOT NULL
+                  AND attempts_json != '[]'
+                ORDER BY completed_at DESC, id DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+
+        latest: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                attempts = json.loads(row["attempts_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(attempts, list):
+                continue
+            for raw in reversed(attempts):
+                if not isinstance(raw, dict):
+                    continue
+                status = str(raw.get("status") or "")
+                if status in {"cache_fresh", "retry_backoff"}:
+                    continue
+                requested = str(raw.get("requested_source") or "").strip()
+                if not requested or requested in latest:
+                    continue
+                latest[requested] = {
+                    **raw,
+                    "updated_at": str(row["completed_at"]),
+                }
+        return list(latest.values())
+
     @staticmethod
     def _decode_run(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
@@ -391,6 +541,101 @@ class MarketCacheStore:
                 (symbol.upper(), actual_source, interval, adjustment),
             ).fetchone()
         return dict(row) if row else None
+
+    def source_poll_state(
+        self, symbol: str, requested_source: str, interval: str, adjustment: str
+    ) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM source_poll_state
+                WHERE symbol=? AND requested_source=? AND interval=? AND adjustment=?
+                """,
+                (symbol.upper(), requested_source, interval, adjustment),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def record_source_attempt(
+        self,
+        *,
+        symbol: str,
+        requested_source: str,
+        interval: str,
+        adjustment: str,
+        status: str,
+        attempted_at: str,
+        actual_source: str | None = None,
+        source_fingerprint: str | None = None,
+        latest_bar_time: str | None = None,
+        error_category: str | None = None,
+        error: str | None = None,
+        retry_base_seconds: int = 60,
+    ) -> dict[str, Any]:
+        """Persist source-level success freshness and bounded failure backoff."""
+        success = status == "success"
+        with self.transaction() as conn:
+            previous = conn.execute(
+                """
+                SELECT * FROM source_poll_state
+                WHERE symbol=? AND requested_source=? AND interval=? AND adjustment=?
+                """,
+                (symbol.upper(), requested_source, interval, adjustment),
+            ).fetchone()
+            previous_failures = (
+                int(previous["consecutive_failures"] or 0)
+                if previous is not None
+                else 0
+            )
+            failures = 0 if success else previous_failures + 1
+            last_success_at = (
+                attempted_at
+                if success
+                else (previous["last_success_at"] if previous is not None else None)
+            )
+            retained_latest = (
+                latest_bar_time
+                if success
+                else (previous["latest_bar_time"] if previous is not None else None)
+            )
+            next_retry_at = None
+            if not success:
+                delay = min(max(1, int(retry_base_seconds)) * (2 ** (failures - 1)), 3600)
+                next_retry_at = (
+                    datetime.fromisoformat(attempted_at.replace("Z", "+00:00"))
+                    + timedelta(seconds=delay)
+                ).isoformat()
+            conn.execute(
+                """
+                INSERT INTO source_poll_state(
+                    symbol, requested_source, interval, adjustment,
+                    actual_source, source_fingerprint, last_attempt_at, last_status,
+                    last_success_at, latest_bar_time, consecutive_failures,
+                    next_retry_at, error_category, error
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(symbol,requested_source,interval,adjustment) DO UPDATE SET
+                    actual_source=COALESCE(excluded.actual_source, source_poll_state.actual_source),
+                    source_fingerprint=COALESCE(
+                        excluded.source_fingerprint, source_poll_state.source_fingerprint
+                    ),
+                    last_attempt_at=excluded.last_attempt_at,
+                    last_status=excluded.last_status,
+                    last_success_at=excluded.last_success_at,
+                    latest_bar_time=excluded.latest_bar_time,
+                    consecutive_failures=excluded.consecutive_failures,
+                    next_retry_at=excluded.next_retry_at,
+                    error_category=excluded.error_category,
+                    error=excluded.error
+                """,
+                (
+                    symbol.upper(), requested_source, interval, adjustment,
+                    actual_source, source_fingerprint, attempted_at, status,
+                    last_success_at, retained_latest, failures, next_retry_at,
+                    error_category, error,
+                ),
+            )
+        result = self.source_poll_state(symbol, requested_source, interval, adjustment)
+        assert result is not None
+        return result
 
     def tail_start(self, symbol: str, actual_source: str, interval: str, adjustment: str, count: int) -> str | None:
         with self.connect() as conn:
@@ -421,6 +666,22 @@ class MarketCacheStore:
             if column not in {"symbol", "interval", "bar_time", "actual_adjustment", "actual_source"}
         )
         with self.transaction() as conn:
+            daily_sessions = {
+                (
+                    row["symbol"], row["actual_adjustment"], row["actual_source"],
+                    row["session_date"], row["bar_time"],
+                )
+                for row in rows
+                if row.get("interval") == "1D"
+            }
+            conn.executemany(
+                """
+                DELETE FROM source_bars
+                WHERE symbol=? AND interval='1D' AND actual_adjustment=?
+                  AND actual_source=? AND session_date=? AND bar_time<>?
+                """,
+                daily_sessions,
+            )
             conn.executemany(
                 f"INSERT INTO source_bars({','.join(columns)}) VALUES({placeholders}) "
                 f"ON CONFLICT(symbol,interval,bar_time,actual_adjustment,actual_source) DO UPDATE SET {updates}",
@@ -470,6 +731,26 @@ class MarketCacheStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def source_tail(
+        self,
+        symbol: str,
+        actual_source: str,
+        interval: str,
+        adjustment: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM source_bars
+                WHERE symbol=? AND actual_source=? AND interval=? AND actual_adjustment=?
+                ORDER BY bar_time DESC LIMIT ?
+                """,
+                (symbol.upper(), actual_source, interval, adjustment, limit),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
     def replace_consensus(self, rows: Iterable[dict[str, Any]]) -> int:
         payload = list(rows)
         if not payload:
@@ -486,6 +767,21 @@ class MarketCacheStore:
             if column not in {"symbol", "interval", "bar_time", "adjustment"}
         )
         with self.transaction() as conn:
+            daily_sessions = {
+                (
+                    row["symbol"], row["adjustment"], row["session_date"], row["bar_time"]
+                )
+                for row in payload
+                if row.get("interval") == "1D"
+            }
+            conn.executemany(
+                """
+                DELETE FROM consensus_bars
+                WHERE symbol=? AND interval='1D' AND adjustment=?
+                  AND session_date=? AND bar_time<>?
+                """,
+                daily_sessions,
+            )
             conn.executemany(
                 f"INSERT INTO consensus_bars({','.join(columns)}) VALUES({placeholders}) "
                 f"ON CONFLICT(symbol,interval,bar_time,adjustment) DO UPDATE SET {updates}",
@@ -494,18 +790,47 @@ class MarketCacheStore:
         return len(payload)
 
     def refresh_latest_quote(self, symbol: str) -> dict[str, Any] | None:
+        accepted_statuses = ["verified"]
+        upper = symbol.upper()
+        if upper.endswith((".US", ".HK")) or upper.endswith(("-USDT", "/USDT")):
+            accepted_statuses.append("single_source")
+        status_placeholders = ",".join("?" for _ in accepted_statuses)
         with self.transaction() as conn:
-            row = conn.execute(
-                """
+            rows = conn.execute(
+                f"""
                 SELECT * FROM consensus_bars
-                WHERE symbol=? AND adjustment='raw' AND status='verified'
+                WHERE symbol=? AND adjustment='raw' AND status IN ({status_placeholders})
                 ORDER BY bar_time DESC, CASE interval WHEN '1m' THEN 0 WHEN '5m' THEN 1 ELSE 2 END
-                LIMIT 1
+                LIMIT 50
                 """,
-                (symbol.upper(),),
-            ).fetchone()
-            if not row:
+                (upper, *accepted_statuses),
+            ).fetchall()
+            if not rows:
                 return None
+            row = rows[0]
+            # US/HK/crypto portfolios may display a one-source forming bar, but
+            # an immediately preceding verified bar is the safer quote for AI
+            # planning. Prefer that quorum result while it is no more than one
+            # 5-minute polling window behind the newest accepted observation.
+            if row["status"] != "verified":
+                verified = next(
+                    (
+                        candidate
+                        for candidate in rows
+                        if candidate["status"] == "verified"
+                        and candidate["interval"] in {"1m", "5m"}
+                    ),
+                    None,
+                )
+                if verified is not None:
+                    newest_time = datetime.fromisoformat(
+                        str(row["bar_time"]).replace("Z", "+00:00")
+                    )
+                    verified_time = datetime.fromisoformat(
+                        str(verified["bar_time"]).replace("Z", "+00:00")
+                    )
+                    if newest_time - verified_time <= timedelta(minutes=10):
+                        row = verified
             conn.execute(
                 """
                 INSERT INTO latest_quotes(
@@ -562,13 +887,18 @@ class MarketCacheStore:
         if item.get("interval") not in {"1m", "5m"}:
             return item
         symbol = str(item.get("symbol") or "").upper()
-        timezone_name = "Asia/Shanghai" if symbol.endswith((".SH", ".SZ", ".BJ", ".HK")) else "UTC"
+        timezone_name = (
+            "Asia/Shanghai" if symbol.endswith((".SH", ".SZ", ".BJ", ".HK"))
+            else "America/New_York" if symbol.endswith(".US")
+            else "UTC"
+        )
         market_tz = ZoneInfo(timezone_name)
         now = datetime.now(market_tz)
         if item.get("session_date") != now.date().isoformat():
             return item
         market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-        market_close = now.replace(hour=15, minute=0, second=0, microsecond=0)
+        market_close_hour = 16 if symbol.endswith(".US") else 15
+        market_close = now.replace(hour=market_close_hour, minute=0, second=0, microsecond=0)
         if not market_open <= now <= market_close:
             return item
         bar_time = datetime.fromisoformat(str(item["bar_time"]).replace("Z", "+00:00")).astimezone(market_tz)
@@ -582,13 +912,17 @@ class MarketCacheStore:
             if symbols:
                 placeholders = ",".join("?" for _ in symbols)
                 rows = conn.execute(
-                    f"SELECT * FROM cache_coverage WHERE symbol IN ({placeholders}) "
-                    "ORDER BY symbol, interval, actual_adjustment, actual_source",
+                    "SELECT c.*, i.name AS name FROM cache_coverage c "
+                    "LEFT JOIN instruments i ON i.symbol=c.symbol "
+                    f"WHERE c.symbol IN ({placeholders}) "
+                    "ORDER BY c.symbol, c.interval, c.actual_adjustment, c.actual_source",
                     [symbol.upper() for symbol in symbols],
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM cache_coverage ORDER BY symbol, interval, actual_adjustment, actual_source"
+                    "SELECT c.*, i.name AS name FROM cache_coverage c "
+                    "LEFT JOIN instruments i ON i.symbol=c.symbol "
+                    "ORDER BY c.symbol, c.interval, c.actual_adjustment, c.actual_source"
                 ).fetchall()
         return [dict(row) for row in rows]
 
@@ -626,22 +960,91 @@ class MarketCacheStore:
                     item[key.removesuffix("_json")] = json.loads(item.pop(key) or "[]")
         return result
 
-    def cache_summaries(self, limit: int = 200) -> list[dict[str, Any]]:
+    def query_same_time_bucket_bars(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        adjustment: str,
+        local_time_bucket: str,
+        view: str = "consensus",
+        before: str | None = None,
+        limit: int = 2000,
+    ) -> list[dict[str, Any]]:
+        """Return historical bars from one Asia/Shanghai HH:MM bucket.
+
+        Price-volume baselines need one seasonal bucket across many sessions,
+        especially for 1m rules.  Filtering that bucket in SQLite avoids
+        loading several thousand unrelated intraday bars into every analyzer.
+        """
+
+        table = "consensus_bars" if view == "consensus" else "source_bars"
+        adjustment_column = "adjustment" if view == "consensus" else "actual_adjustment"
+        clauses = [
+            "symbol=?",
+            "interval=?",
+            f"{adjustment_column}=?",
+            "strftime('%H:%M', datetime(bar_time, '+8 hours'))=?",
+        ]
+        params: list[Any] = [
+            symbol.upper(),
+            interval,
+            adjustment,
+            str(local_time_bucket),
+        ]
+        if before:
+            clauses.append("bar_time<?")
+            params.append(before)
+        params.append(max(1, min(int(limit), 2000)))
         with self.connect() as conn:
             rows = conn.execute(
-                """
+                f"SELECT * FROM {table} WHERE {' AND '.join(clauses)} "
+                "ORDER BY bar_time DESC LIMIT ?",
+                params,
+            ).fetchall()
+        result = [dict(row) for row in reversed(rows)]
+        for item in result:
+            for key in ("sources_json", "observations_json", "quality_flags"):
+                if key in item:
+                    item[key.removesuffix("_json")] = json.loads(item.pop(key) or "[]")
+        return result
+
+    def cache_summaries(
+        self,
+        limit: int = 200,
+        *,
+        symbols: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        normalized_symbols = sorted({
+            str(symbol).strip().upper()
+            for symbol in (symbols or [])
+            if str(symbol).strip()
+        })
+        if symbols is not None and not normalized_symbols:
+            return []
+        where_clause = ""
+        params: list[Any] = []
+        if normalized_symbols:
+            placeholders = ",".join("?" for _ in normalized_symbols)
+            where_clause = f"WHERE c.symbol IN ({placeholders})"
+            params.extend(normalized_symbols)
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
                 SELECT c.* FROM consensus_bars c
                 JOIN (
                     SELECT symbol, interval, adjustment, MAX(bar_time) AS max_time
                     FROM consensus_bars GROUP BY symbol, interval, adjustment
                 ) latest ON latest.symbol=c.symbol AND latest.interval=c.interval
                     AND latest.adjustment=c.adjustment AND latest.max_time=c.bar_time
+                {where_clause}
                 ORDER BY c.verified_at DESC LIMIT ?
                 """,
-                (limit,),
+                params,
             ).fetchall()
         summaries: list[dict[str, Any]] = []
-        coverage = self.list_coverage()
+        coverage = self.list_coverage(normalized_symbols or None)
         for row in rows:
             item = dict(row)
             sources = json.loads(item.pop("sources_json") or "[]")

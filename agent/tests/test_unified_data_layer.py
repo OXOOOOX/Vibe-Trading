@@ -65,6 +65,10 @@ def test_long_term_history_is_cache_first_and_returns_contiguous_pages(tmp_path,
     service = _unified(tmp_path, fetcher)
     first = service.get_context(symbols=["588870.SH"], purpose="long_term", lookback_days=20, include=["market"])
     assert first["status"] == "live"
+    # The provider consensus is verified even when the current daily candle is
+    # still forming; actionability is intentionally a separate, time-based gate.
+    assert first["market"]["series"][0]["decision_status"] == "verified"
+    assert isinstance(first["provider_health"], list)
     assert calls
     handle = first["market"]["series"][0]["handle"]
     page = service.read_bars(handle)
@@ -73,6 +77,37 @@ def test_long_term_history_is_cache_first_and_returns_contiguous_pages(tmp_path,
     second = service.get_context(symbols=["588870.SH"], purpose="long_term", lookback_days=20, include=["market"])
     assert second["market"]["series"][0]["retrieval"]["mode"] == "cache"
     assert calls == []  # Existing settled coverage is read, not re-fetched.
+
+
+def test_mixed_market_context_preserves_one_canonical_adjustment_semantics(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("VIBE_TRADING_PORTFOLIO_STATE_PATH", str(tmp_path / "portfolio.json"))
+    calls: list[dict] = []
+
+    def fetcher(**kwargs):
+        calls.append(dict(kwargs))
+        return _outcome(kwargs)
+
+    service = _unified(tmp_path, fetcher)
+    result = service.get_context(
+        symbols=["588870.SH", "AAPL.US"],
+        purpose="long_term",
+        lookback_days=20,
+        include=["market"],
+    )
+
+    by_symbol = {row["symbol"]: row for row in result["market"]["series"]}
+    assert by_symbol["588870.SH"]["adjustment"] == "qfq"
+    assert by_symbol["AAPL.US"]["adjustment"] == "qfq"
+    assert any(
+        call["symbol"] == "AAPL.US" and call["adjustment"] == "qfq"
+        for call in calls
+    )
+    assert not any(
+        call["symbol"] == "588870.SH" and call["adjustment"] == "source_default"
+        for call in calls
+    )
 
 
 def test_live_failure_uses_explicit_stale_market_cache_fallback(tmp_path, monkeypatch) -> None:
@@ -90,6 +125,13 @@ def test_live_failure_uses_explicit_stale_market_cache_fallback(tmp_path, monkey
     assert series["retrieval"]["cache_fallback_used"] is True
     assert series["actionability"] == "analysis_only"
     assert series["selected_quote"] is None
+
+
+def test_latest_price_profile_keeps_raw_daily_close_as_premarket_fallback() -> None:
+    assert data_service.PROFILES["latest_price"]["items"] == [
+        ("1m", "raw"),
+        ("1D", "raw"),
+    ]
 
 
 def test_premarket_context_reuses_covered_cache_and_publishes_bar_handles(tmp_path, monkeypatch) -> None:
@@ -119,6 +161,37 @@ def test_premarket_context_reuses_covered_cache_and_publishes_bar_handles(tmp_pa
         assert "request_id" in str(exc)
     else:  # pragma: no cover - the request id must never be a bar handle
         raise AssertionError("request_id unexpectedly resolved as a bars handle")
+
+
+def test_decision_scopes_keep_daily_trend_when_intraday_has_not_started(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VIBE_TRADING_PORTFOLIO_STATE_PATH", str(tmp_path / "portfolio.json"))
+    service = _unified(tmp_path, lambda **kwargs: _outcome(kwargs))
+    scopes = service._decision_scopes(
+        ["588870.SH"],
+        {
+            "series": [
+                {
+                    "symbol": "588870.SH",
+                    "interval": "1D",
+                    "actionability": "price_actionable",
+                    "selected_quote": {"bar_time": "2026-07-15", "verified_at": "2026-07-15T15:10:00+08:00"},
+                },
+                {
+                    "symbol": "588870.SH",
+                    "interval": "1m",
+                    "actionability": "analysis_only",
+                    "blocked_reasons": ["intraday_not_started"],
+                    "freshness": {"bar_time": "2026-07-15T15:00:00+08:00"},
+                },
+            ]
+        },
+        {},
+    )["588870.SH"]
+
+    assert scopes["daily_trend"]["status"] == "verified"
+    assert scopes["intraday"]["status"] == "not_started"
+    assert scopes["condition_order"]["status"] == "verified"
+    assert scopes["condition_order"]["basis"] == "daily"
 
 
 def test_holding_uses_resolution_specific_history_and_reuses_weekday_cache(tmp_path, monkeypatch) -> None:
@@ -228,6 +301,71 @@ def test_sources_include_latest_portfolio_refresh_attempts(tmp_path, monkeypatch
     assert sources["healthy-source:market"]["upstream_source"] == "independent-upstream"
     assert sources["offline-source:market"]["effective_status"] == "failed"
     assert sources["offline-source:market"]["error_category"] == "transport_error"
+
+
+def test_source_health_keeps_latest_attempt_per_provider_across_runs(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("VIBE_TRADING_PORTFOLIO_STATE_PATH", str(tmp_path / "portfolio.json"))
+
+    def fetcher(**kwargs):
+        if kwargs["requested_source"] == "akshare":
+            raise ConnectionError("remote end closed connection")
+        return _outcome(kwargs)
+
+    service = _unified(tmp_path, fetcher)
+    service.control.record_source(
+        "akshare:market",
+        succeeded=False,
+        status="failed",
+        error="Data source 'akshare' is unavailable",
+        error_category="dependency_missing",
+        requested_source="akshare",
+    )
+    service.control.record_source("auto:market", succeeded=False, error="Unknown data source: auto")
+    service.control.record_source("healthy-source", succeeded=True, latency_ms=99)
+    service.market_service.refresh_sync(
+        symbols=["588870.SH"],
+        profile="test",
+        sources=["akshare"],
+        start_date="2026-07-10",
+        end_date="2026-07-10",
+        items=[("1D", "qfq")],
+    )
+    service.market_service.refresh_sync(
+        symbols=["588870.SH"],
+        profile="test",
+        sources=["healthy-source"],
+        start_date="2026-07-10",
+        end_date="2026-07-10",
+        items=[("1D", "raw")],
+    )
+
+    sources = {row["source"]: row for row in service.sources()["sources"]}
+    assert "auto:market" not in sources
+    assert "healthy-source" not in sources
+    assert sources["akshare:market"]["effective_status"] == "failed"
+    assert sources["akshare:market"]["error_category"] == "transport_error"
+    assert sources["akshare:market"]["last_error"] == "remote end closed connection"
+
+
+def test_non_a_share_reports_are_not_applicable_instead_of_provider_failures(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("VIBE_TRADING_PORTFOLIO_STATE_PATH", str(tmp_path / "portfolio.json"))
+    service = _unified(tmp_path, lambda **kwargs: _outcome(kwargs))
+
+    result = service.get_context(
+        symbols=["AAPL.US"], purpose="long_term", include=["reports"]
+    )
+
+    reports = result["research"]["reports"]["items"]["AAPL.US"]
+    assert reports["mode"] == "not_applicable"
+    assert result["decision_scopes"]["AAPL.US"]["reports"]["status"] == "not_applicable"
+    assert not any(
+        row["source"] == "eastmoney:report"
+        for row in service.control.source_health()
+    )
 
 
 def test_registry_can_hide_low_level_data_tools_without_hiding_the_facade() -> None:

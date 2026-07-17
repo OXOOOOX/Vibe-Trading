@@ -1,8 +1,13 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
-from src.market_cache.service import MarketRefreshService, source_candidates
+from src.market_cache.service import (
+    MarketRefreshService,
+    _actual_adjustment,
+    _source_fingerprint,
+    source_candidates,
+)
 from src.market_cache.storage import MarketCacheStore
 from src.portfolio.state import PortfolioState, load_state, save_state
 
@@ -38,13 +43,25 @@ def _outcome(kwargs, *, actual_source=None, close=2.0, amount=20_000.0):
     }
 
 
-def _service(tmp_path, monkeypatch, fetcher):
+def _service(tmp_path, monkeypatch, fetcher, *, now_factory=None):
     monkeypatch.setenv("VIBE_TRADING_PORTFOLIO_STATE_PATH", str(tmp_path / "portfolio.json"))
     return MarketRefreshService(
         store=MarketCacheStore(tmp_path / "market_cache.sqlite3"),
         fetcher=fetcher,
         summary_dir=tmp_path / "summaries",
+        now_factory=now_factory,
     )
+
+
+class MutableClock:
+    def __init__(self, value: datetime) -> None:
+        self.value = value
+
+    def __call__(self) -> datetime:
+        return self.value
+
+    def advance(self, **kwargs) -> None:
+        self.value += timedelta(**kwargs)
 
 
 def test_schema_is_idempotent_and_running_jobs_are_interrupted(tmp_path) -> None:
@@ -64,6 +81,50 @@ def test_schema_is_idempotent_and_running_jobs_are_interrupted(tmp_path) -> None
     assert store.get_run("run-1")["status"] == "interrupted"
 
 
+def test_daily_upserts_remove_legacy_timestamp_variants(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch, lambda **kwargs: _outcome(kwargs))
+    outcome = _outcome(
+        {
+            "requested_source": "yahoo",
+            "start_date": "2026-07-13",
+            "end_date": "2026-07-13",
+            "adjustment": "raw",
+        },
+        actual_source="yahoo",
+        close=317.31,
+    )
+    canonical = service._normalize_records(
+        outcome,
+        symbol="AAPL.US",
+        interval="1D",
+        batch_id="canonical",
+        acquisition_mode="network",
+    )[0]
+    legacy = dict(canonical, bar_time="2026-07-13T00:00:00+00:00", batch_id="legacy")
+
+    service.store.upsert_source_bars([legacy])
+    service.store.upsert_source_bars([canonical])
+    source_rows = service.store.source_bars("AAPL.US", "1D", "raw")
+
+    assert len(source_rows) == 1
+    assert source_rows[0]["bar_time"] == "2026-07-13T04:00:00+00:00"
+
+    consensus = service._recompute_consensus("AAPL.US", "1D", "raw", "canonical")[0]
+    old_consensus = dict(
+        consensus,
+        bar_time="2026-07-13T00:00:00+00:00",
+        batch_id="legacy",
+    )
+    service.store.replace_consensus([old_consensus])
+    service.store.replace_consensus([consensus])
+
+    bars = service.store.query_bars(
+        symbol="AAPL.US", interval="1D", adjustment="raw", view="consensus"
+    )
+    assert len(bars) == 1
+    assert bars[0]["bar_time"] == "2026-07-13T04:00:00+00:00"
+
+
 def test_identical_active_refresh_is_deduplicated(tmp_path, monkeypatch) -> None:
     service = _service(tmp_path, monkeypatch, lambda **kwargs: _outcome(kwargs))
     request = dict(symbols=["588870.SH"], profile="portfolio_default")
@@ -76,6 +137,28 @@ def test_identical_active_refresh_is_deduplicated(tmp_path, monkeypatch) -> None
     assert second["run_id"] == first["run_id"]
 
 
+def test_cache_summaries_can_be_scoped_to_current_holdings(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch, lambda **kwargs: _outcome(kwargs))
+    service.refresh_sync(
+        symbols=["588870.SH", "000905.SH"],
+        profile="test",
+        sources=["source-a", "source-b"],
+        start_date="2026-07-10",
+        end_date="2026-07-10",
+        items=[("1D", "raw")],
+    )
+
+    assert {row["symbol"] for row in service.store.cache_summaries()} == {
+        "588870.SH",
+        "000905.SH",
+    }
+    assert [
+        row["symbol"]
+        for row in service.store.cache_summaries(symbols=["588870.SH"])
+    ] == ["588870.SH"]
+    assert service.store.cache_summaries(symbols=[]) == []
+
+
 def test_a_share_raw_sources_try_fast_independent_pair_first() -> None:
     assert source_candidates("588870.SH", "1m", "raw") == [
         "tencent", "mootdx", "eastmoney",
@@ -86,6 +169,143 @@ def test_a_share_raw_sources_try_fast_independent_pair_first() -> None:
     assert source_candidates("600036.SH", "1D", "qfq") == [
         "tencent", "baostock", "eastmoney", "akshare",
     ]
+    assert source_candidates("UNRESOLVED", "1D", "raw") == []
+
+
+def test_us_equity_uses_supported_sources_and_profile_variants(tmp_path, monkeypatch) -> None:
+    assert source_candidates("AAPL.US", "1m", "raw") == [
+        "yahoo", "nasdaq", "eastmoney",
+    ]
+    assert source_candidates("AAPL.US", "5m", "raw") == [
+        "yahoo", "nasdaq", "eastmoney",
+    ]
+    assert source_candidates("AAPL.US", "1D", "raw") == [
+        "sina", "eastmoney",
+    ]
+    assert source_candidates("AAPL.US", "1D", "qfq") == ["yahoo"]
+    assert source_candidates("AAPL.US", "1D", "hfq") == []
+
+    service = _service(tmp_path, monkeypatch, lambda **kwargs: _outcome(kwargs))
+    run, _ = service.create_refresh(symbols=["AAPL.US"], profile="portfolio_default")
+
+    assert [(item["interval"], item["adjustment"]) for item in run["items"]] == [
+        ("1m", "raw"),
+        ("5m", "raw"),
+        ("1D", "raw"),
+        ("1D", "qfq"),
+    ]
+
+    save_state(
+        PortfolioState(holdings=[{
+            "code": "AAPL",
+            "symbol": "AAPL",
+            "name": "Apple Inc.",
+            "quantity": 2,
+            "cost_price": 1.5,
+        }]),
+        tmp_path / "portfolio.json",
+    )
+    service.refresh_sync(
+        symbols=["AAPL.US"],
+        profile="us-single-source",
+        sources=["yahoo"],
+        items=[("1m", "raw")],
+    )
+
+    quote = service.store.quote("AAPL.US")
+    assert quote is not None
+    assert quote["status"] == "single_source"
+    holding = load_state(tmp_path / "portfolio.json").holdings[0]
+    assert holding["symbol"] == "AAPL.US"
+    assert holding["last_price"] == 2.0
+    assert holding["market_status"] == "single_source"
+
+
+def test_us_daily_price_bases_are_not_relabelled_for_compatibility() -> None:
+    assert _actual_adjustment("yahoo", "AAPL.US", "1D", "qfq") == (
+        "qfq",
+        "adjusted_close_factor",
+    )
+    assert _actual_adjustment("yahoo", "AAPL.US", "1D", "raw") == (
+        "split_adjusted",
+        "provider_contract",
+    )
+    assert _actual_adjustment("sina", "AAPL.US", "1D", "raw") == (
+        "raw",
+        "loader_contract",
+    )
+    assert _actual_adjustment("stooq", "AAPL.US", "1D", "qfq")[0] == (
+        "source_default"
+    )
+
+def test_yahoo_and_yfinance_are_not_counted_as_independent_upstreams() -> None:
+    assert _source_fingerprint("yahoo", "AAPL.US") == "yahoo_chart"
+    assert _source_fingerprint("yfinance", "AAPL.US") == "yahoo_chart"
+
+
+def test_startup_migration_removes_legacy_yahoo_daily_raw_bars(
+    tmp_path, monkeypatch
+) -> None:
+    service = _service(tmp_path, monkeypatch, lambda **kwargs: _outcome(kwargs))
+    service.refresh_sync(
+        symbols=["AAPL.US"],
+        profile="legacy-yahoo-raw",
+        sources=["yahoo"],
+        start_date="2026-07-10",
+        end_date="2026-07-10",
+        items=[("1D", "raw")],
+    )
+    assert service.store.source_bars("AAPL.US", "1D", "raw")
+    assert service.store.query_bars(
+        symbol="AAPL.US", interval="1D", adjustment="raw"
+    )
+
+    service.prepare_startup()
+
+    assert service.store.source_bars("AAPL.US", "1D", "raw") == []
+    assert service.store.query_bars(
+        symbol="AAPL.US", interval="1D", adjustment="raw"
+    ) == []
+    assert service.store.coverage("AAPL.US", "yahoo", "1D", "raw") is None
+
+
+def test_recent_verified_us_bar_is_preferred_to_newer_forming_bar(tmp_path, monkeypatch) -> None:
+    def fetcher(**kwargs):
+        outcome = _outcome(kwargs, close=313.0)
+        first_timestamp = (
+            "2026-07-14 15:55:00"
+            if kwargs["requested_source"] == "yahoo"
+            else "2026-07-14 11:55:00"
+        )
+        outcome["records"] = [
+            {
+                "trade_date": first_timestamp,
+                "open": 313.0, "high": 313.0, "low": 313.0, "close": 313.0,
+            }
+        ]
+        if kwargs["requested_source"] == "yahoo":
+            outcome["records"].append(
+                {
+                    "trade_date": "2026-07-14 16:00:00",
+                    "open": 313.1, "high": 313.1, "low": 313.1, "close": 313.1,
+                }
+            )
+        return outcome
+
+    service = _service(tmp_path, monkeypatch, fetcher)
+    service.refresh_sync(
+        symbols=["AAPL.US"], profile="test", sources=["yahoo", "nasdaq"],
+        start_date="2026-07-14", end_date="2026-07-14", items=[("5m", "raw")],
+    )
+
+    quote = service.store.quote("AAPL.US")
+    assert quote is not None
+    assert quote["last_price"] == 313.0
+    with service.store.connect() as connection:
+        stored = connection.execute(
+            "SELECT status FROM latest_quotes WHERE symbol='AAPL.US'"
+        ).fetchone()
+    assert stored["status"] == "verified"
 
 
 def test_second_refresh_only_requests_overlap_tail_without_duplicate_bars(tmp_path, monkeypatch) -> None:
@@ -110,6 +330,182 @@ def test_second_refresh_only_requests_overlap_tail_without_duplicate_bars(tmp_pa
     assert first["status"] == second["status"] == "completed"
     assert calls[0]["start_date"] >= "2026-07-08"
     assert first_count == second_count == 10
+
+
+def test_fresh_successful_sources_are_reused_without_network_calls(tmp_path, monkeypatch) -> None:
+    clock = MutableClock(datetime(2026, 7, 15, 15, 0, tzinfo=timezone.utc))
+    calls: list[str] = []
+
+    def fetcher(**kwargs):
+        calls.append(kwargs["requested_source"])
+        outcome = _outcome(
+            kwargs,
+            close=2.0 if kwargs["requested_source"] == "source-a" else 2.001,
+        )
+        outcome["records"] = [{
+            "trade_date": "2026-07-15 11:00:00",
+            "open": 2.0,
+            "high": 2.001,
+            "low": 2.0,
+            "close": 2.0 if kwargs["requested_source"] == "source-a" else 2.001,
+            "volume": 100,
+            "amount": 200,
+        }]
+        return outcome
+
+    service = _service(tmp_path, monkeypatch, fetcher, now_factory=clock)
+    request = dict(
+        symbols=["AAPL.US"],
+        profile="adaptive",
+        sources=["source-a", "source-b"],
+        items=[("1m", "raw")],
+    )
+    first = service.refresh_sync(**request)
+    assert calls == ["source-a", "source-b"]
+    calls.clear()
+
+    second = service.refresh_sync(**request)
+
+    assert first["items"][0]["status"] == "verified"
+    assert second["items"][0]["status"] == "verified"
+    assert calls == []
+    assert [attempt["status"] for attempt in second["items"][0]["attempts"]] == [
+        "cache_fresh",
+        "cache_fresh",
+    ]
+
+
+def test_failed_source_retries_when_due_while_fresh_quorum_stays_cached(tmp_path, monkeypatch) -> None:
+    clock = MutableClock(datetime(2026, 7, 15, 15, 0, tzinfo=timezone.utc))
+    calls: list[str] = []
+
+    def fetcher(**kwargs):
+        source = kwargs["requested_source"]
+        calls.append(source)
+        if source == "source-c":
+            raise ConnectionError("still unavailable")
+        return _outcome(kwargs, close=2.0 if source == "source-a" else 2.001)
+
+    service = _service(tmp_path, monkeypatch, fetcher, now_factory=clock)
+    request = dict(
+        symbols=["AAPL.US"],
+        profile="adaptive-retry",
+        sources=["source-a", "source-b", "source-c"],
+        items=[("1D", "raw")],
+    )
+    service.refresh_sync(**request)
+    service.store.record_source_attempt(
+        symbol="AAPL.US",
+        requested_source="source-c",
+        interval="1D",
+        adjustment="raw",
+        status="failed",
+        attempted_at=clock().isoformat(),
+        error_category="transport_error",
+        error="offline",
+        retry_base_seconds=60,
+    )
+    calls.clear()
+
+    service.refresh_sync(**request)
+    assert calls == []
+
+    clock.advance(seconds=61)
+    retried = service.refresh_sync(**request)
+
+    assert calls == ["source-c"]
+    assert retried["items"][0]["status"] == "verified"
+    assert [attempt["status"] for attempt in retried["items"][0]["attempts"]] == [
+        "cache_fresh",
+        "cache_fresh",
+        "failed",
+    ]
+    state = service.store.source_poll_state("AAPL.US", "source-c", "1D", "raw")
+    assert state is not None
+    assert state["consecutive_failures"] == 2
+
+
+def test_closed_market_success_is_reused_until_the_next_open(tmp_path, monkeypatch) -> None:
+    clock = MutableClock(datetime(2026, 7, 15, 20, 5, tzinfo=timezone.utc))
+    calls: list[str] = []
+
+    def fetcher(**kwargs):
+        calls.append(kwargs["requested_source"])
+        outcome = _outcome(kwargs, close=2.0)
+        outcome["records"] = [{
+            "trade_date": "2026-07-15 16:00:00",
+            "open": 2.0,
+            "high": 2.0,
+            "low": 2.0,
+            "close": 2.0,
+            "volume": 100,
+            "amount": 200,
+        }]
+        return outcome
+
+    service = _service(tmp_path, monkeypatch, fetcher, now_factory=clock)
+    request = dict(
+        symbols=["AAPL.US"],
+        profile="closed-market",
+        sources=["source-a", "source-b"],
+        items=[("1m", "raw")],
+    )
+    service.refresh_sync(**request)
+    calls.clear()
+
+    service.refresh_sync(**request)
+    assert calls == []
+
+    clock.value = datetime(2026, 7, 16, 13, 31, tzinfo=timezone.utc)
+    service.refresh_sync(**request)
+    assert calls == ["source-a", "source-b"]
+
+
+def test_cached_refresh_preserves_source_lag_diagnostics(tmp_path, monkeypatch) -> None:
+    clock = MutableClock(datetime(2026, 7, 15, 20, 5, tzinfo=timezone.utc))
+
+    def fetcher(**kwargs):
+        outcome = _outcome(kwargs, close=2.0)
+        if kwargs["requested_source"] == "lagging-source":
+            outcome["records"] = outcome["records"][:-1]
+        return outcome
+
+    service = _service(tmp_path, monkeypatch, fetcher, now_factory=clock)
+    request = dict(
+        symbols=["AAPL.US"],
+        profile="cached-lag",
+        sources=["current-source", "lagging-source"],
+        items=[("1D", "raw")],
+    )
+
+    first = service.refresh_sync(**request)
+    second = service.refresh_sync(**request)
+
+    assert first["items"][0]["status"] == "source_lag"
+    assert second["items"][0]["status"] == "source_lag"
+    assert [attempt["status"] for attempt in second["items"][0]["attempts"]] == [
+        "cache_fresh",
+        "cache_fresh",
+    ]
+
+
+def test_new_secondary_source_backfills_full_requested_window(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def fetcher(**kwargs):
+        calls.append(dict(kwargs))
+        return _outcome(
+            kwargs,
+            close=2.0 if kwargs["requested_source"] == "source-a" else 2.001,
+        )
+
+    service = _service(tmp_path, monkeypatch, fetcher)
+    service.refresh_sync(
+        symbols=["AAPL.US"], profile="test", sources=["source-a", "source-b"],
+        start_date="2026-06-01", end_date="2026-07-10", items=[("1D", "raw")],
+    )
+
+    assert [call["start_date"] for call in calls] == ["2026-06-01", "2026-06-01"]
 
 
 def test_same_actual_upstream_is_not_counted_twice(tmp_path, monkeypatch) -> None:

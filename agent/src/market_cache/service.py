@@ -12,7 +12,7 @@ import tempfile
 import time
 import uuid
 from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -22,6 +22,7 @@ import pandas as pd
 from src.market_data import get_loader_strict
 from src.market_verification import normalize_adjustment, source_adjustment_policy, verified_cache_dir
 from src.portfolio.state import load_state, save_state
+from src.usage import record_current_resource
 
 from .storage import MarketCacheStore, utc_now
 
@@ -34,13 +35,152 @@ PROFILE_ITEMS: tuple[tuple[str, str, int, int], ...] = (
     ("1D", "raw", 1100, 750),
     ("1D", "qfq", 1100, 750),
 )
+SOURCE_SUCCESS_TTL_SECONDS = {"1m": 60, "5m": 300, "1D": 900}
+SOURCE_BAR_MAX_AGE_SECONDS = {"1m": 180, "5m": 720}
+MARKET_SETTLEMENT_GRACE = timedelta(minutes=2)
+SOURCE_RETRY_BASE_SECONDS = {
+    "transport_error": 60,
+    "provider_error": 60,
+    "rate_limited": 300,
+    "no_coverage": 300,
+    "basis_mismatch": 900,
+    "duplicate_upstream": 900,
+    "dependency_missing": 1800,
+}
+
+
+def _profile_items_for_symbol(symbol: str) -> list[tuple[str, str]]:
+    """Return cache variants that have declared semantics for this market."""
+    is_equity = symbol.upper().endswith((".SH", ".SZ", ".BJ", ".US", ".HK"))
+    return [
+        (interval, adjustment)
+        for interval, adjustment, _, _ in PROFILE_ITEMS
+        if is_equity or adjustment == "raw"
+    ]
 
 
 def _market_timezone(symbol: str) -> ZoneInfo:
     upper = symbol.upper()
     if upper.endswith((".SH", ".SZ", ".BJ", ".HK")):
         return ZoneInfo("Asia/Shanghai")
+    if upper.endswith(".US"):
+        return ZoneInfo("America/New_York")
     return ZoneInfo("UTC")
+
+
+def _market_sessions(symbol: str) -> tuple[tuple[clock_time, clock_time], ...] | None:
+    """Return regular local sessions; ``None`` means an always-open market."""
+    upper = symbol.upper()
+    if upper.endswith((".SH", ".SZ", ".BJ")):
+        return (
+            (clock_time(9, 30), clock_time(11, 30)),
+            (clock_time(13, 0), clock_time(15, 0)),
+        )
+    if upper.endswith(".HK"):
+        return (
+            (clock_time(9, 30), clock_time(12, 0)),
+            (clock_time(13, 0), clock_time(16, 0)),
+        )
+    if upper.endswith(".US"):
+        return ((clock_time(9, 30), clock_time(16, 0)),)
+    return None
+
+
+def _as_utc(value: str | datetime) -> datetime:
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _previous_weekday(value: date) -> date:
+    candidate = value - timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def _closed_period_boundary(symbol: str, now: datetime) -> datetime | None:
+    """Return the close after which one successful snapshot is valid until reopen."""
+    sessions = _market_sessions(symbol)
+    if not sessions:
+        return None
+    local_now = now.astimezone(_market_timezone(symbol))
+    local_time = local_now.timetz().replace(tzinfo=None)
+    timezone_info = local_now.tzinfo
+    assert timezone_info is not None
+
+    if local_now.weekday() >= 5 or local_time < sessions[0][0]:
+        previous_day = _previous_weekday(local_now.date())
+        return datetime.combine(
+            previous_day,
+            sessions[-1][1],
+            tzinfo=timezone_info,
+        ) + MARKET_SETTLEMENT_GRACE
+
+    for index, (opens_at, closes_at) in enumerate(sessions):
+        if opens_at <= local_time < closes_at:
+            return None
+        if local_time >= closes_at:
+            next_open = sessions[index + 1][0] if index + 1 < len(sessions) else None
+            if next_open is None or local_time < next_open:
+                boundary = datetime.combine(
+                    local_now.date(),
+                    closes_at,
+                    tzinfo=timezone_info,
+                ) + MARKET_SETTLEMENT_GRACE
+                return boundary if local_now >= boundary else None
+    return None
+
+
+def _source_success_is_fresh(
+    state: dict[str, Any], *, symbol: str, interval: str, now: datetime
+) -> bool:
+    last_success = state.get("last_success_at")
+    if not last_success:
+        return False
+    success_at = _as_utc(str(last_success))
+    now_utc = _as_utc(now)
+    if success_at > now_utc + timedelta(seconds=5):
+        return False
+
+    boundary = _closed_period_boundary(symbol, now_utc)
+    if boundary is not None:
+        return success_at >= boundary.astimezone(timezone.utc)
+
+    ttl = timedelta(seconds=SOURCE_SUCCESS_TTL_SECONDS.get(interval, 60))
+    if now_utc - success_at > ttl:
+        return False
+
+    sessions = _market_sessions(symbol)
+    local_now = now_utc.astimezone(_market_timezone(symbol))
+    local_time = local_now.timetz().replace(tzinfo=None)
+    market_is_open = bool(
+        sessions
+        and local_now.weekday() < 5
+        and any(opens_at <= local_time < closes_at for opens_at, closes_at in sessions)
+    )
+    if market_is_open and interval in SOURCE_BAR_MAX_AGE_SECONDS:
+        latest_bar = state.get("latest_bar_time")
+        if not latest_bar:
+            return False
+        bar_age = now_utc - _as_utc(str(latest_bar))
+        if bar_age < timedelta(minutes=-1) or bar_age > timedelta(
+            seconds=SOURCE_BAR_MAX_AGE_SECONDS[interval]
+        ):
+            return False
+    return True
+
+
+def _source_retry_is_due(state: dict[str, Any] | None, now: datetime) -> bool:
+    if not state or state.get("last_status") == "success":
+        return False
+    retry_at = state.get("next_retry_at")
+    return not retry_at or _as_utc(now) >= _as_utc(str(retry_at))
+
+
+def _retry_base_seconds(category: str) -> int:
+    return SOURCE_RETRY_BASE_SECONDS.get(category, 60)
 
 
 def _float(value: Any) -> float | None:
@@ -58,11 +198,20 @@ def _json_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _normalize_bar_time(value: Any, symbol: str, interval: str) -> tuple[str, str]:
+def _normalize_bar_time(value: Any, symbol: str, interval: str, source: str) -> tuple[str, str]:
     timestamp = pd.Timestamp(value)
     market_tz = _market_timezone(symbol)
     if timestamp.tzinfo is None:
-        timestamp = timestamp.tz_localize(market_tz)
+        # Yahoo's intraday loader removes the UTC tz marker while preserving
+        # UTC clock values. Daily rows, and the other equity loaders, are
+        # calendar-date values in the exchange timezone.
+        timestamp = timestamp.tz_localize(
+            timezone.utc if source == "yahoo" and interval != "1D" else market_tz
+        )
+    if interval == "1m":
+        timestamp = timestamp.floor("min")
+    elif interval == "5m":
+        timestamp = timestamp.floor("5min")
     local = timestamp.tz_convert(market_tz)
     if interval == "1D":
         # Providers encode the same daily session either as local midnight or
@@ -83,11 +232,35 @@ def _volume_policy(source: str, symbol: str) -> tuple[str, float]:
     return "unknown", 1.0
 
 
-def _actual_adjustment(source: str, symbol: str, requested: str) -> tuple[str, str]:
+def _actual_adjustment(
+    source: str,
+    symbol: str,
+    interval: str,
+    requested: str,
+) -> tuple[str, str]:
+    """Classify the returned price basis without weakening the request.
+
+    Provider names are irrelevant here: only an adapter path with an explicit
+    contract may claim a canonical basis. Unknown/default series remain
+    unclassified and are rejected by the exact-basis gate below.
+    """
+
+    source = source.lower()
     requested = normalize_adjustment(requested)
     if source in {"tencent", "eastmoney"} and requested in {"raw", "qfq"}:
         return requested, "explicit_request"
+    if source == "yahoo":
+        if requested == "qfq" and interval in {"1D", "1W", "1M"}:
+            return "qfq", "adjusted_close_factor"
+        if requested == "raw" and interval in {"1m", "5m", "1H"}:
+            return "raw", "intraday_trade_price"
+        if interval in {"1D", "1W", "1M"}:
+            return "split_adjusted", "provider_contract"
     if source == "mootdx" and requested == "raw":
+        return "raw", "loader_contract"
+    if source == "sina" and interval == "1D" and requested == "raw":
+        return "raw", "loader_contract"
+    if source == "nasdaq" and interval in {"1m", "5m"} and requested == "raw":
         return "raw", "loader_contract"
     policy = source_adjustment_policy(source, symbol)
     return str(policy["adjustment"]), str(policy["confidence"])
@@ -104,6 +277,12 @@ def _source_fingerprint(source: str, symbol: str) -> str:
         return "tdx_tcp"
     if normalized == "baostock":
         return "baostock_tcp"
+    if normalized in {"yahoo", "yfinance"}:
+        return "yahoo_chart"
+    if normalized == "nasdaq":
+        return "nasdaq_official_chart"
+    if normalized == "sina":
+        return "sina_us_kline"
     if normalized == "akshare":
         upper = symbol.upper()
         is_etf = upper.endswith((".SH", ".SZ", ".BJ")) and upper[:2] in {
@@ -162,12 +341,20 @@ def fetch_source_records(
     records: list[dict[str, Any]] = []
     if frame is not None and not frame.empty:
         records = frame.reset_index().to_dict(orient="records")
-    actual_adjustment, confidence = _actual_adjustment(actual_source, symbol, adjustment)
+    actual_adjustment, confidence = _actual_adjustment(
+        actual_source,
+        symbol,
+        interval,
+        adjustment,
+    )
     return {
         "requested_source": requested_source,
         "actual_source": actual_source,
         "adapter_name": f"{loader_cls.__module__}.{loader_cls.__name__}",
-        "source_fingerprint": _source_fingerprint(actual_source, symbol),
+        "source_fingerprint": str(
+            getattr(loader, "source_fingerprint", None)
+            or _source_fingerprint(actual_source, symbol)
+        ),
         "requested_adjustment": normalize_adjustment(adjustment),
         "actual_adjustment": actual_adjustment,
         "adjustment_confidence": confidence,
@@ -178,6 +365,7 @@ def fetch_source_records(
 
 def source_candidates(symbol: str, interval: str, adjustment: str) -> list[str]:
     upper = symbol.upper()
+    adjustment = normalize_adjustment(adjustment)
     if upper.endswith((".SH", ".SZ", ".BJ")):
         if interval in {"1m", "5m"}:
             # Tencent + TDX are the fastest independent A-share pair in normal
@@ -192,12 +380,34 @@ def source_candidates(symbol: str, interval: str, adjustment: str) -> list[str]:
             return ["tencent", "baostock", "eastmoney", "akshare"]
         return ["tencent", "mootdx", "eastmoney"]
     if upper.endswith(".US"):
-        return ["yahoo", "stooq"]
+        if interval in {"1m", "5m"}:
+            return ["yahoo", "nasdaq", "eastmoney"] if adjustment == "raw" else []
+        if interval == "1D" and adjustment == "qfq":
+            # Yahoo adjusted_close is converted into canonical qfq OHLC by the
+            # adapter. No second independent upstream currently proves the same
+            # total-return basis, so the result intentionally remains single-source.
+            return ["yahoo"]
+        if interval == "1D" and adjustment == "raw":
+            # Sina preserves historical event-time prices across AAPL's 2020
+            # split. Yahoo daily Close is split-adjusted and is therefore barred
+            # from this raw quorum; Eastmoney is retained only when it has coverage.
+            return ["sina", "eastmoney"]
+        return []
     if upper.endswith(".HK"):
-        return ["eastmoney", "yahoo"]
+        if interval != "1D":
+            return ["eastmoney"] if adjustment == "raw" else []
+        if adjustment == "qfq":
+            return ["eastmoney", "yahoo"]
+        if adjustment == "raw":
+            return ["eastmoney"]
+        return []
     if upper.endswith("-USDT") or upper.endswith("/USDT"):
         return ["okx", "ccxt"]
-    return ["auto"]
+    # ``auto`` is a routing instruction, not a real independent provider.  The
+    # strict verification path must never persist it as source health or try to
+    # instantiate it as a loader.  Unknown symbol families remain unresolved
+    # until they are normalized to a market with concrete candidates.
+    return []
 
 
 def _spread(values: list[float]) -> float | None:
@@ -229,7 +439,13 @@ def _session_is_settled(session_date: str, symbol: str) -> bool:
         return True
     if session > local_now.date():
         return False
-    return local_now.time() >= datetime.strptime("15:10", "%H:%M").time()
+    sessions = _market_sessions(symbol)
+    if not sessions:
+        return False
+    settled_at = datetime.combine(
+        local_now.date(), sessions[-1][1], tzinfo=local_now.tzinfo
+    ) + timedelta(minutes=10)
+    return local_now >= settled_at
 
 
 class MarketRefreshService:
@@ -239,13 +455,28 @@ class MarketRefreshService:
         store: MarketCacheStore | None = None,
         fetcher: FetchSource = fetch_source_records,
         summary_dir: Path | None = None,
+        now_factory: Callable[[], datetime] | None = None,
     ) -> None:
         self.store = store or MarketCacheStore()
         self.fetcher = fetcher
         self.summary_dir = summary_dir or verified_cache_dir()
+        self.now_factory = now_factory or (lambda: datetime.now(timezone.utc))
+
+    def _now_utc(self) -> datetime:
+        return _as_utc(self.now_factory())
 
     def prepare_startup(self) -> int:
-        return self.store.mark_running_interrupted()
+        interrupted = self.store.mark_running_interrupted()
+        migrated_symbols = self.store.migrate_price_basis_contract_v2()
+        for symbol in migrated_symbols:
+            self._recompute_consensus(
+                symbol,
+                "1D",
+                "raw",
+                "price-basis-contract-v2",
+            )
+            self.store.refresh_latest_quote(symbol)
+        return interrupted
 
     def create_refresh(
         self,
@@ -257,6 +488,7 @@ class MarketRefreshService:
         start_date: str | None = None,
         end_date: str | None = None,
         items: list[tuple[str, str]] | None = None,
+        read_only: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         normalized = sorted({str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()})
         if not normalized:
@@ -268,6 +500,7 @@ class MarketRefreshService:
             "start_date": start_date,
             "end_date": end_date,
             "items": item_specs,
+            "read_only": bool(read_only),
         }
         dedupe_payload = {"symbols": normalized, "profile": profile, **config}
         dedupe_key = _json_hash(dedupe_payload)
@@ -278,7 +511,11 @@ class MarketRefreshService:
             return run, True
 
         run_id = uuid.uuid4().hex
-        rows = [(symbol, interval, adjustment) for symbol in normalized for interval, adjustment in item_specs]
+        rows = [
+            (symbol, interval, adjustment)
+            for symbol in normalized
+            for interval, adjustment in (item_specs if items is not None else _profile_items_for_symbol(symbol))
+        ]
         self.store.create_run(
             run_id=run_id,
             dedupe_key=dedupe_key,
@@ -383,7 +620,8 @@ class MarketRefreshService:
             for symbol in set(completed_symbols):
                 self.store.refresh_latest_quote(symbol)
             if completed_symbols:
-                self._update_portfolio(list(set(completed_symbols)))
+                if not bool(config.get("read_only")):
+                    self._update_portfolio(list(set(completed_symbols)))
                 self._write_compatibility_summaries(list(set(completed_symbols)))
             final_status = "interrupted" if interrupted else (
                 "completed" if failed == 0 else ("partial" if completed > failed else "failed")
@@ -433,7 +671,18 @@ class MarketRefreshService:
         deadline: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
-        requested_sources = sources or source_candidates(symbol, interval, adjustment)
+        default_sources = source_candidates(symbol, interval, adjustment)
+        if sources:
+            requested_sources = [
+                str(source).strip()
+                for source in sources
+                if str(source).strip() and str(source).strip().lower() != "auto"
+            ]
+            if any(str(source).strip().lower() == "auto" for source in sources):
+                requested_sources.extend(default_sources)
+            requested_sources = list(dict.fromkeys(requested_sources))
+        else:
+            requested_sources = default_sources
         start_date, end_date, keep_sessions = self._date_window(
             interval, adjustment, explicit_start, explicit_end
         )
@@ -446,8 +695,94 @@ class MarketRefreshService:
         source_errors: list[str] = []
         attempts: list[dict[str, Any]] = []
         successes: dict[str, dict[str, Any]] = {}
+        reused_observation_keys: set[tuple[str, str]] = set()
         rows_written = 0
         tick_size = float(self.store.instrument(symbol).get("tick_size") or 0.001)
+        adaptive_polling = not force and explicit_start is None and explicit_end is None
+
+        def add_success(
+            *,
+            requested_source: str,
+            actual_source: str,
+            fingerprint: str,
+            bars: list[dict[str, Any]],
+            reused: bool = False,
+        ) -> None:
+            if not bars:
+                return
+            latest = bars[-1]
+            successes[fingerprint] = {
+                "requested_source": requested_source,
+                "actual_source": actual_source,
+                "fingerprint": fingerprint,
+                "bar_time": latest["bar_time"],
+                "close": float(latest["close"]),
+                "bars": {
+                    str(row["bar_time"]): float(row["close"])
+                    for row in bars[-20:]
+                    if row.get("close") is not None
+                },
+            }
+            if actual_source not in actual_sources:
+                actual_sources.append(actual_source)
+            if reused:
+                reused_observation_keys.update(
+                    (fingerprint, str(row["bar_time"])) for row in bars[-20:]
+                )
+
+        def confirmation_state() -> tuple[bool, bool]:
+            if not successes:
+                return False, False
+            grouped_successes: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for success in successes.values():
+                for candidate_time, candidate_close in success["bars"].items():
+                    grouped_successes[candidate_time].append(
+                        {
+                            **success,
+                            "bar_time": candidate_time,
+                            "close": candidate_close,
+                        }
+                    )
+            newest_time = max(
+                pd.Timestamp(success["bar_time"]) for success in successes.values()
+            )
+            maximum_confirmation_lag = (
+                pd.Timedelta(minutes=10)
+                if interval in {"1m", "5m"}
+                else pd.Timedelta(days=3)
+            )
+            recent_groups = {
+                candidate_time: group
+                for candidate_time, group in grouped_successes.items()
+                if newest_time - pd.Timestamp(candidate_time) <= maximum_confirmation_lag
+            }
+            has_quorum = any(
+                _within_tolerance(
+                    float(left["close"]),
+                    float(right["close"]),
+                    interval=interval,
+                    tick_size=tick_size,
+                )
+                for group in recent_groups.values()
+                for left_index, left in enumerate(group)
+                for right in group[left_index + 1:]
+            )
+            return has_quorum, any(len(group) >= 3 for group in recent_groups.values())
+
+        def should_stop_after(index: int) -> bool:
+            has_quorum, has_three_sources = confirmation_state()
+            if not (has_quorum or has_three_sources):
+                return False
+            now = self._now_utc()
+            return not any(
+                _source_retry_is_due(
+                    self.store.source_poll_state(
+                        symbol, remaining_source, interval, adjustment
+                    ),
+                    now,
+                )
+                for remaining_source in requested_sources[index + 1:]
+            )
 
         def interrupted_result() -> dict[str, Any]:
             self.store.update_item(
@@ -470,22 +805,126 @@ class MarketRefreshService:
             if self._should_stop(deadline, should_cancel):
                 return interrupted_result()
             self.store.update_run(run_id, current_symbol=symbol, current_source=requested_source)
-            checkpoint = index > 0
-            fetch_start = (date.fromisoformat(end_date) - timedelta(days=7)).isoformat() if checkpoint else start_date
-
-            if not force and not checkpoint:
-                actual_hint = requested_source
-                try:
-                    actual_hint = str(getattr(get_loader_strict(requested_source), "name", requested_source))
-                except Exception:  # The injected test fetcher may use synthetic source names.
-                    pass
-                tail = self.store.tail_start(
-                    symbol, actual_hint, interval, adjustment, 5 if interval != "1D" else 3
+            actual_hint = requested_source
+            try:
+                actual_hint = str(
+                    getattr(get_loader_strict(requested_source), "name", requested_source)
                 )
-                if tail:
-                    tail_date = pd.Timestamp(tail).tz_convert(_market_timezone(symbol)).date().isoformat()
-                    if tail_date > fetch_start:
-                        fetch_start = tail_date
+            except Exception:  # The injected test fetcher may use synthetic source names.
+                pass
+            poll_state = self.store.source_poll_state(
+                symbol, requested_source, interval, adjustment
+            )
+            cached_rows: list[dict[str, Any]] = []
+            cache_is_fresh = bool(
+                adaptive_polling
+                and poll_state
+                and _source_success_is_fresh(
+                    poll_state,
+                    symbol=symbol,
+                    interval=interval,
+                    now=self._now_utc(),
+                )
+            )
+            if cache_is_fresh and poll_state is not None:
+                cached_actual_source = str(poll_state.get("actual_source") or actual_hint)
+                cached_rows = self.store.source_tail(
+                    symbol,
+                    cached_actual_source,
+                    interval,
+                    adjustment,
+                    limit=20,
+                )
+                cache_is_fresh = bool(cached_rows)
+                if cached_rows:
+                    cached_fingerprint = str(
+                        poll_state.get("source_fingerprint")
+                        or cached_rows[-1].get("source_fingerprint")
+                        or cached_actual_source
+                    )
+                    if cached_fingerprint not in successes:
+                        add_success(
+                            requested_source=requested_source,
+                            actual_source=cached_actual_source,
+                            fingerprint=cached_fingerprint,
+                            bars=cached_rows,
+                            reused=True,
+                        )
+
+            retry_due = _source_retry_is_due(poll_state, self._now_utc())
+            if cache_is_fresh and not retry_due:
+                record_current_resource(
+                    provider=str(poll_state.get("actual_source") if poll_state else actual_hint),
+                    category="market",
+                    status="ok",
+                    elapsed_ms=0,
+                    cache_mode="cache_hit",
+                    query={"code": symbol, "interval": interval, "source": requested_source},
+                    network_request=False,
+                    cache_access=True,
+                    metadata={"reason": "adaptive_polling_fresh"},
+                )
+                attempts.append(
+                    {
+                        "requested_source": requested_source,
+                        "actual_source": poll_state.get("actual_source") if poll_state else actual_hint,
+                        "upstream_source": poll_state.get("source_fingerprint") if poll_state else None,
+                        "actual_adjustment": adjustment,
+                        "status": "cache_fresh",
+                        "error_category": None,
+                        "error": None,
+                        "latency_ms": 0.0,
+                        "rows": len(cached_rows),
+                        "latest_bar_time": cached_rows[-1]["bar_time"],
+                    }
+                )
+                if should_stop_after(index):
+                    break
+                continue
+            if adaptive_polling and poll_state and poll_state.get("last_status") != "success" and not retry_due:
+                record_current_resource(
+                    provider=str(poll_state.get("actual_source") or actual_hint),
+                    category="market",
+                    status="error",
+                    elapsed_ms=0,
+                    cache_mode="cache_hit",
+                    query={"code": symbol, "interval": interval, "source": requested_source},
+                    network_request=False,
+                    cache_access=True,
+                    metadata={"reason": "retry_backoff"},
+                )
+                attempts.append(
+                    {
+                        "requested_source": requested_source,
+                        "actual_source": poll_state.get("actual_source"),
+                        "upstream_source": poll_state.get("source_fingerprint"),
+                        "actual_adjustment": adjustment,
+                        "status": "retry_backoff",
+                        "error_category": poll_state.get("error_category"),
+                        "error": poll_state.get("error"),
+                        "next_retry_at": poll_state.get("next_retry_at"),
+                        "latency_ms": 0.0,
+                    }
+                )
+                if should_stop_after(index):
+                    break
+                continue
+
+            tail = self.store.tail_start(
+                symbol, actual_hint, interval, adjustment, 5 if interval != "1D" else 3
+            )
+            checkpoint = bool(index > 0 and tail and not force)
+            fetch_start = (
+                (date.fromisoformat(end_date) - timedelta(days=7)).isoformat()
+                if checkpoint
+                else start_date
+            )
+            if tail and not force and not checkpoint:
+                tail_date = pd.Timestamp(tail).tz_convert(
+                    _market_timezone(symbol)
+                ).date().isoformat()
+                if tail_date > fetch_start:
+                    fetch_start = tail_date
 
             attempt_started = time.monotonic()
             try:
@@ -506,6 +945,20 @@ class MarketRefreshService:
                 category = _error_category(exc)
                 detail = f"{requested_source}: {type(exc).__name__}: {exc}"
                 source_errors.append(detail)
+                attempted_at = self._now_utc().isoformat()
+                self.store.record_source_attempt(
+                    symbol=symbol,
+                    requested_source=requested_source,
+                    interval=interval,
+                    adjustment=adjustment,
+                    status="failed",
+                    attempted_at=attempted_at,
+                    actual_source=(poll_state or {}).get("actual_source"),
+                    source_fingerprint=(poll_state or {}).get("source_fingerprint"),
+                    error_category=category,
+                    error=str(exc),
+                    retry_base_seconds=_retry_base_seconds(category),
+                )
                 attempts.append(
                     {
                         "requested_source": requested_source,
@@ -517,6 +970,8 @@ class MarketRefreshService:
                         "latency_ms": round((time.monotonic() - attempt_started) * 1000, 1),
                     }
                 )
+                if should_stop_after(index):
+                    break
                 continue
             if self._should_stop(deadline, should_cancel):
                 return interrupted_result()
@@ -541,14 +996,47 @@ class MarketRefreshService:
                     error=f"requested {adjustment}, provider returned {actual_adjustment}",
                 )
                 attempts.append(attempt)
+                self.store.record_source_attempt(
+                    symbol=symbol,
+                    requested_source=requested_source,
+                    interval=interval,
+                    adjustment=adjustment,
+                    status="basis_mismatch",
+                    attempted_at=self._now_utc().isoformat(),
+                    actual_source=actual_source,
+                    source_fingerprint=fingerprint,
+                    error_category="basis_mismatch",
+                    error=str(attempt["error"]),
+                    retry_base_seconds=_retry_base_seconds("basis_mismatch"),
+                )
+                if should_stop_after(index):
+                    break
                 continue
-            if fingerprint in successes:
+            if (
+                fingerprint in successes
+                and successes[fingerprint].get("requested_source") != requested_source
+            ):
                 attempt.update(
                     status="duplicate_upstream",
                     error_category="duplicate_upstream",
                     error=f"same upstream as {successes[fingerprint]['actual_source']}",
                 )
                 attempts.append(attempt)
+                self.store.record_source_attempt(
+                    symbol=symbol,
+                    requested_source=requested_source,
+                    interval=interval,
+                    adjustment=adjustment,
+                    status="duplicate_upstream",
+                    attempted_at=self._now_utc().isoformat(),
+                    actual_source=actual_source,
+                    source_fingerprint=fingerprint,
+                    error_category="duplicate_upstream",
+                    error=str(attempt["error"]),
+                    retry_base_seconds=_retry_base_seconds("duplicate_upstream"),
+                )
+                if should_stop_after(index):
+                    break
                 continue
 
             normalized = self._normalize_records(
@@ -562,6 +1050,21 @@ class MarketRefreshService:
                     error="provider returned no usable bars",
                 )
                 attempts.append(attempt)
+                self.store.record_source_attempt(
+                    symbol=symbol,
+                    requested_source=requested_source,
+                    interval=interval,
+                    adjustment=adjustment,
+                    status="no_coverage",
+                    attempted_at=self._now_utc().isoformat(),
+                    actual_source=actual_source,
+                    source_fingerprint=fingerprint,
+                    error_category="no_coverage",
+                    error=str(attempt["error"]),
+                    retry_base_seconds=_retry_base_seconds("no_coverage"),
+                )
+                if should_stop_after(index):
+                    break
                 continue
             rows_written += self.store.upsert_source_bars(normalized)
             if actual_source not in actual_sources:
@@ -573,35 +1076,37 @@ class MarketRefreshService:
                 latest_close=latest["close"],
             )
             attempts.append(attempt)
-            successes[fingerprint] = {
-                "actual_source": actual_source,
-                "fingerprint": fingerprint,
-                "bar_time": latest["bar_time"],
-                "close": float(latest["close"]),
-            }
-
-            grouped_successes: dict[str, list[dict[str, Any]]] = defaultdict(list)
-            for success in successes.values():
-                grouped_successes[str(success["bar_time"])].append(success)
-            has_quorum = any(
-                _within_tolerance(
-                    float(left["close"]), float(right["close"]),
-                    interval=interval, tick_size=tick_size,
-                )
-                for group in grouped_successes.values()
-                for left_index, left in enumerate(group)
-                for right in group[left_index + 1:]
+            self.store.record_source_attempt(
+                symbol=symbol,
+                requested_source=requested_source,
+                interval=interval,
+                adjustment=adjustment,
+                status="success",
+                attempted_at=self._now_utc().isoformat(),
+                actual_source=actual_source,
+                source_fingerprint=fingerprint,
+                latest_bar_time=str(latest["bar_time"]),
             )
-            if has_quorum:
-                break
-            if any(len(group) >= 3 for group in grouped_successes.values()):
+            add_success(
+                requested_source=requested_source,
+                actual_source=actual_source,
+                fingerprint=fingerprint,
+                bars=normalized,
+            )
+            if should_stop_after(index):
                 break
 
-        if interval == "5m" and adjustment == "raw":
+        if interval == "5m" and adjustment == "raw" and rows_written:
             rows_written += self._derive_five_minute_bars(symbol, run_id)
 
         self.store.update_item(run_id, symbol, interval, adjustment, status="verifying")
-        consensus = self._recompute_consensus(symbol, interval, adjustment, run_id)
+        consensus = self._recompute_consensus(
+            symbol,
+            interval,
+            adjustment,
+            run_id,
+            reused_observation_keys=reused_observation_keys,
+        )
         self.store.prune_sessions(symbol, interval, adjustment, keep_sessions)
         latest = consensus[-1] if consensus else None
         if not successes:
@@ -647,7 +1152,7 @@ class MarketRefreshService:
             close = _float(record.get("close"))
             if timestamp is None or close is None:
                 continue
-            bar_time, session_date = _normalize_bar_time(timestamp, symbol, interval)
+            bar_time, session_date = _normalize_bar_time(timestamp, symbol, interval, source)
             raw_volume = _float(record.get("volume"))
             volume = raw_volume * multiplier if raw_volume is not None and unit != "unknown" else None
             amount = _float(record.get("amount"))
@@ -742,8 +1247,25 @@ class MarketRefreshService:
         return self.store.upsert_source_bars(derived)
 
     def _recompute_consensus(
-        self, symbol: str, interval: str, adjustment: str, batch_id: str
+        self,
+        symbol: str,
+        interval: str,
+        adjustment: str,
+        batch_id: str,
+        *,
+        reused_observation_keys: set[tuple[str, str]] | None = None,
     ) -> list[dict[str, Any]]:
+        reused_observation_keys = reused_observation_keys or set()
+
+        def is_current(row: dict[str, Any]) -> bool:
+            return bool(
+                row.get("batch_id") == batch_id
+                or (
+                    str(row.get("source_fingerprint")),
+                    str(row.get("bar_time")),
+                ) in reused_observation_keys
+            )
+
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         source_rows = self.store.source_bars(symbol, interval, adjustment)
         for row in source_rows:
@@ -754,7 +1276,7 @@ class MarketRefreshService:
         latest_bar_time = max(grouped)
         current_latest_by_source: dict[str, str] = {}
         for row in source_rows:
-            if row.get("batch_id") != batch_id:
+            if not is_current(row):
                 continue
             fingerprint = str(row["source_fingerprint"])
             current_latest_by_source[fingerprint] = max(
@@ -775,7 +1297,10 @@ class MarketRefreshService:
                 if previous is None or str(candidate["retrieved_at"]) >= str(previous["retrieved_at"]):
                     independent[fingerprint] = candidate
             all_observations = list(independent.values())
-            current_observations = [row for row in all_observations if row.get("batch_id") == batch_id]
+            current_observations = [row for row in all_observations if is_current(row)]
+            network_observations = [
+                row for row in current_observations if row.get("batch_id") == batch_id
+            ]
             is_latest = bar_time == latest_bar_time
             settled = _session_is_settled(str(all_observations[0]["session_date"]), symbol)
             current_only = bool(is_latest and current_observations and not settled)
@@ -795,6 +1320,8 @@ class MarketRefreshService:
                 and len(all_observations) > len(current_observations)
             ):
                 flags.append("cached_confirmation_reused")
+            if current_observations and not network_observations:
+                flags.append("fresh_source_cache_reused")
 
             included = list(observations)
             if len(observations) == 1:
@@ -898,10 +1425,10 @@ class MarketRefreshService:
                     "sources_json": json.dumps([row["actual_source"] for row in included]),
                     "observations_json": json.dumps(public_observations, ensure_ascii=False),
                     "quality_flags": json.dumps(flags),
-                    "verified_at": utc_now() if current_observations else max(
+                    "verified_at": utc_now() if network_observations else max(
                         str(row["retrieved_at"]) for row in all_observations
                     ),
-                    "batch_id": batch_id if current_observations else max(
+                    "batch_id": batch_id if network_observations else max(
                         all_observations, key=lambda row: str(row["retrieved_at"])
                     )["batch_id"],
                 }
@@ -929,7 +1456,7 @@ class MarketRefreshService:
             diagnostic = latest_raw.get(symbol)
             if diagnostic and diagnostic.get("status") in {
                 "unresolved_conflict", "source_lag", "provisional_mix", "basis_mismatch",
-                "single_source", "stale", "unresolved",
+                "stale", "unresolved",
             } and (
                 not quote or str(diagnostic.get("bar_time")) >= str(quote.get("bar_time"))
             ):
@@ -945,7 +1472,7 @@ class MarketRefreshService:
                     changed = True
                 continue
             close = _float(quote.get("last_price"))
-            if close is None or quote.get("status") != "verified":
+            if close is None or quote.get("status") not in {"verified", "single_source"}:
                 continue
             quantity = _float(holding.get("quantity"))
             cost_price = _float(holding.get("cost_price"))
