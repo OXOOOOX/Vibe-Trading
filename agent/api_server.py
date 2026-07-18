@@ -39,7 +39,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from rich.console import Console
 
 from cli._version import __version__ as APP_VERSION
+from src.codex_cli import (
+    codex_login_command,
+    get_codex_cli_status,
+    get_latest_codex_cli_version,
+    launch_codex_login_terminal,
+)
+from src.codex_cli.status import (
+    CODEX_INSTALL_COMMAND,
+    MINIMUM_CODEX_CLI_VERSION,
+    is_container_runtime,
+)
 from src.goal.context import default_goal_criteria
+from src.reports.execution import (
+    DEEP_RESEARCH_ENGINE_CODEX_CLI,
+    DEEP_RESEARCH_ENGINE_PROVIDER,
+    DeepResearchEngine,
+    engine_env_updates,
+    resolve_deep_research_engine,
+)
 from src.ui_services import build_run_analysis, load_run_context
 
 # UTF-8 on Windows
@@ -154,6 +172,16 @@ class HealthResponse(BaseModel):
     timestamp: str = Field(..., description="Server timestamp")
 
 
+class LLMModelOption(BaseModel):
+    """One selectable model advertised by a configured or live provider."""
+
+    id: str
+    label: str
+    description: str = ""
+    default_reasoning_effort: str = ""
+    reasoning_efforts: List[str] = Field(default_factory=list)
+
+
 class LLMProviderOption(BaseModel):
     """Supported LLM provider metadata for the settings UI."""
 
@@ -166,6 +194,18 @@ class LLMProviderOption(BaseModel):
     api_key_required: bool = True
     auth_type: str = "api_key"
     login_command: Optional[str] = None
+    model_discovery: Optional[Literal["codex_oauth"]] = None
+    models: List[LLMModelOption] = Field(default_factory=list)
+
+
+class LLMModelsResponse(BaseModel):
+    """Secret-free model choices for one LLM provider."""
+
+    provider: str
+    models: List[LLMModelOption]
+    source: Literal["remote", "configured"]
+    refreshed_at: Optional[str] = None
+    warning: Optional[str] = None
 
 
 class LLMSettingsResponse(BaseModel):
@@ -219,9 +259,42 @@ class ResearchSettingsResponse(BaseModel):
     equity_deep_research_enabled: bool
     monitor_auto_deep_report_enabled: bool
     effective_monitor_auto_deep_report_enabled: bool
+    deep_research_engine: DeepResearchEngine
+    codex_cli_enabled: bool
+    codex_cli_ready: bool
+    effective_codex_cli_enabled: bool
+    codex_cli_model: str
+    codex_cli_reasoning_effort: str
     enabled_profiles: List[str]
     available_profiles: List[str]
     env_path: str
+
+
+class CodexCliStatusResponse(BaseModel):
+    """Public, secret-free Codex CLI readiness state."""
+
+    installed: bool
+    version: Optional[str] = None
+    latest_version: Optional[str] = None
+    minimum_version: str
+    version_supported: bool
+    auth_state: Literal["authenticated", "unauthenticated", "error", "unavailable"]
+    ready: bool
+    environment: Literal["native", "container", "remote"]
+    command_shell: Literal["powershell", "terminal"]
+    can_launch_login: bool
+    login_command: str
+    install_command: str
+    message: str
+
+
+class CodexCliLoginResponse(BaseModel):
+    """Result of a fixed local Codex login-terminal request."""
+
+    launched: bool
+    manual_required: bool
+    command: str
+    message: str
 
 
 class PortfolioReviewResponse(BaseModel):
@@ -347,6 +420,10 @@ class UpdateResearchSettingsRequest(BaseModel):
 
     deep_report_enabled: Optional[bool] = None
     monitor_auto_deep_report_enabled: Optional[bool] = None
+    deep_research_engine: Optional[DeepResearchEngine] = None
+    codex_cli_enabled: Optional[bool] = None
+    codex_cli_model: Optional[str] = Field(None, min_length=1, max_length=128)
+    codex_cli_reasoning_effort: Optional[str] = Field(None, min_length=1, max_length=16)
 
 
 class GeneratePdfRequest(BaseModel):
@@ -1010,6 +1087,75 @@ def _is_local_client(request: Request) -> bool:
     return _trusted_docker_loopback_ip(ip)
 
 
+def _is_direct_native_local_client(request: Request) -> bool:
+    """Require a direct loopback browser request before opening a host terminal."""
+
+    if is_container_runtime() or os.name != "nt":
+        return False
+    if any(
+        request.headers.get(name)
+        for name in ("forwarded", "x-forwarded-for", "x-real-ip", "x-forwarded-host")
+    ):
+        return False
+    host = request.client.host if request.client else ""
+    if host not in {"localhost", "testclient"}:
+        try:
+            if not ipaddress.ip_address(host).is_loopback:
+                return False
+        except ValueError:
+            return False
+    for header_name in ("origin", "referer"):
+        value = request.headers.get(header_name, "").strip()
+        if not value:
+            continue
+        parsed = urllib.parse.urlparse(value)
+        origin_host = (parsed.hostname or "").strip().lower()
+        if origin_host == "localhost":
+            continue
+        try:
+            if ipaddress.ip_address(origin_host).is_loopback:
+                continue
+        except ValueError:
+            pass
+        return False
+    return True
+
+
+def _codex_environment_for_request(request: Request) -> Literal["native", "container", "remote"]:
+    if is_container_runtime():
+        return "container"
+    return "native" if _is_direct_native_local_client(request) else "remote"
+
+
+def _build_codex_cli_status_response(
+    request: Request,
+    *,
+    force_refresh: bool = False,
+) -> CodexCliStatusResponse:
+    cli_status = get_codex_cli_status(force_refresh=force_refresh)
+    environment = _codex_environment_for_request(request)
+    can_launch = bool(
+        environment == "native"
+        and cli_status.installed
+        and cli_status.binary
+    )
+    return CodexCliStatusResponse(
+        installed=cli_status.installed,
+        version=cli_status.version,
+        latest_version=get_latest_codex_cli_version(),
+        minimum_version=cli_status.minimum_version,
+        version_supported=cli_status.version_supported,
+        auth_state=cli_status.auth_state,
+        ready=cli_status.ready,
+        environment=environment,
+        command_shell="powershell" if os.name == "nt" else "terminal",
+        can_launch_login=can_launch,
+        login_command=codex_login_command(device_auth=environment != "native"),
+        install_command=CODEX_INSTALL_COMMAND,
+        message=cli_status.message,
+    )
+
+
 def _env_flag_enabled(name: str) -> bool:
     """Return whether a boolean environment flag is enabled."""
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
@@ -1142,9 +1288,60 @@ def _load_llm_providers() -> List[LLMProviderOption]:
 LLM_PROVIDERS = _load_llm_providers()
 LLM_PROVIDER_BY_NAME = {provider.name: provider for provider in LLM_PROVIDERS}
 LLM_REASONING_EFFORTS = {"", "low", "medium", "high", "max"}
+CODEX_CLI_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 LLM_API_KEY_PLACEHOLDERS = {"", "sk-or-v1-your-key-here", "sk-xxx", "xxx", "gsk_xxx"}
 TUSHARE_TOKEN_PLACEHOLDERS = {"", "your-tushare-token"}
 DEEP_REPORT_PROFILES = ("equity_deep_research",)
+
+
+def _codex_models_client_version() -> str:
+    configured = os.getenv("OPENAI_CODEX_MODELS_CLIENT_VERSION", "").strip()
+    if configured:
+        return configured
+    try:
+        status_snapshot = get_codex_cli_status()
+    except Exception:
+        status_snapshot = None
+    return (
+        str(getattr(status_snapshot, "version", "") or "").strip()
+        or MINIMUM_CODEX_CLI_VERSION
+    )
+
+
+def _discover_llm_models(provider: LLMProviderOption) -> LLMModelsResponse:
+    fallback = list(provider.models)
+    if provider.model_discovery != "codex_oauth":
+        return LLMModelsResponse(
+            provider=provider.name,
+            models=fallback,
+            source="configured",
+        )
+
+    try:
+        from src.providers.openai_codex import list_openai_codex_models
+
+        discovered = [
+            LLMModelOption(**item)
+            for item in list_openai_codex_models(
+                client_version=_codex_models_client_version(),
+            )
+        ]
+        if not discovered:
+            raise RuntimeError("OpenAI Codex returned no selectable models")
+        return LLMModelsResponse(
+            provider=provider.name,
+            models=discovered,
+            source="remote",
+            refreshed_at=datetime.now().astimezone().isoformat(),
+        )
+    except Exception as exc:
+        logger.warning("LLM model discovery failed for %s: %s", provider.name, exc)
+        return LLMModelsResponse(
+            provider=provider.name,
+            models=fallback,
+            source="configured",
+            warning=f"Live model refresh failed; using configured choices. {exc}",
+        )
 
 
 def _ensure_agent_env_file() -> Path:
@@ -1341,6 +1538,9 @@ def _build_research_settings_response(values: Optional[Dict[str, str]] = None) -
         "0",
     ).strip().lower()
     monitor_auto_deep_report_enabled = auto_value in {"1", "true", "yes", "on"}
+    deep_research_engine = resolve_deep_research_engine(env_values)
+    codex_cli_enabled = deep_research_engine == DEEP_RESEARCH_ENGINE_CODEX_CLI
+    codex_status = get_codex_cli_status()
     configured_profiles = {
         item.strip()
         for item in env_values.get(
@@ -1360,6 +1560,20 @@ def _build_research_settings_response(values: Optional[Dict[str, str]] = None) -
             deep_report_enabled
             and "equity_deep_research" in enabled_profiles
             and monitor_auto_deep_report_enabled
+        ),
+        deep_research_engine=deep_research_engine,
+        codex_cli_enabled=codex_cli_enabled,
+        codex_cli_ready=codex_status.ready,
+        effective_codex_cli_enabled=(
+            deep_report_enabled and codex_cli_enabled and codex_status.ready
+        ),
+        codex_cli_model=(
+            env_values.get("VIBE_TRADING_CODEX_MODEL", "gpt-5.6-terra").strip()
+            or "gpt-5.6-terra"
+        ),
+        codex_cli_reasoning_effort=(
+            env_values.get("VIBE_TRADING_CODEX_REASONING_EFFORT", "medium").strip().lower()
+            or "medium"
         ),
         enabled_profiles=enabled_profiles,
         available_profiles=list(DEEP_REPORT_PROFILES),
@@ -2113,6 +2327,23 @@ async def get_llm_settings():
     return _build_llm_settings_response()
 
 
+@app.get(
+    "/settings/llm/models",
+    response_model=LLMModelsResponse,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def get_llm_models(provider: str = Query(..., min_length=1)):
+    """Refresh selectable models without exposing provider credentials."""
+
+    provider_option = LLM_PROVIDER_BY_NAME.get(provider.strip().lower())
+    if provider_option is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported LLM provider",
+        )
+    return await asyncio.to_thread(_discover_llm_models, provider_option)
+
+
 @app.put("/settings/llm", response_model=LLMSettingsResponse, dependencies=[Depends(require_settings_write_auth)])
 async def update_llm_settings(payload: UpdateLLMSettingsRequest):
     """Persist project-local LLM settings and update the running process."""
@@ -2219,6 +2450,66 @@ async def get_research_settings():
     return _build_research_settings_response()
 
 
+@app.get(
+    "/settings/codex-cli/status",
+    response_model=CodexCliStatusResponse,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def get_codex_cli_settings_status(request: Request):
+    """Return installation and login readiness without exposing credentials."""
+
+    return await asyncio.to_thread(
+        _build_codex_cli_status_response,
+        request,
+        force_refresh=True,
+    )
+
+
+@app.post(
+    "/settings/codex-cli/login",
+    response_model=CodexCliLoginResponse,
+    dependencies=[Depends(require_settings_write_auth)],
+)
+async def open_codex_cli_login(request: Request):
+    """Open a fixed visible login terminal only for direct native-local requests."""
+
+    if not _is_direct_native_local_client(request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Opening a login terminal is available only from the native local Web UI. "
+                f"Run `{codex_login_command(device_auth=True)}` on the server host instead."
+            ),
+        )
+    cli_status = await asyncio.to_thread(get_codex_cli_status, force_refresh=True)
+    if not cli_status.installed or not cli_status.binary:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Codex CLI is not installed. Run `{CODEX_INSTALL_COMMAND}` first.",
+        )
+    try:
+        launched = await asyncio.to_thread(
+            launch_codex_login_terminal,
+            cli_status.binary,
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Unable to open the Codex login terminal: {exc}",
+        ) from exc
+    if not launched:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Run `{codex_login_command()}` in a local terminal.",
+        )
+    return CodexCliLoginResponse(
+        launched=True,
+        manual_required=False,
+        command=codex_login_command(),
+        message="A visible Codex login terminal was opened for the isolated Vibe-Trading profile.",
+    )
+
+
 @app.put(
     "/settings/research",
     response_model=ResearchSettingsResponse,
@@ -2226,7 +2517,14 @@ async def get_research_settings():
 )
 async def update_research_settings(payload: UpdateResearchSettingsRequest):
     """Persist the Deep Report gate and apply it to new requests immediately."""
-    if payload.deep_report_enabled is None and payload.monitor_auto_deep_report_enabled is None:
+    if (
+        payload.deep_report_enabled is None
+        and payload.monitor_auto_deep_report_enabled is None
+        and payload.deep_research_engine is None
+        and payload.codex_cli_enabled is None
+        and payload.codex_cli_model is None
+        and payload.codex_cli_reasoning_effort is None
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="At least one research setting must be provided",
@@ -2242,6 +2540,51 @@ async def update_research_settings(payload: UpdateResearchSettingsRequest):
         if payload.monitor_auto_deep_report_enabled is not None
         else current.monitor_auto_deep_report_enabled
     )
+    if (
+        payload.deep_research_engine is not None
+        and payload.codex_cli_enabled is not None
+        and (payload.deep_research_engine == DEEP_RESEARCH_ENGINE_CODEX_CLI)
+        != payload.codex_cli_enabled
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="deep_research_engine conflicts with codex_cli_enabled",
+        )
+    deep_research_engine = (
+        payload.deep_research_engine
+        if payload.deep_research_engine is not None
+        else (
+            DEEP_RESEARCH_ENGINE_CODEX_CLI
+            if payload.codex_cli_enabled is True
+            else DEEP_RESEARCH_ENGINE_PROVIDER
+            if payload.codex_cli_enabled is False
+            else current.deep_research_engine
+        )
+    )
+    if deep_research_engine == DEEP_RESEARCH_ENGINE_CODEX_CLI and (
+        payload.deep_research_engine is not None or payload.codex_cli_enabled is True
+    ):
+        cli_status = await asyncio.to_thread(get_codex_cli_status, force_refresh=True)
+        if not cli_status.ready:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Codex CLI is not ready: {cli_status.message}",
+            )
+    codex_cli_model = (
+        payload.codex_cli_model.strip()
+        if payload.codex_cli_model is not None
+        else current.codex_cli_model
+    )
+    codex_cli_reasoning_effort = (
+        payload.codex_cli_reasoning_effort.strip().lower()
+        if payload.codex_cli_reasoning_effort is not None
+        else current.codex_cli_reasoning_effort
+    )
+    if codex_cli_reasoning_effort not in CODEX_CLI_REASONING_EFFORTS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Codex CLI reasoning effort must be minimal, low, medium, high, xhigh, max, or ultra",
+        )
     # Disabling the parent capability also revokes autonomous generation. This
     # keeps the automation consent explicit instead of leaving a hidden armed
     # setting that would reactivate later.
@@ -2250,6 +2593,9 @@ async def update_research_settings(payload: UpdateResearchSettingsRequest):
     updates = {
         "VIBE_TRADING_DEEP_REPORT_ENABLED": "1" if deep_report_enabled else "0",
         "VIBE_TRADING_MONITOR_AUTO_DEEP_REPORT_ENABLED": "1" if monitor_auto_enabled else "0",
+        **engine_env_updates(deep_research_engine),
+        "VIBE_TRADING_CODEX_MODEL": codex_cli_model,
+        "VIBE_TRADING_CODEX_REASONING_EFFORT": codex_cli_reasoning_effort,
         # The first release exposes exactly one audited Profile. Keeping the
         # whitelist explicit prevents future Profiles from becoming active
         # merely because the total switch is enabled.

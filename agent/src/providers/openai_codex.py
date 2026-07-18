@@ -22,6 +22,7 @@ except ImportError:
     httpx = None  # type: ignore
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
+DEFAULT_CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
 DEFAULT_ORIGINATOR = "vibe-trading"
 
 
@@ -153,6 +154,78 @@ def _strip_model_prefix(model: str) -> str:
     if model.startswith("openai-codex/") or model.startswith("openai_codex/"):
         return model.split("/", 1)[1]
     return model
+
+
+def list_openai_codex_models(
+    *,
+    client_version: str,
+    timeout: int = 30,
+) -> list[dict[str, Any]]:
+    """Return account-visible models supported by the direct Codex API path."""
+
+    if httpx is None:
+        raise RuntimeError("OpenAI Codex model discovery requires httpx")
+    version = client_version.strip()
+    if not version:
+        raise ValueError("Codex model discovery requires a client version")
+
+    headers = _headers_for_json_request()
+    with httpx.Client(timeout=timeout, follow_redirects=True, trust_env=True) as client:
+        response = client.get(
+            DEFAULT_CODEX_MODELS_URL,
+            headers=headers,
+            params={"client_version": version},
+        )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"OpenAI Codex model discovery HTTP {response.status_code}"
+        )
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("OpenAI Codex model discovery returned invalid JSON") from exc
+
+    raw_models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(raw_models, list):
+        raise RuntimeError("OpenAI Codex model discovery returned no model list")
+
+    models: list[dict[str, Any]] = []
+    for item in raw_models:
+        if not isinstance(item, dict):
+            continue
+        slug = str(item.get("slug") or "").strip()
+        if (
+            not slug
+            or item.get("supported_in_api") is False
+            or str(item.get("visibility") or "list").lower() != "list"
+        ):
+            continue
+        reasoning_efforts = [
+            str(level.get("effort") or "").strip()
+            for level in item.get("supported_reasoning_levels") or []
+            if isinstance(level, dict) and str(level.get("effort") or "").strip()
+        ]
+        models.append(
+            {
+                "id": f"openai-codex/{slug}",
+                "label": str(item.get("display_name") or slug),
+                "description": str(item.get("description") or ""),
+                "default_reasoning_effort": str(
+                    item.get("default_reasoning_level") or ""
+                ),
+                "reasoning_efforts": reasoning_efforts,
+            }
+        )
+    return models
+
+
+def _headers_for_json_request() -> dict[str, str]:
+    token = _get_codex_token()
+    headers = _build_headers(str(token.account_id), str(token.access))
+    headers["accept"] = "application/json"
+    headers.pop("content-type", None)
+    return headers
 
 
 def _prompt_cache_key(messages: list[dict[str, Any]]) -> str:

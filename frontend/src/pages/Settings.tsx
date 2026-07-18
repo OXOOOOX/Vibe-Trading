@@ -2,6 +2,8 @@ import i18n from "@/i18n";
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   BookOpen,
+  ChevronDown,
+  Copy,
   Database,
   KeyRound,
   Loader2,
@@ -13,13 +15,16 @@ import {
   Server,
   SlidersHorizontal,
   Square,
+  Terminal,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
   api,
   isAuthRequiredError,
   type ChannelRuntimeStatus,
+  type CodexCliStatus,
   type DataSourceSettings,
+  type LLMModelOption,
   type LLMProviderOption,
   type LLMSettings,
   type ResearchSettings,
@@ -40,6 +45,11 @@ const fieldClass =
   "w-full rounded-md border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20 disabled:cursor-not-allowed disabled:opacity-60";
 const labelClass = "text-sm font-medium";
 const hintClass = "text-xs text-muted-foreground";
+const CUSTOM_MODEL_VALUE = "__custom_model__";
+
+function toCodexCliModelSlug(value: string): string {
+  return value.replace(/^openai[-_]codex\//, "");
+}
 
 function toForm(settings: LLMSettings): LLMFormState {
   return {
@@ -58,6 +68,8 @@ export function Settings() {
   const [settings, setSettings] = useState<LLMSettings | null>(null);
   const [dataSettings, setDataSettings] = useState<DataSourceSettings | null>(null);
   const [researchSettings, setResearchSettings] = useState<ResearchSettings | null>(null);
+  const [codexStatus, setCodexStatus] = useState<CodexCliStatus | null>(null);
+  const [codexLoadError, setCodexLoadError] = useState<string | null>(null);
   const [channelStatus, setChannelStatus] = useState<ChannelRuntimeStatus | null>(null);
   const [channelLoadError, setChannelLoadError] = useState<string | null>(null);
   const [form, setForm] = useState<LLMFormState | null>(null);
@@ -69,10 +81,20 @@ export function Settings() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [dataSaving, setDataSaving] = useState(false);
-  const [researchSaving, setResearchSaving] = useState<"main" | "auto" | null>(null);
+  const [researchSaving, setResearchSaving] = useState<"main" | "auto" | "engine" | "cli_model" | null>(null);
+  const [codexRefreshing, setCodexRefreshing] = useState(false);
+  const [codexLoginOpening, setCodexLoginOpening] = useState(false);
+  const [codexManagementExpanded, setCodexManagementExpanded] = useState(false);
+  const [codexCliModel, setCodexCliModel] = useState("gpt-5.6-terra");
+  const [codexCliReasoningEffort, setCodexCliReasoningEffort] = useState("medium");
+  const [codexModelRefreshing, setCodexModelRefreshing] = useState(false);
+  const [codexModelRefreshNote, setCodexModelRefreshNote] = useState<string | null>(null);
   const [channelRefreshing, setChannelRefreshing] = useState(false);
   const [channelAction, setChannelAction] = useState<"start" | "stop" | null>(null);
   const [settingsLoadError, setSettingsLoadError] = useState<string | null>(null);
+  const [modelChoicesByProvider, setModelChoicesByProvider] = useState<Record<string, LLMModelOption[]>>({});
+  const [modelRefreshing, setModelRefreshing] = useState(false);
+  const [modelRefreshNote, setModelRefreshNote] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -80,6 +102,12 @@ export function Settings() {
       api.getLLMSettings(),
       api.getDataSourceSettings(),
       api.getResearchSettings(),
+      api.getCodexCliStatus()
+        .then((status) => ({ status, error: null }))
+        .catch((error: unknown) => ({
+          status: null,
+          error: error instanceof Error ? error.message : "Unknown error",
+        })),
       api.getChannelStatus()
         .then((status) => ({ status, error: null }))
         .catch((error: unknown) => ({
@@ -87,12 +115,17 @@ export function Settings() {
           error: error instanceof Error ? error.message : "Unknown error",
         })),
     ])
-      .then(([llmData, dataSourceData, researchData, channelResult]) => {
+      .then(([llmData, dataSourceData, researchData, codexResult, channelResult]) => {
         if (!alive) return;
         setSettings(llmData);
         setForm(toForm(llmData));
         setDataSettings(dataSourceData);
         setResearchSettings(researchData);
+        setCodexManagementExpanded(researchData.deep_research_engine === "codex_cli");
+        setCodexCliModel(researchData.codex_cli_model);
+        setCodexCliReasoningEffort(researchData.codex_cli_reasoning_effort);
+        setCodexStatus(codexResult.status);
+        setCodexLoadError(codexResult.error);
         setChannelStatus(channelResult.status);
         setChannelLoadError(channelResult.error);
         setSettingsLoadError(null);
@@ -155,6 +188,19 @@ export function Settings() {
     () => providers.find((provider) => provider.name === form?.provider),
     [form?.provider, providers],
   );
+  const selectableModels = form
+    ? (modelChoicesByProvider[form.provider] ?? selectedProvider?.models ?? [])
+    : [];
+  const selectedModelOption = selectableModels.find((model) => model.id === form?.model_name);
+  const usingCustomModel = selectableModels.length > 0 && !selectedModelOption;
+  const codexProvider = providers.find((provider) => provider.name === "openai-codex");
+  const codexCliModelOptions = (
+    modelChoicesByProvider["openai-codex"] ?? codexProvider?.models ?? []
+  ).map((model) => ({ ...model, id: toCodexCliModelSlug(model.id) }));
+  const selectedCodexCliModel = codexCliModelOptions.find((model) => model.id === codexCliModel);
+  const codexCliReasoningOptions = selectedCodexCliModel?.reasoning_efforts?.length
+    ? selectedCodexCliModel.reasoning_efforts
+    : ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
   const applyProviderDefaults = (provider = selectedProvider) => {
     if (!provider || !form) return;
@@ -176,6 +222,78 @@ export function Settings() {
     });
     setApiKey("");
     setClearApiKey(false);
+    setModelRefreshNote(null);
+  };
+
+  const refreshAvailableModels = async () => {
+    if (!form || !selectedProvider?.model_discovery) return;
+    const provider = form.provider;
+    setModelRefreshing(true);
+    try {
+      const result = await api.getLLMModels(provider);
+      setModelChoicesByProvider((current) => ({
+        ...current,
+        [provider]: result.models,
+      }));
+      setModelRefreshNote(
+        result.warning
+        || `${result.models.length} models refreshed from ${result.source === "remote" ? "your account" : "project defaults"}.`,
+      );
+      if (result.warning) {
+        toast.warning(result.warning);
+      } else {
+        toast.success(`Found ${result.models.length} available models`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      setModelRefreshNote(message);
+      toast.error(`Unable to refresh models: ${message}`);
+    } finally {
+      setModelRefreshing(false);
+    }
+  };
+
+  const refreshCodexCliModels = async () => {
+    setCodexModelRefreshing(true);
+    try {
+      const result = await api.getLLMModels("openai-codex");
+      setModelChoicesByProvider((current) => ({
+        ...current,
+        "openai-codex": result.models,
+      }));
+      const note = result.warning
+        || i18n.t("settings.codexCli.modelsRefreshed", { count: result.models.length });
+      setCodexModelRefreshNote(note);
+      if (result.warning) toast.warning(result.warning);
+      else toast.success(note);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      setCodexModelRefreshNote(message);
+      toast.error(`${i18n.t("settings.codexCli.modelRefreshFailed")}: ${message}`);
+    } finally {
+      setCodexModelRefreshing(false);
+    }
+  };
+
+  const saveCodexCliPreferences = async () => {
+    if (!researchSettings || researchSaving !== null) return;
+    setResearchSaving("cli_model");
+    try {
+      const updated = await api.updateResearchSettings({
+        codex_cli_model: codexCliModel,
+        codex_cli_reasoning_effort: codexCliReasoningEffort,
+      });
+      setResearchSettings(updated);
+      setCodexCliModel(updated.codex_cli_model);
+      setCodexCliReasoningEffort(updated.codex_cli_reasoning_effort);
+      toast.success(i18n.t("settings.codexCli.modelSettingsSaved"));
+    } catch (error) {
+      toast.error(
+        `${i18n.t("settings.codexCli.modelSettingsSaveFailed")}: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+    } finally {
+      setResearchSaving(null);
+    }
   };
 
   const submitLocalApiKey = (event: FormEvent) => {
@@ -258,6 +376,80 @@ export function Settings() {
     }
   };
 
+  const refreshCodexStatus = async () => {
+    setCodexRefreshing(true);
+    try {
+      const updated = await api.getCodexCliStatus();
+      setCodexStatus(updated);
+      setCodexLoadError(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      setCodexLoadError(message);
+      toast.error(`${i18n.t("settings.codexCli.refreshFailed")}: ${message}`);
+    } finally {
+      setCodexRefreshing(false);
+    }
+  };
+
+  const openCodexLogin = async () => {
+    setCodexLoginOpening(true);
+    try {
+      await api.openCodexCliLogin();
+      toast.success(i18n.t("settings.codexCli.loginOpened"));
+    } catch (error) {
+      toast.error(
+        `${i18n.t("settings.codexCli.loginFailed")}: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+    } finally {
+      setCodexLoginOpening(false);
+    }
+  };
+
+  const copyCodexCommand = async (command: string) => {
+    try {
+      await navigator.clipboard.writeText(command);
+      toast.success(
+        i18n.t(
+          codexStatus?.command_shell === "powershell"
+            ? "settings.codexCli.copiedPowerShell"
+            : "settings.codexCli.copiedTerminal",
+        ),
+      );
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Unable to copy command");
+    }
+  };
+
+  const selectDeepResearchEngine = async (
+    engine: ResearchSettings["deep_research_engine"],
+  ) => {
+    if (!researchSettings || researchSaving !== null) return;
+    if (engine === researchSettings.deep_research_engine) return;
+    if (engine === "codex_cli" && !codexStatus?.ready) {
+      toast.error(codexStatus?.message || i18n.t("settings.codexCli.notReady"));
+      return;
+    }
+    setResearchSaving("engine");
+    try {
+      const updated = await api.updateResearchSettings({ deep_research_engine: engine });
+      setResearchSettings(updated);
+      setCodexManagementExpanded(updated.deep_research_engine === "codex_cli");
+      toast.success(
+        i18n.t(
+          engine === "provider"
+            ? "settings.codexCli.providerSelected"
+            : "settings.codexCli.cliSelected",
+        ),
+      );
+    } catch (error) {
+      toast.error(
+        `${i18n.t("settings.codexCli.saveFailed")}: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+    } finally {
+      setResearchSaving(null);
+    }
+  };
+
   const localApiAccessSection = (
     <form onSubmit={submitLocalApiKey} className="rounded-lg border bg-card p-5 shadow-sm">
       <div className="mb-4 space-y-1">
@@ -332,6 +524,7 @@ export function Settings() {
   const channelLoadedCount = channelRows.filter(([, item]) => item.loaded).length;
   const channelUnavailableCount = channelRows.filter(([, item]) => item.available === false).length;
   const channelBusy = channelRefreshing || channelAction !== null;
+  const codexUsesPowerShell = codexStatus?.command_shell === "powershell";
 
   return (
     <div className="mx-auto max-w-5xl space-y-6 p-6">
@@ -416,6 +609,302 @@ export function Settings() {
                 {researchSaving === "auto" ? <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" /> : null}
               </span>
             </button>
+          </div>
+        </div>
+
+        <div className="mt-5 space-y-4 border-t pt-4">
+          <div className="space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <SlidersHorizontal className="h-4 w-4 text-primary" />
+              <span className="text-sm font-semibold">{i18n.t("settings.codexCli.title")}</span>
+              <span className="rounded-full bg-primary/10 px-2 py-0.5 text-xs text-primary">
+                {researchSettings.deep_research_engine === "provider"
+                  ? i18n.t("settings.codexCli.providerTitle")
+                  : i18n.t("settings.codexCli.cliTitle")}
+              </span>
+            </div>
+            <p className="max-w-3xl text-sm text-muted-foreground">
+              {i18n.t("settings.codexCli.description")}
+            </p>
+          </div>
+
+          <div
+            role="radiogroup"
+            aria-label={i18n.t("settings.codexCli.title")}
+            className="grid gap-3 md:grid-cols-2"
+          >
+            <button
+              type="button"
+              role="radio"
+              aria-checked={researchSettings.deep_research_engine === "provider"}
+              disabled={researchSaving !== null}
+              onClick={() => selectDeepResearchEngine("provider")}
+              className={`rounded-lg border p-4 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60 ${researchSettings.deep_research_engine === "provider" ? "border-primary bg-primary/5 shadow-sm" : "hover:bg-muted/50"}`}
+            >
+              <span className="flex items-start gap-3">
+                <Server className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                <span className="min-w-0 space-y-1">
+                  <span className="flex flex-wrap items-center gap-2 text-sm font-medium">
+                    {i18n.t("settings.codexCli.providerTitle")}
+                    <span className="rounded-full bg-success/10 px-2 py-0.5 text-[11px] text-success">
+                      {i18n.t("settings.codexCli.recommended")}
+                    </span>
+                  </span>
+                  <span className="block text-xs font-normal text-muted-foreground">
+                    {i18n.t("settings.codexCli.providerDescription")}
+                  </span>
+                </span>
+              </span>
+            </button>
+
+            <button
+              type="button"
+              role="radio"
+              aria-checked={researchSettings.deep_research_engine === "codex_cli"}
+              disabled={researchSaving !== null || (!codexStatus?.ready && researchSettings.deep_research_engine !== "codex_cli")}
+              onClick={() => selectDeepResearchEngine("codex_cli")}
+              className={`rounded-lg border p-4 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60 ${researchSettings.deep_research_engine === "codex_cli" ? "border-primary bg-primary/5 shadow-sm" : "hover:bg-muted/50"}`}
+            >
+              <span className="flex items-start gap-3">
+                <Terminal className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                <span className="min-w-0 space-y-1">
+                  <span className="flex flex-wrap items-center gap-2 text-sm font-medium">
+                    {i18n.t("settings.codexCli.cliTitle")}
+                    <span className={`rounded-full px-2 py-0.5 text-[11px] ${codexStatus?.ready ? "bg-blue-500/10 text-blue-700 dark:text-blue-300" : "bg-amber-500/10 text-amber-700 dark:text-amber-300"}`}>
+                      {codexStatus?.ready
+                        ? i18n.t("settings.codexCli.ready")
+                        : i18n.t("settings.codexCli.notReady")}
+                    </span>
+                  </span>
+                  <span className="block text-xs font-normal text-muted-foreground">
+                    {i18n.t("settings.codexCli.cliDescription")}
+                  </span>
+                </span>
+              </span>
+            </button>
+          </div>
+
+          <div className="overflow-hidden rounded-lg border bg-muted/20">
+            <div className="grid gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
+              <button
+                type="button"
+                aria-expanded={codexManagementExpanded}
+                onClick={() => setCodexManagementExpanded((expanded) => !expanded)}
+                className="flex min-w-0 items-start gap-3 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+              >
+                  <span className="rounded-md border bg-background p-2 text-primary">
+                    <Terminal className="h-4 w-4" />
+                  </span>
+                  <span className="min-w-0 flex-1 space-y-1">
+                    <div className="text-sm font-medium">{i18n.t("settings.codexCli.cliManagementTitle")}</div>
+                    <p className="max-w-3xl text-xs leading-5 text-muted-foreground">
+                      {i18n.t("settings.codexCli.oneTimeHint")}
+                    </p>
+                  </span>
+                  <ChevronDown className={`mt-1 h-4 w-4 shrink-0 text-muted-foreground transition-transform ${codexManagementExpanded ? "rotate-180" : ""}`} />
+              </button>
+
+              {codexManagementExpanded ? (
+                <button
+                  type="button"
+                  onClick={refreshCodexStatus}
+                  disabled={codexRefreshing || codexLoginOpening}
+                  className="inline-flex items-center justify-center gap-2 rounded-md border bg-background px-3 py-2 text-xs text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {codexRefreshing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                  {i18n.t("settings.codexCli.refresh")}
+                </button>
+              ) : null}
+            </div>
+
+            {codexManagementExpanded ? (
+              <div className="space-y-4 border-t p-4">
+                <p className="max-w-3xl rounded-md border border-dashed bg-background/60 px-3 py-2 text-xs leading-5 text-muted-foreground">
+                  {i18n.t("settings.codexCli.isolationHint")}
+                </p>
+                <div className="flex items-start gap-3 rounded-md border bg-background/60 px-3 py-2.5">
+                  <Terminal className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                  <div className="space-y-1">
+                    <div className="text-xs font-medium text-foreground">{i18n.t("settings.codexCli.commandLocationTitle")}</div>
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      {i18n.t(
+                        codexUsesPowerShell
+                          ? "settings.codexCli.commandLocationPowerShell"
+                          : "settings.codexCli.commandLocationTerminal",
+                      )}
+                    </p>
+                  </div>
+                </div>
+
+                {codexStatus ? (
+                  <div className="grid gap-4 lg:grid-cols-2">
+                    <section aria-labelledby="codex-version-card-title" className="flex min-w-0 flex-col rounded-lg border bg-background/60 p-4">
+                      <div className="mb-4 flex items-center gap-2">
+                        <Server className="h-4 w-4 text-primary" />
+                        <h3 id="codex-version-card-title" className="text-sm font-medium">
+                          {i18n.t("settings.codexCli.versionManagementTitle")}
+                        </h3>
+                      </div>
+                      <div className="grid grid-cols-3 gap-3 text-xs">
+                        <div className="space-y-1 rounded-md border bg-background px-3 py-2.5">
+                          <div className="text-muted-foreground">{i18n.t("settings.codexCli.version")}</div>
+                          <div className={`font-mono ${codexStatus.version_supported ? "text-foreground" : "text-amber-700 dark:text-amber-300"}`}>
+                            {codexStatus.version || "—"}
+                          </div>
+                        </div>
+                        <div className="space-y-1 rounded-md border bg-background px-3 py-2.5">
+                          <div className="text-muted-foreground">{i18n.t("settings.codexCli.latestVersion")}</div>
+                          <div className="font-mono text-foreground">{codexStatus.latest_version || "—"}</div>
+                        </div>
+                        <div className="space-y-1 rounded-md border bg-background px-3 py-2.5">
+                          <div className="text-muted-foreground">{i18n.t("settings.codexCli.minimumVersion")}</div>
+                          <div className="font-mono text-foreground">{codexStatus.minimum_version}</div>
+                        </div>
+                      </div>
+                      <div className="mt-auto flex justify-end pt-4">
+                        <button
+                          type="button"
+                          onClick={() => copyCodexCommand(codexStatus.install_command)}
+                          className="inline-flex shrink-0 items-center justify-center gap-2 rounded-md border bg-background px-3 py-2 text-xs text-muted-foreground transition hover:bg-muted hover:text-foreground"
+                        >
+                          <Copy className="h-3.5 w-3.5" />
+                          {i18n.t(codexUsesPowerShell ? "settings.codexCli.copyInstallPowerShell" : "settings.codexCli.copyInstallTerminal")}
+                        </button>
+                      </div>
+                    </section>
+
+                    <section aria-labelledby="codex-login-card-title" className="flex min-w-0 flex-col rounded-lg border bg-background/60 p-4">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                          <KeyRound className="h-4 w-4 text-primary" />
+                          <h3 id="codex-login-card-title" className="text-sm font-medium">
+                            {i18n.t("settings.codexCli.loginManagementTitle")}
+                          </h3>
+                        </div>
+                        <span className={`rounded-full px-2 py-0.5 text-[11px] ${codexStatus.auth_state === "authenticated" ? "bg-success/10 text-success" : "bg-amber-500/10 text-amber-700 dark:text-amber-300"}`}>
+                          {codexStatus.auth_state === "authenticated"
+                            ? i18n.t("settings.codexCli.authenticated")
+                            : i18n.t("settings.codexCli.unauthenticated")}
+                        </span>
+                      </div>
+                      <p className={`text-xs leading-5 ${codexLoadError || !codexStatus.ready ? "text-amber-700 dark:text-amber-300" : "text-muted-foreground"}`}>
+                        {codexLoadError || codexStatus.message || i18n.t("settings.codexCli.notReady")}
+                      </p>
+                      {codexStatus.environment !== "native" ? (
+                        <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
+                          {i18n.t("settings.codexCli.remoteHint")}
+                        </p>
+                      ) : null}
+                      <div className="mt-auto flex flex-wrap gap-2 pt-4">
+                        {codexStatus.can_launch_login ? (
+                          <button
+                            type="button"
+                            onClick={openCodexLogin}
+                            disabled={codexRefreshing || codexLoginOpening}
+                            className="inline-flex items-center justify-center gap-2 rounded-md bg-primary px-3 py-2 text-xs font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {codexLoginOpening ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Terminal className="h-3.5 w-3.5" />}
+                            {i18n.t(codexUsesPowerShell ? "settings.codexCli.openLoginPowerShell" : "settings.codexCli.openLogin")}
+                          </button>
+                        ) : null}
+                        <button
+                          type="button"
+                          onClick={() => copyCodexCommand(codexStatus.login_command)}
+                          className="inline-flex items-center justify-center gap-2 rounded-md border bg-background px-3 py-2 text-xs text-muted-foreground transition hover:bg-muted hover:text-foreground"
+                        >
+                          <Copy className="h-3.5 w-3.5" />
+                          {i18n.t(codexUsesPowerShell ? "settings.codexCli.copyLoginPowerShell" : "settings.codexCli.copyLoginTerminal")}
+                        </button>
+                      </div>
+                    </section>
+                  </div>
+                ) : (
+                  <p className="text-xs text-amber-700 dark:text-amber-300">
+                    {codexLoadError || i18n.t("settings.codexCli.notReady")}
+                  </p>
+                )}
+
+                <section aria-labelledby="codex-model-card-title" className="rounded-lg border bg-background/60 p-4">
+                  <div className="mb-3 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                    <div className="flex items-start gap-3">
+                      <SlidersHorizontal className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                      <div className="space-y-1">
+                        <h3 id="codex-model-card-title" className="text-sm font-medium">{i18n.t("settings.codexCli.modelSettingsTitle")}</h3>
+                        <p className="max-w-3xl text-xs leading-5 text-muted-foreground">
+                          {i18n.t("settings.codexCli.modelSettingsDescription")}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={refreshCodexCliModels}
+                      disabled={codexModelRefreshing || researchSaving !== null}
+                      aria-label={i18n.t("settings.codexCli.refreshModels")}
+                      className="inline-flex items-center justify-center gap-2 rounded-md border bg-background px-3 py-2 text-xs text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {codexModelRefreshing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                      {i18n.t("settings.codexCli.refreshModels")}
+                    </button>
+                  </div>
+
+                  <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(180px,0.45fr)_auto] md:items-start">
+                    <label className="grid gap-2">
+                      <span className="text-xs font-medium">{i18n.t("settings.codexCli.modelLabel")}</span>
+                      <select
+                        aria-label={i18n.t("settings.codexCli.modelLabel")}
+                        value={codexCliModel}
+                        onChange={(event) => {
+                          const nextModel = event.target.value;
+                          const option = codexCliModelOptions.find((item) => item.id === nextModel);
+                          const efforts = option?.reasoning_efforts ?? [];
+                          setCodexCliModel(nextModel);
+                          if (efforts.length > 0 && !efforts.includes(codexCliReasoningEffort)) {
+                            setCodexCliReasoningEffort(option?.default_reasoning_effort || efforts[0]);
+                          }
+                        }}
+                        className={fieldClass}
+                      >
+                        {!selectedCodexCliModel ? <option value={codexCliModel}>{codexCliModel}</option> : null}
+                        {codexCliModelOptions.map((model) => (
+                          <option key={model.id} value={model.id}>{model.label}</option>
+                        ))}
+                      </select>
+                      <span className={`${hintClass} line-clamp-1`} title={selectedCodexCliModel?.description || i18n.t("settings.codexCli.modelHint")}>
+                        {selectedCodexCliModel?.description || i18n.t("settings.codexCli.modelHint")}
+                      </span>
+                    </label>
+
+                    <label className="grid gap-2">
+                      <span className="text-xs font-medium">{i18n.t("settings.codexCli.reasoningEffortLabel")}</span>
+                      <select
+                        aria-label={i18n.t("settings.codexCli.reasoningEffortLabel")}
+                        value={codexCliReasoningEffort}
+                        onChange={(event) => setCodexCliReasoningEffort(event.target.value)}
+                        className={fieldClass}
+                      >
+                        {codexCliReasoningOptions.map((effort) => (
+                          <option key={effort} value={effort}>{effort}</option>
+                        ))}
+                      </select>
+                      <span className={hintClass}>{i18n.t("settings.codexCli.reasoningEffortHint")}</span>
+                    </label>
+
+                    <button
+                      type="button"
+                      onClick={saveCodexCliPreferences}
+                      disabled={researchSaving !== null || !codexCliModel}
+                      className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 text-xs font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60 md:mt-6"
+                    >
+                      {researchSaving === "cli_model" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                      {i18n.t("settings.codexCli.saveModelSettings")}
+                    </button>
+                  </div>
+                  {codexModelRefreshNote ? (
+                    <p className="mt-2 text-xs text-muted-foreground">{codexModelRefreshNote}</p>
+                  ) : null}
+                </section>
+              </div>
+            ) : null}
           </div>
         </div>
       </section>
@@ -558,15 +1047,49 @@ export function Settings() {
               <span className={hintClass}>{"Changing providers updates the recommended model and endpoint."}</span>
             </label>
 
-            <label className="grid gap-2">
+            <div className="grid gap-2">
               <span className={labelClass}>{"Model"}</span>
               <div className="flex gap-2">
-                <input
-                  value={form.model_name}
-                  onChange={(event) => setForm({ ...form, model_name: event.target.value })}
-                  className={fieldClass}
-                  required
-                />
+                {selectableModels.length > 0 ? (
+                  <select
+                    aria-label="Model"
+                    value={selectedModelOption ? form.model_name : CUSTOM_MODEL_VALUE}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setForm({
+                        ...form,
+                        model_name: value === CUSTOM_MODEL_VALUE ? "" : value,
+                      });
+                    }}
+                    className={fieldClass}
+                  >
+                    {selectableModels.map((model) => (
+                      <option key={model.id} value={model.id}>{model.label}</option>
+                    ))}
+                    <option value={CUSTOM_MODEL_VALUE}>Custom model ID…</option>
+                  </select>
+                ) : (
+                  <input
+                    aria-label="Model"
+                    value={form.model_name}
+                    onChange={(event) => setForm({ ...form, model_name: event.target.value })}
+                    className={fieldClass}
+                    required
+                  />
+                )}
+                {selectedProvider?.model_discovery ? (
+                  <button
+                    type="button"
+                    onClick={refreshAvailableModels}
+                    disabled={modelRefreshing}
+                    className="inline-flex shrink-0 items-center gap-2 rounded-md border px-3 py-2 text-sm text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+                    title="Ask the provider which models this account can use"
+                    aria-label="Refresh available models"
+                  >
+                    {modelRefreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                    <span className="hidden sm:inline">Refresh</span>
+                  </button>
+                ) : null}
                 <button
                   type="button"
                   onClick={() => applyProviderDefaults()}
@@ -577,8 +1100,21 @@ export function Settings() {
                   <span className="hidden sm:inline">{"Use provider defaults"}</span>
                 </button>
               </div>
-              <span className={hintClass}>{"Use the exact model id required by your provider."}</span>
-            </label>
+              {usingCustomModel ? (
+                <input
+                  aria-label="Custom model ID"
+                  value={form.model_name}
+                  onChange={(event) => setForm({ ...form, model_name: event.target.value })}
+                  className={fieldClass}
+                  placeholder="Enter the exact model ID"
+                  required
+                />
+              ) : null}
+              <span className={hintClass}>
+                {selectedModelOption?.description || "Use the exact model id required by your provider."}
+              </span>
+              {modelRefreshNote ? <span className={hintClass}>{modelRefreshNote}</span> : null}
+            </div>
 
             <label className="grid gap-2">
               <span className={labelClass}>{i18n.t("settings.baseUrl")}</span>

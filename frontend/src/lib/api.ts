@@ -385,6 +385,8 @@ export const api = {
   retrySwarmRun: (id: string) =>
     request<{ id: string; status: string; preset_name: string }>(`/swarm/runs/${id}/retry`, { method: "POST" }),
   getLLMSettings: () => request<LLMSettings>("/settings/llm"),
+  getLLMModels: (provider: string) =>
+    request<LLMModelsResponse>(`/settings/llm/models?provider=${encodeURIComponent(provider)}`),
   updateLLMSettings: (settings: UpdateLLMSettingsRequest) =>
     request<LLMSettings>("/settings/llm", {
       method: "PUT",
@@ -402,6 +404,10 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(settings),
     }),
+  getCodexCliStatus: () => request<CodexCliStatus>("/settings/codex-cli/status"),
+  openCodexCliLogin: () => request<CodexCliLoginResult>("/settings/codex-cli/login", {
+    method: "POST",
+  }),
   getChannelStatus: () => request<ChannelRuntimeStatus>("/channels/status"),
   startChannels: () => request<ChannelRuntimeActionResponse>("/channels/start", { method: "POST" }),
   stopChannels: () => request<ChannelRuntimeActionResponse>("/channels/stop", { method: "POST" }),
@@ -762,6 +768,24 @@ export interface LLMProviderOption {
   api_key_required: boolean;
   auth_type?: string;
   login_command?: string | null;
+  model_discovery?: "codex_oauth" | null;
+  models?: LLMModelOption[];
+}
+
+export interface LLMModelOption {
+  id: string;
+  label: string;
+  description?: string;
+  default_reasoning_effort?: string;
+  reasoning_efforts?: string[];
+}
+
+export interface LLMModelsResponse {
+  provider: string;
+  models: LLMModelOption[];
+  source: "remote" | "configured";
+  refreshed_at?: string | null;
+  warning?: string | null;
 }
 
 export interface LLMSettings {
@@ -812,6 +836,12 @@ export interface ResearchSettings {
   equity_deep_research_enabled: boolean;
   monitor_auto_deep_report_enabled: boolean;
   effective_monitor_auto_deep_report_enabled: boolean;
+  deep_research_engine: "provider" | "codex_cli";
+  codex_cli_enabled: boolean;
+  codex_cli_ready: boolean;
+  effective_codex_cli_enabled: boolean;
+  codex_cli_model: string;
+  codex_cli_reasoning_effort: string;
   enabled_profiles: string[];
   available_profiles: string[];
   env_path: string;
@@ -820,6 +850,34 @@ export interface ResearchSettings {
 export interface UpdateResearchSettingsRequest {
   deep_report_enabled?: boolean;
   monitor_auto_deep_report_enabled?: boolean;
+  deep_research_engine?: "provider" | "codex_cli";
+  /** @deprecated Use deep_research_engine. */
+  codex_cli_enabled?: boolean;
+  codex_cli_model?: string;
+  codex_cli_reasoning_effort?: string;
+}
+
+export interface CodexCliStatus {
+  installed: boolean;
+  version?: string | null;
+  latest_version?: string | null;
+  minimum_version: string;
+  version_supported: boolean;
+  auth_state: "authenticated" | "unauthenticated" | "error" | "unavailable";
+  ready: boolean;
+  environment: "native" | "container" | "remote";
+  command_shell: "powershell" | "terminal";
+  can_launch_login: boolean;
+  login_command: string;
+  install_command: string;
+  message: string;
+}
+
+export interface CodexCliLoginResult {
+  launched: boolean;
+  manual_required: boolean;
+  command: string;
+  message: string;
 }
 
 export interface ChannelAdapterStatus {

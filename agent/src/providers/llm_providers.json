@@ -19,14 +19,38 @@
   },
   {
     "name": "openai-codex",
-    "label": "OpenAI Codex (ChatGPT OAuth)",
+    "label": "OpenAI Codex (Legacy direct OAuth Provider)",
     "api_key_env": null,
     "base_url_env": "OPENAI_CODEX_BASE_URL",
-    "default_model": "openai-codex/gpt-5.3-codex",
+    "default_model": "openai-codex/gpt-5.6-terra",
     "default_base_url": "https://chatgpt.com/backend-api/codex/responses",
     "api_key_required": false,
     "auth_type": "oauth",
-    "login_command": "vibe-trading provider login openai-codex"
+    "login_command": "vibe-trading provider login openai-codex",
+    "model_discovery": "codex_oauth",
+    "models": [
+      {
+        "id": "openai-codex/gpt-5.6-sol",
+        "label": "GPT-5.6 Sol",
+        "description": "Frontier model for complex professional research and coding.",
+        "default_reasoning_effort": "low",
+        "reasoning_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"]
+      },
+      {
+        "id": "openai-codex/gpt-5.6-terra",
+        "label": "GPT-5.6 Terra",
+        "description": "Balanced model for everyday research, intelligence, and usage.",
+        "default_reasoning_effort": "medium",
+        "reasoning_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"]
+      },
+      {
+        "id": "openai-codex/gpt-5.6-luna",
+        "label": "GPT-5.6 Luna",
+        "description": "Fast model for cost-sensitive and high-volume workloads.",
+        "default_reasoning_effort": "medium",
+        "reasoning_efforts": ["low", "medium", "high", "xhigh", "max"]
+      }
+    ]
   },
   {
     "name": "deepseek",

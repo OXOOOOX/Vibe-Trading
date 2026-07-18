@@ -14,11 +14,12 @@ from src.providers.openai_codex import (
     _events_from_lines,
     _message_chunks_from_events,
     _strip_model_prefix,
+    list_openai_codex_models,
     validate_codex_base_url,
 )
 
 
-DEFAULT_CODEX_MODEL = "openai-codex/gpt-5.3-codex"
+DEFAULT_CODEX_MODEL = "openai-codex/gpt-5.6-terra"
 
 
 def test_provider_default_model_matches_live_codex_account_path() -> None:
@@ -68,8 +69,8 @@ def test_codex_body_strips_provider_prefix_and_converts_tools() -> None:
         stream=True,
     )
 
-    assert _strip_model_prefix(DEFAULT_CODEX_MODEL) == "gpt-5.3-codex"
-    assert body["model"] == "gpt-5.3-codex"
+    assert _strip_model_prefix(DEFAULT_CODEX_MODEL) == "gpt-5.6-terra"
+    assert body["model"] == "gpt-5.6-terra"
     assert body["instructions"] == "You are careful."
     assert body["tools"][0]["name"] == "bash"
     assert body["input"][0]["content"][0]["text"] == "Say hi."
@@ -147,3 +148,72 @@ def test_stream_non_200_response_raises_http_error(monkeypatch: pytest.MonkeyPat
 
     with pytest.raises(RuntimeError, match="OpenAI Codex HTTP 401"):
         list(adapter.stream([{"role": "user", "content": "hello"}]))
+
+
+def test_model_discovery_returns_only_visible_api_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeResponse:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json() -> dict:
+            return {
+                "models": [
+                    {
+                        "slug": "gpt-5.6-terra",
+                        "display_name": "GPT-5.6-Terra",
+                        "description": "Balanced",
+                        "visibility": "list",
+                        "supported_in_api": True,
+                        "default_reasoning_level": "medium",
+                        "supported_reasoning_levels": [
+                            {"effort": "low"},
+                            {"effort": "medium"},
+                        ],
+                    },
+                    {
+                        "slug": "gpt-hidden",
+                        "visibility": "hide",
+                        "supported_in_api": True,
+                    },
+                    {
+                        "slug": "gpt-cli-only",
+                        "visibility": "list",
+                        "supported_in_api": False,
+                    },
+                ]
+            }
+
+    class _FakeClient:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> "_FakeClient":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def get(self, *args: object, **kwargs: object) -> _FakeResponse:
+            assert kwargs["params"] == {"client_version": "0.145.0"}
+            assert kwargs["headers"]["accept"] == "application/json"
+            return _FakeResponse()
+
+    import src.providers.openai_codex as codex_mod
+
+    monkeypatch.setattr(codex_mod, "_headers_for_json_request", lambda: {"accept": "application/json"})
+    monkeypatch.setattr(codex_mod.httpx, "Client", _FakeClient)
+
+    models = list_openai_codex_models(client_version="0.145.0")
+
+    assert models == [
+        {
+            "id": "openai-codex/gpt-5.6-terra",
+            "label": "GPT-5.6-Terra",
+            "description": "Balanced",
+            "default_reasoning_effort": "medium",
+            "reasoning_efforts": ["low", "medium"],
+        }
+    ]

@@ -20,6 +20,10 @@ from src.session.models import Attempt, AttemptStatus, Message, Session
 from src.session.search import get_shared_index
 from src.session.store import SessionStore
 from src.usage import UsageRecorder, UsageStore, bind_usage_recorder
+from src.reports.execution import (
+    DEEP_RESEARCH_ENGINE_CODEX_CLI,
+    resolve_deep_research_engine,
+)
 
 if TYPE_CHECKING:
     from src.agent.loop import AgentLoop
@@ -214,6 +218,11 @@ class SessionService:
         self.usage_store = usage_store or UsageStore(store.base_dir.parent / "sessions.db")
         self._active_loops: Dict[str, "AgentLoop"] = {}
         self._session_locks: Dict[str, asyncio.Lock] = {}
+        try:
+            codex_concurrency = int(os.getenv("VIBE_TRADING_CODEX_MAX_CONCURRENCY", "1"))
+        except ValueError:
+            codex_concurrency = 1
+        self._codex_semaphore = asyncio.Semaphore(max(1, codex_concurrency))
         # Web chat asks for an id before it can open the SSE stream.  Keep that
         # id in memory only; the session becomes durable when the first message
         # is accepted.  Abandoned composers therefore never become empty
@@ -1125,6 +1134,10 @@ class SessionService:
         raw = os.getenv("VIBE_TRADING_DEEP_REPORT_PROFILES", "equity_deep_research")
         return {item.strip() for item in raw.split(",") if item.strip()}
 
+    @staticmethod
+    def _codex_cli_enabled() -> bool:
+        return resolve_deep_research_engine() == DEEP_RESEARCH_ENGINE_CODEX_CLI
+
     async def _run_with_agent(
         self,
         attempt: Attempt,
@@ -1177,7 +1190,6 @@ class SessionService:
             attempt_id=attempt_id,
             notify=_usage_notify,
         )
-        llm = ChatLLM()
         pm = PersistentMemory()
 
         safe_overrides = sanitize_session_overrides(session_config) if session_config else session_config
@@ -1364,6 +1376,41 @@ class SessionService:
                     name for name in (research_tool_names or [])
                     if name != "analyze_financial_snapshot"
                 ]
+
+        history = self._convert_messages_to_history(messages) if messages else None
+        if is_equity_deep_report and self._codex_cli_enabled():
+            from src.codex_cli import CodexResearchRunner
+
+            report_id = str(attempt.metadata.get("report_id") or "")
+            if not report_id:
+                return {
+                    "status": "failed",
+                    "reason": "codex_protocol_error: active Deep Report has no report_id",
+                    "error_code": "codex_protocol_error",
+                    "react_trace": [],
+                }
+            runner = CodexResearchRunner(
+                session_id=session_id,
+                attempt_id=attempt_id,
+                report_id=report_id,
+                report_profile="equity_deep_research",
+                revision_mode=str(attempt.metadata.get("revision_mode") or "initial"),
+                prompt=attempt.prompt,
+                history=history,
+                reports_dir=self.deep_reports.base_dir,
+                allowed_tools=list(research_tool_names or ["report_workspace"]),
+                financial_rigor_commands=_EQUITY_DEEP_FINANCIAL_COMMANDS,
+                event_callback=event_callback,
+                usage_recorder=usage_recorder,
+                semaphore=self._codex_semaphore,
+            )
+            self._active_loops[session_id] = runner  # type: ignore[assignment]
+            try:
+                return await runner.run()
+            finally:
+                self._active_loops.pop(session_id, None)
+
+        llm = ChatLLM()
         if research_tool_names is not None:
             registry = await loop.run_in_executor(
                 _AGENT_EXECUTOR,
@@ -1407,9 +1454,6 @@ class SessionService:
             usage_recorder=usage_recorder,
         )
         self._active_loops[session_id] = agent
-
-        # Build the message history context.
-        history = self._convert_messages_to_history(messages) if messages else None
 
         try:
             def _execute_scoped_agent() -> Dict[str, Any]:
