@@ -22,6 +22,10 @@ class _FakeHTML:
         return b"%PDF-fake"
 
 
+def test_reportlab_glyph_normalization_uses_visible_cjk_currency_symbol() -> None:
+    assert api_server._normalize_reportlab_glyphs("¥37.80\u2011test") == "￥37.80-test"
+
+
 def test_generate_response_pdf_returns_download(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "weasyprint", SimpleNamespace(HTML=_FakeHTML))
     client = TestClient(api_server.app)

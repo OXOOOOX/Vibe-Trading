@@ -17,6 +17,9 @@ results/
 .env
 agent/.env
 
+# Local licensed monitor media; never commit these assets.
+agent/.local-assets/
+
 .claude/*
 !.claude/hooks.json
 CLAUDE.md
@@ -24,6 +27,9 @@ CLAUDE.md
 learn-claude-code-main/
 agent/sessions/
 agent/runs/
+agent/reports/
+agent/logs/
+agent/*.log
 agent/.ui_runtime/
 agent/.tasks/
 agent/uploads/
@@ -81,6 +87,8 @@ agent/tests/test_e2e_*.py
 
 # Local working notes
 NOTES.md
+/design-qa.md
+/tmp/
 
 # Local PDF/render validation artifacts
 /*.pdf

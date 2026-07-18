@@ -47,11 +47,13 @@ class ChannelManager:
         *,
         session_service: Any | None = None,
         cron_service: Any | None = None,
+        monitor_binding_claimer: Any | None = None,
     ) -> None:
         self.config = config
         self.bus = bus
         self._session_service = session_service
         self._cron_service = cron_service
+        self._monitor_binding_claimer = monitor_binding_claimer
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         self._origin_reply_fingerprints: dict[tuple[str, str, str], str] = {}
@@ -151,6 +153,8 @@ class ChannelManager:
                 "restrict_to_workspace": self._global_bool("restrict_to_workspace", False),
                 "workspace": get_workspace_path(),
             }
+        if name == "feishu":
+            return {"monitor_binding_claimer": self._monitor_binding_claimer}
         return {}
 
     def _get_channel_config(self, name: str) -> dict | None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import re
 import time
 from urllib.parse import urlsplit
 
@@ -113,24 +114,61 @@ def read_url(url: str, no_cache: bool = False) -> str:
                 "error": f"remote reader returned HTTP {resp.status_code}: {resp.text[:500]}",
             }, ensure_ascii=False)
 
-        text = resp.text
+        full_text = resp.text
+        text = full_text
         title = ""
         for line in text.split("\n"):
             if line.startswith("Title:"):
                 title = line[6:].strip()
                 break
 
+        published_at = ""
+        published_match = re.search(
+            r"(?im)^(?:Published Time|Publication Date|Published At):\s*(.+?)\s*$",
+            full_text,
+        )
+        if published_match:
+            published_at = published_match.group(1).strip()
+
+        knowledge_payload: dict[str, object] = {}
+        try:
+            from src.research import get_research_knowledge_store, knowledge_enabled
+
+            if knowledge_enabled():
+                stored = get_research_knowledge_store().store_document(
+                    url=target_url,
+                    content=full_text,
+                    title=title,
+                    published_at=published_at or None,
+                    cached_status=("jina_cache" if _CACHED_MARKER in full_text else "network"),
+                )
+                knowledge_payload = {
+                    "document_ref": stored.document_ref,
+                    "canonical_url": stored.canonical_url,
+                    "content_hash": stored.content_hash,
+                    "published_at": published_at or None,
+                    "chunk_catalog": stored.chunk_catalog,
+                }
+        except Exception as exc:
+            # Knowledge capture is a shadow-write path. A local indexing issue
+            # must not turn a successfully fetched source into a failed read.
+            logger.warning("research knowledge document capture failed: %s", exc)
+
         if len(text) > _MAX_LENGTH:
-            text = text[:_MAX_LENGTH] + f"\n\n... (truncated, total {len(resp.text)} chars)"
+            text = text[:_MAX_LENGTH] + (
+                f"\n\n... (preview truncated, total {len(full_text)} chars; "
+                "use read_research_document with document_ref/chunk_ref for the remainder)"
+            )
 
         result = {
             "status": "ok",
             "title": title,
             "url": target_url,
             "content": text,
-            "length": len(resp.text),
+            "length": len(full_text),
+            **knowledge_payload,
         }
-        if _CACHED_MARKER in resp.text:
+        if _CACHED_MARKER in full_text:
             result["cached"] = True
         cached = bool(result.get("cached"))
         record_current_resource(

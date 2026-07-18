@@ -24,7 +24,12 @@ import uuid
 import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
+
+if TYPE_CHECKING:
+    from src.scheduled_research.executor import ScheduledResearchExecutor
+    from src.scheduled_research.models import ScheduledResearchJob
+    from src.scheduled_research.store import ScheduledResearchJobStore
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Security, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -207,6 +212,18 @@ class DataSourceSettingsResponse(BaseModel):
     env_path: str
 
 
+class ResearchSettingsResponse(BaseModel):
+    """Runtime feature gates for user-triggered research products."""
+
+    deep_report_enabled: bool
+    equity_deep_research_enabled: bool
+    monitor_auto_deep_report_enabled: bool
+    effective_monitor_auto_deep_report_enabled: bool
+    enabled_profiles: List[str]
+    available_profiles: List[str]
+    env_path: str
+
+
 class PortfolioReviewResponse(BaseModel):
     """Read-only structured portfolio and verified market-data cache snapshot."""
 
@@ -237,10 +254,10 @@ class UpdatePortfolioCashRequest(BaseModel):
 
 
 class RecordPortfolioTradeRequest(BaseModel):
-    """Persist one complete, resolved A-share trade into structured portfolio state."""
+    """Persist one complete, resolved equity trade into structured portfolio state."""
 
-    code: str = Field(..., pattern=r"^\d{6}$")
-    symbol: str = Field(..., min_length=8, max_length=16)
+    code: str = Field(..., pattern=r"^(?:\d{6}|[A-Za-z][A-Za-z0-9]{0,9}(?:\.[A-Za-z])?)$")
+    symbol: str = Field(..., min_length=3, max_length=16)
     name: str = Field(..., min_length=1, max_length=200)
     side: Literal["buy", "sell"]
     quantity: float = Field(..., gt=0)
@@ -257,7 +274,7 @@ class EditPortfolioHoldingRequest(BaseModel):
 
 
 class PortfolioSecurityLookupResponse(BaseModel):
-    """One exact, network-resolved A-share security."""
+    """One exact, network-resolved equity security."""
 
     code: str
     symbol: str
@@ -325,6 +342,13 @@ class UpdateDataSourceSettingsRequest(BaseModel):
     clear_tushare_token: bool = False
 
 
+class UpdateResearchSettingsRequest(BaseModel):
+    """Update the user-facing Deep Report feature gate."""
+
+    deep_report_enabled: Optional[bool] = None
+    monitor_auto_deep_report_enabled: Optional[bool] = None
+
+
 class GeneratePdfRequest(BaseModel):
     """Generate a downloadable PDF from one assistant Markdown response."""
 
@@ -353,6 +377,9 @@ class SessionResponse(BaseModel):
 class SendMessageRequest(BaseModel):
     """Send chat message: natural-language strategy description."""
     content: str = Field(..., description="Natural language strategy description", min_length=1, max_length=5000)
+    response_mode: Literal["chat", "deep_report"] = "chat"
+    report_profile: Optional[Literal["equity_deep_research"]] = None
+    routing_decision_id: Optional[str] = Field(None, max_length=100)
 
 
 class EditMessageRequest(BaseModel):
@@ -771,24 +798,38 @@ async def _spa_html_deep_link_fallback(request: Request, call_next):
 @app.on_event("startup")
 async def _run_startup_preflight() -> None:
     """Run preflight checks on server startup."""
+    global _runtime_event_loop
+    _runtime_event_loop = asyncio.get_running_loop()
     from src.preflight import run_preflight
 
     run_preflight(console)
     from src.market_cache import get_market_refresh_service
 
     get_market_refresh_service().prepare_startup()
+    session_service = _get_session_service()
+    if session_service is not None:
+        recovered_attempts = session_service.recover_interrupted_attempts()
+        if recovered_attempts:
+            logger.warning(
+                "reconciled %s interrupted session attempt(s) after restart",
+                recovered_attempts,
+            )
     _start_scheduled_research_executor()
-    dispatcher = _get_session_dispatcher()
-    if dispatcher is not None:
-        dispatcher.start()
     if _env_flag_enabled("VIBE_TRADING_CHANNELS_AUTO_START"):
         await _start_channel_runtime()
+    else:
+        dispatcher = _get_session_dispatcher()
+        if dispatcher is not None:
+            dispatcher.start()
     await _get_portfolio_daily_scheduler().start()
+    await _get_portfolio_monitoring_runtime().start()
 
 
 @app.on_event("shutdown")
 async def _stop_scheduled_research_on_shutdown() -> None:
     """Stop channel, message-dispatch, and scheduled workers on shutdown."""
+    if _portfolio_monitoring_runtime is not None:
+        await _portfolio_monitoring_runtime.stop()
     if _portfolio_daily_scheduler is not None:
         await _portfolio_daily_scheduler.stop()
     await _stop_channel_runtime()
@@ -1103,6 +1144,7 @@ LLM_PROVIDER_BY_NAME = {provider.name: provider for provider in LLM_PROVIDERS}
 LLM_REASONING_EFFORTS = {"", "low", "medium", "high", "max"}
 LLM_API_KEY_PLACEHOLDERS = {"", "sk-or-v1-your-key-here", "sk-xxx", "xxx", "gsk_xxx"}
 TUSHARE_TOKEN_PLACEHOLDERS = {"", "your-tushare-token"}
+DEEP_REPORT_PROFILES = ("equity_deep_research",)
 
 
 def _ensure_agent_env_file() -> Path:
@@ -1289,12 +1331,62 @@ def _build_data_source_settings_response(values: Optional[Dict[str, str]] = None
     )
 
 
-def _load_verified_market_cache(limit: int = 50) -> tuple[str, List[Dict[str, Any]]]:
+def _build_research_settings_response(values: Optional[Dict[str, str]] = None) -> ResearchSettingsResponse:
+    """Build the Deep Report feature-gate payload from project-local settings."""
+    env_values = values if values is not None else _read_settings_env_values()
+    enabled_value = env_values.get("VIBE_TRADING_DEEP_REPORT_ENABLED", "0").strip().lower()
+    deep_report_enabled = enabled_value not in {"0", "false", "no", "off"}
+    auto_value = env_values.get(
+        "VIBE_TRADING_MONITOR_AUTO_DEEP_REPORT_ENABLED",
+        "0",
+    ).strip().lower()
+    monitor_auto_deep_report_enabled = auto_value in {"1", "true", "yes", "on"}
+    configured_profiles = {
+        item.strip()
+        for item in env_values.get(
+            "VIBE_TRADING_DEEP_REPORT_PROFILES",
+            "equity_deep_research",
+        ).split(",")
+        if item.strip()
+    }
+    enabled_profiles = [profile for profile in DEEP_REPORT_PROFILES if profile in configured_profiles]
+    return ResearchSettingsResponse(
+        deep_report_enabled=deep_report_enabled,
+        equity_deep_research_enabled=(
+            deep_report_enabled and "equity_deep_research" in enabled_profiles
+        ),
+        monitor_auto_deep_report_enabled=monitor_auto_deep_report_enabled,
+        effective_monitor_auto_deep_report_enabled=(
+            deep_report_enabled
+            and "equity_deep_research" in enabled_profiles
+            and monitor_auto_deep_report_enabled
+        ),
+        enabled_profiles=enabled_profiles,
+        available_profiles=list(DEEP_REPORT_PROFILES),
+        env_path=_project_relative_path(ENV_PATH),
+    )
+
+
+def _load_verified_market_cache(
+    limit: int = 50,
+    *,
+    symbols: List[str] | None = None,
+) -> tuple[str, List[Dict[str, Any]]]:
     from src.market_cache import get_market_refresh_service
     from src.market_verification import verified_cache_dir
 
     service = get_market_refresh_service()
-    sqlite_rows = service.store.cache_summaries(limit=limit)
+    normalized_symbols = (
+        {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
+        if symbols is not None
+        else None
+    )
+    if normalized_symbols is not None and not normalized_symbols:
+        return str(service.store.path), []
+    sqlite_rows = service.store.cache_summaries(
+        limit=limit,
+        symbols=sorted(normalized_symbols) if normalized_symbols is not None else None,
+    )
     if sqlite_rows:
         return str(service.store.path), sqlite_rows
 
@@ -1308,11 +1400,14 @@ def _load_verified_market_cache(limit: int = 50) -> tuple[str, List[Dict[str, An
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
-    for path in files[:limit]:
+    for path in files:
         modified_at = datetime.fromtimestamp(path.stat().st_mtime).isoformat()
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
+            inferred_symbol = path.name.split("__", 1)[0].upper()
+            if normalized_symbols is not None and inferred_symbol not in normalized_symbols:
+                continue
             rows.append(
                 {
                     "file_name": path.name,
@@ -1322,27 +1417,33 @@ def _load_verified_market_cache(limit: int = 50) -> tuple[str, List[Dict[str, An
                     "modified_at": modified_at,
                 }
             )
+            if len(rows) >= limit:
+                break
             continue
         if not isinstance(payload, dict):
             continue
-        rows.append(
-            {
-                "file_name": path.name,
-                "path": str(path),
-                "symbol": payload.get("symbol"),
-                "status": payload.get("status"),
-                "consensus_close": payload.get("consensus_close"),
-                "spread_pct": payload.get("spread_pct"),
-                "requested_adjustment": payload.get("requested_adjustment"),
-                "source_adjustments": payload.get("source_adjustments"),
-                "sources": payload.get("sources"),
-                "observations": payload.get("observations"),
-                "verified_at": payload.get("verified_at"),
-                "start_date": payload.get("start_date"),
-                "end_date": payload.get("end_date"),
-                "modified_at": modified_at,
-            }
-        )
+        item = {
+            "file_name": path.name,
+            "path": str(path),
+            "symbol": payload.get("symbol"),
+            "status": payload.get("status"),
+            "consensus_close": payload.get("consensus_close"),
+            "spread_pct": payload.get("spread_pct"),
+            "requested_adjustment": payload.get("requested_adjustment"),
+            "source_adjustments": payload.get("source_adjustments"),
+            "sources": payload.get("sources"),
+            "observations": payload.get("observations"),
+            "verified_at": payload.get("verified_at"),
+            "start_date": payload.get("start_date"),
+            "end_date": payload.get("end_date"),
+            "modified_at": modified_at,
+        }
+        item_symbol = str(item.get("symbol") or "").strip().upper()
+        if normalized_symbols is not None and item_symbol not in normalized_symbols:
+            continue
+        rows.append(item)
+        if len(rows) >= limit:
+            break
     return str(cache_dir), rows
 
 
@@ -1415,12 +1516,21 @@ def _build_portfolio_review(
     from src.portfolio.state import state_path
 
     service = get_market_refresh_service()
-    cache_dir, market_cache = _load_verified_market_cache(limit=limit)
     symbols = [
         str(row.get("symbol") or row.get("code") or "").upper()
         for row in state.holdings
         if row.get("symbol") or row.get("code")
     ]
+    cache_dir, market_cache = _load_verified_market_cache(
+        limit=limit,
+        symbols=symbols,
+    )
+    holding_symbols = set(symbols)
+    market_cache = [
+        row
+        for row in market_cache
+        if str(row.get("symbol") or "").strip().upper() in holding_symbols
+    ][:limit]
     return PortfolioReviewResponse(
         status="ok",
         portfolio_path=str(state_path()),
@@ -1428,7 +1538,7 @@ def _build_portfolio_review(
         verified_cache_dir=cache_dir,
         verified_market_cache=market_cache,
         market_cache_db=str(service.store.path),
-        market_cache_coverage=service.store.list_coverage(symbols or None),
+        market_cache_coverage=service.store.list_coverage(symbols) if symbols else [],
         active_market_refresh=service.store.latest_active_run(),
         market_refresh=market_refresh,
     )
@@ -1763,6 +1873,91 @@ async def get_run_pine(run_id: str):
     }
 
 
+_MAX_REPORT_PREVIEW_BYTES = 4 * 1024 * 1024
+_REPORT_FILENAME_MARKERS = (
+    "穿透式",
+    "深度研究",
+    "研究报告",
+    "报告",
+    "research",
+    "report",
+)
+
+
+def _run_report_preview_path(run_dir: Path) -> Optional[Path]:
+    """Select the most likely Markdown report without leaving ``run_dir``."""
+    root = run_dir.resolve()
+    candidates: List[Path] = []
+    for pattern in ("*.md", "artifacts/*.md"):
+        for candidate in run_dir.glob(pattern):
+            try:
+                resolved = candidate.resolve()
+                resolved.relative_to(root)
+            except (OSError, ValueError):
+                continue
+            try:
+                size = resolved.stat().st_size
+            except OSError:
+                continue
+            if resolved.is_file() and 0 < size <= _MAX_REPORT_PREVIEW_BYTES:
+                candidates.append(resolved)
+
+    if not candidates:
+        return None
+
+    def score(path: Path) -> tuple[int, int, int, str]:
+        name = path.name.casefold()
+        marker_score = sum(1 for marker in _REPORT_FILENAME_MARKERS if marker in name)
+        root_score = 1 if path.parent == root else 0
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        return marker_score, root_score, size, name
+
+    return max(candidates, key=score)
+
+
+def _markdown_preview_title(content: str, fallback: str) -> str:
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            title = stripped[2:].strip()
+            if title:
+                return title
+    return Path(fallback).stem
+
+
+@app.get("/runs/{run_id}/report-preview", dependencies=[Depends(require_auth)])
+async def get_run_report_preview(run_id: str):
+    """Return a safe, read-only Markdown preview for a run-produced report."""
+    _validate_path_param(run_id, "run_id")
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.is_dir():
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    report_path = _run_report_preview_path(run_dir)
+    if report_path is None:
+        raise HTTPException(status_code=404, detail="Markdown report not found for this run")
+
+    try:
+        content = report_path.read_text(encoding="utf-8")
+        stat = report_path.stat()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="Unable to read Markdown report") from exc
+
+    report_relative = report_path.relative_to(run_dir.resolve()).as_posix()
+    return {
+        "run_id": run_id,
+        "title": _markdown_preview_title(content, report_path.name),
+        "filename": report_path.name,
+        "relative_path": f"agent/runs/{run_id}/{report_relative}",
+        "content": content,
+        "updated_at": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(),
+        "source": "run_artifact",
+    }
+
+
 @app.get("/runs/{run_id}", response_model=RunResponse, dependencies=[Depends(require_auth)])
 async def get_run_result(
     run_id: str,
@@ -2015,25 +2210,96 @@ async def update_data_source_settings(payload: UpdateDataSourceSettingsRequest):
 
 
 @app.get(
+    "/settings/research",
+    response_model=ResearchSettingsResponse,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def get_research_settings():
+    """Return the effective Deep Report feature gate and Profile whitelist."""
+    return _build_research_settings_response()
+
+
+@app.put(
+    "/settings/research",
+    response_model=ResearchSettingsResponse,
+    dependencies=[Depends(require_settings_write_auth)],
+)
+async def update_research_settings(payload: UpdateResearchSettingsRequest):
+    """Persist the Deep Report gate and apply it to new requests immediately."""
+    if payload.deep_report_enabled is None and payload.monitor_auto_deep_report_enabled is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one research setting must be provided",
+        )
+    current = _build_research_settings_response(_read_settings_env_values())
+    deep_report_enabled = (
+        payload.deep_report_enabled
+        if payload.deep_report_enabled is not None
+        else current.deep_report_enabled
+    )
+    monitor_auto_enabled = (
+        payload.monitor_auto_deep_report_enabled
+        if payload.monitor_auto_deep_report_enabled is not None
+        else current.monitor_auto_deep_report_enabled
+    )
+    # Disabling the parent capability also revokes autonomous generation. This
+    # keeps the automation consent explicit instead of leaving a hidden armed
+    # setting that would reactivate later.
+    if not deep_report_enabled:
+        monitor_auto_enabled = False
+    updates = {
+        "VIBE_TRADING_DEEP_REPORT_ENABLED": "1" if deep_report_enabled else "0",
+        "VIBE_TRADING_MONITOR_AUTO_DEEP_REPORT_ENABLED": "1" if monitor_auto_enabled else "0",
+        # The first release exposes exactly one audited Profile. Keeping the
+        # whitelist explicit prevents future Profiles from becoming active
+        # merely because the total switch is enabled.
+        "VIBE_TRADING_DEEP_REPORT_PROFILES": "equity_deep_research",
+    }
+    _write_env_values(ENV_PATH, updates)
+    os.environ.update(updates)
+    return _build_research_settings_response(_read_env_values(ENV_PATH))
+
+
+@app.get(
     "/portfolio/security-lookup",
     response_model=PortfolioSecurityLookupResponse,
     dependencies=[Depends(require_local_or_auth)],
 )
-async def lookup_portfolio_security(code: str = Query(..., pattern=r"^\d{6}$")):
-    """Resolve one complete six-digit A-share code through live symbol search."""
-    from src.portfolio.state import normalize_symbol
-    from src.tools.symbol_search_tool import lookup_exact_ashare
+async def lookup_portfolio_security(code: str = Query(..., min_length=1, max_length=16)):
+    """Resolve one complete A-share code or U.S. ticker through live search."""
+    from src.market_cache import get_market_refresh_service
+    from src.tools.symbol_search_tool import lookup_exact_security
 
-    exact, source_status = await asyncio.to_thread(lookup_exact_ashare, code)
+    normalized_code = str(code).strip().upper()
+    if not (
+        re.fullmatch(r"\d{6}", normalized_code)
+        or re.fullmatch(
+            r"[A-Z][A-Z0-9]{0,9}(?:\.[A-Z])?(?:\.US)?",
+            normalized_code,
+        )
+        or re.fullmatch(r"\d{5,6}\.(?:SH|SZ|BJ|HK)", normalized_code)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="请输入完整证券代码，例如 000905.SH、588870 或 AAPL。",
+        )
+
+    exact, source_status = await asyncio.to_thread(lookup_exact_security, normalized_code)
     if source_status != "ok":
         raise HTTPException(status_code=503, detail="证券联网查询暂不可用，请稍后重试。")
-    expected_symbol = normalize_symbol(code)
     if exact is None:
-        raise HTTPException(status_code=404, detail=f"未找到证券代码 {code}，请检查后重试。")
+        raise HTTPException(status_code=404, detail=f"未找到证券代码 {normalized_code}，请检查后重试。")
+    expected_symbol = str(exact["symbol"]).strip().upper()
+    resolved_name = str(exact["name"]).strip()
+    await asyncio.to_thread(
+        get_market_refresh_service().store.upsert_instrument,
+        expected_symbol,
+        name=resolved_name,
+    )
     return PortfolioSecurityLookupResponse(
-        code=code,
+        code=normalized_code.split(".", 1)[0],
         symbol=expected_symbol,
-        name=str(exact["name"]).strip(),
+        name=resolved_name,
         market=str(exact.get("market") or "cn"),
         source=str(exact.get("source") or "symbol_search"),
     )
@@ -2509,6 +2775,9 @@ _channel_manager = None
 _goal_store = None
 _portfolio_daily_service = None
 _portfolio_daily_scheduler = None
+_portfolio_monitoring_service = None
+_portfolio_monitoring_runtime = None
+_runtime_event_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _get_session_service():
@@ -2524,6 +2793,7 @@ def _get_session_service():
     from src.session.store import SessionStore
     from src.session.events import EventBus
     from src.session.service import SessionService
+    from src.usage import UsageStore
 
     store = SessionStore(base_dir=SESSIONS_DIR)
     event_bus = EventBus()
@@ -2538,6 +2808,7 @@ def _get_session_service():
         store=store,
         event_bus=event_bus,
         runs_dir=RUNS_DIR,
+        usage_store=UsageStore(),
     )
     return _session_service
 
@@ -2605,6 +2876,370 @@ def _get_portfolio_daily_scheduler():
     return _portfolio_daily_scheduler
 
 
+def _get_portfolio_monitoring_service():
+    """Return the persistent portfolio monitoring application service."""
+
+    global _portfolio_monitoring_service
+    if _portfolio_monitoring_service is None:
+        from src.portfolio.monitoring import MonitoringService
+
+        session_service = _get_session_service()
+        _portfolio_monitoring_service = MonitoringService(
+            deep_report_service=(
+                getattr(session_service, "deep_reports", None)
+                if session_service is not None
+                else None
+            ),
+            auto_deep_report_submitter=_submit_monitor_auto_deep_report,
+        )
+        # Reuse the latest channel target learned by the daily-report runtime.
+        target = _get_portfolio_daily_scheduler().store.delivery_target()
+        existing_targets = _portfolio_monitoring_service.store.list_targets()
+        if target and not any(
+            item.get("channel") == target.get("channel")
+            and item.get("chat_id") == target.get("chat_id")
+            for item in existing_targets
+        ):
+            _portfolio_monitoring_service.store.bind_target(**target)
+    return _portfolio_monitoring_service
+
+
+async def _queue_monitor_auto_deep_report(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Queue one report turn through the durable session dispatcher."""
+    service = _get_session_service()
+    dispatcher = _get_session_dispatcher()
+    if service is None or dispatcher is None:
+        raise RuntimeError("session runtime is not available")
+
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    security_name = str(payload.get("security_name") or symbol).strip()
+    research_date = str(payload.get("research_date") or "").strip()
+    reasons = [str(item) for item in payload.get("research_reasons") or [] if str(item)]
+    if not symbol or not research_date:
+        raise ValueError("symbol and research_date are required")
+
+    existing_report = service.deep_reports.latest_for_symbol(
+        symbol,
+        report_date=research_date,
+    )
+    if existing_report is not None and existing_report.quality_status != "failed_validation":
+        return {
+            "status": "reused",
+            "report_id": existing_report.report_id,
+            "session_id": existing_report.session_id,
+            "deduplicated": True,
+        }
+
+    source_event_id = f"auto-equity-deep-report:{research_date}:{symbol}"
+    queued = dispatcher.store.get_by_source_event("api", source_event_id)
+    if queued is not None:
+        return {
+            "status": queued.status,
+            "job_id": queued.job_id,
+            "session_id": queued.session_id,
+            "attempt_id": queued.attempt_id,
+            "deduplicated": True,
+        }
+
+    reason_text = "、".join(reasons) or "自主监控需要新的公司级研究证据"
+    session = service.create_session(
+        title=f"{security_name}（{symbol}）穿透式深度研究 · AI自主监控",
+        config={
+            "internal": True,
+            "research_session": {
+                "kind": "equity_deep_research",
+                "symbol": symbol,
+                "security_name": security_name,
+                "origin": "portfolio_monitor_autopilot",
+                "planner_job_id": str(payload.get("job_id") or ""),
+            },
+        },
+    )
+    content = (
+        f"AI 自主监控因“{reason_text}”自动发起研究。"
+        f"请对 {security_name}（{symbol}）生成穿透式单股深度研究报告；"
+        "严格执行 equity_deep_research 的数据门控、确定性计算和证据链要求。"
+    )
+    result = await dispatcher.submit(
+        session.session_id,
+        content,
+        source="api",
+        source_event_id=source_event_id,
+        source_metadata={
+            "response_mode": "deep_report",
+            "report_profile": "equity_deep_research",
+            "generation_source": "portfolio_monitor_autopilot",
+            "generation_reason": reason_text,
+            "monitor_planner_job_id": str(payload.get("job_id") or ""),
+            "monitor_trigger_type": str(payload.get("trigger_type") or ""),
+        },
+        include_shell_tools=False,
+    )
+    return {
+        **result,
+        "status": result.get("status") or "queued",
+        "session_id": session.session_id,
+        "deduplicated": bool(result.get("deduplicated")),
+    }
+
+
+def _submit_monitor_auto_deep_report(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Bridge a monitoring worker thread onto the API event loop."""
+    loop = _runtime_event_loop
+    if loop is None or not loop.is_running():
+        raise RuntimeError("API event loop is not available for Deep Report dispatch")
+    future = asyncio.run_coroutine_threadsafe(_queue_monitor_auto_deep_report(payload), loop)
+    return future.result(timeout=30)
+
+
+_PRICE_VOLUME_REGIME_LABELS = {
+    "bullish_expansion": "上涨放量",
+    "bullish_contraction": "上涨缩量",
+    "bearish_expansion": "下跌放量",
+    "bearish_contraction": "下跌缩量",
+    "high_volume_stall": "放量滞涨",
+    "neutral": "量价中性",
+}
+
+_PRICE_VOLUME_STATE_LABELS = {
+    "expanded": "放量",
+    "expansion": "放量",
+    "normal": "正常量能",
+    "contracted": "缩量",
+    "contraction": "缩量",
+}
+
+
+def _monitor_price_volume_mode() -> str:
+    """Return the rollout mode that is allowed to reach outbound copy."""
+
+    selected = os.getenv("VIBE_TRADING_MONITOR_PRICE_VOLUME_MODE", "off").strip().lower()
+    return selected if selected in {"off", "shadow", "deliver"} else "off"
+
+
+def _format_monitor_number(value: Any, *, digits: int = 2) -> str | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f"{number:.{digits}f}"
+
+
+def _format_monitor_price_volume_lines(facts: Dict[str, Any]) -> List[str]:
+    """Build deterministic, advisory-only price-volume copy for Feishu."""
+
+    if _monitor_price_volume_mode() != "deliver":
+        return []
+
+    price_volume = facts.get("price_volume")
+    target = facts.get("target_assessment")
+    if not isinstance(price_volume, dict) and not isinstance(target, dict):
+        return []
+
+    target_intent = (
+        str(target.get("target_intent") or "").strip().lower()
+        if isinstance(target, dict)
+        else ""
+    )
+    decision = (
+        str(
+            target.get("decision")
+            or target.get("assessment")
+            or target.get("result")
+            or ""
+        ).strip().lower()
+        if isinstance(target, dict)
+        else ""
+    )
+    add_intents = {"buy_point", "add", "add_position", "buy", "scale_in", "加仓"}
+    lines: List[str] = []
+    if isinstance(price_volume, dict):
+        status = str(price_volume.get("status") or "").strip().lower()
+        if status == "disabled":
+            lines.append("- 量价态势：未启用")
+        elif status == "insufficient_data":
+            samples = price_volume.get("baseline_samples")
+            sample_suffix = f"（同期样本 {samples}）" if samples is not None else ""
+            lines.append(f"- 量价态势：数据不足{sample_suffix}，不据此作交易判断")
+        else:
+            regime = str(price_volume.get("regime") or "neutral").strip().lower()
+            regime_label = _PRICE_VOLUME_REGIME_LABELS.get(regime, regime or "量价中性")
+            ratio = _format_monitor_number(price_volume.get("volume_ratio"))
+            volume_state = str(price_volume.get("volume_state") or "").strip().lower()
+            volume_label = _PRICE_VOLUME_STATE_LABELS.get(volume_state, volume_state)
+            detail_parts = []
+            if ratio is not None:
+                detail_parts.append(f"量比 {ratio}")
+            if volume_label:
+                detail_parts.append(volume_label)
+            detail = f"（{'，'.join(detail_parts)}）" if detail_parts else ""
+            lines.append(f"- 量价态势：{regime_label}{detail}")
+
+        evidence_time = facts.get("price_volume_bar_time")
+        if evidence_time and evidence_time != facts.get("bar_time"):
+            lines.append(f"- 量价证据时间：{evidence_time}（闭合 5 分钟 K 线）")
+
+        if bool(price_volume.get("accelerated_decline")) and not (
+            target_intent in add_intents and decision == "opposes_add"
+        ):
+            lines.append("- 风险提示：**放量加速下跌，不宜补仓。**")
+
+    if not isinstance(target, dict):
+        return lines
+
+    phase = str(target.get("phase") or "").strip().lower()
+    target_level = target.get("target_level")
+    distance = _format_monitor_number(target.get("distance_bps"), digits=0)
+    location_parts = []
+    if target_level is not None:
+        location_parts.append(f"目标 {target_level}")
+    if phase == "reached":
+        location_parts.append("已到达")
+    elif phase == "approaching":
+        location_parts.append("接近中")
+    if distance is not None:
+        location_parts.append(f"距离 {distance} bps")
+    if location_parts:
+        lines.append(f"- 目标位置：{'，'.join(location_parts)}")
+
+    take_profit_intents = {"take_profit", "profit_take", "sell_profit", "止盈"}
+    if target_intent in add_intents:
+        if decision == "opposes_add":
+            lines.append("- 加仓判断：**放量加速下跌，不宜补仓。**")
+        elif decision == "supports_action":
+            lines.append("- 加仓判断：量价条件支持该观察点，但不会自动执行交易")
+        elif decision == "insufficient_data":
+            lines.append("- 加仓判断：量价数据不足，暂不确认加仓点")
+        else:
+            lines.append("- 加仓判断：尚未形成量价确认")
+    elif target_intent in take_profit_intents:
+        if decision == "supports_action":
+            lines.append("- 止盈量价证据：出现动能衰竭迹象；原价格提醒仍然有效")
+        elif decision == "no_confirmation":
+            lines.append("- 止盈量价证据：动能仍强，尚未出现衰竭证据；不否定或延迟原价格提醒")
+        elif decision == "insufficient_data":
+            lines.append("- 止盈量价证据：数据不足；原价格提醒不受影响")
+        else:
+            lines.append("- 止盈量价证据：仅作当前动能背景；原价格提醒不受影响")
+    elif decision:
+        lines.append("- 量价说明：仅作目标位背景证据，不改变或延迟原价格提醒")
+    return lines
+
+
+async def _deliver_portfolio_monitor_event(event, delivery):
+    """Send one proactive research-only alert and surface ambiguous outcomes."""
+
+    runtime = _get_channel_runtime()
+    if not runtime.status().get("running"):
+        await runtime.start(start_manager=True)
+    if runtime.manager is None:
+        raise RuntimeError("channel manager is unavailable")
+    from src.channels.bus.events import OutboundMessage
+    from src.api.portfolio_monitor_routes import (
+        get_monitor_ymca_down_sticker_path,
+        get_monitor_ymca_sticker_path,
+    )
+
+    facts = event.get("facts") or {}
+    parameters = facts.get("parameters") or {}
+    threshold = facts.get("threshold", parameters.get("threshold"))
+    alert_cue = str(facts.get("alert_cue") or "none")
+    direction = str(facts.get("direction") or "")
+    sticker_path = None
+    if alert_cue == "ymca_v1":
+        if direction == "above":
+            sticker_path = get_monitor_ymca_sticker_path()
+        elif direction == "below":
+            sticker_path = get_monitor_ymca_down_sticker_path()
+    threshold_line = f"\n- 规则阈值：{threshold}" if threshold is not None else ""
+    quality_line = (
+        "\n- ⚠ 数据质量：当前为单源数据，可能不准确"
+        if facts.get("quality_status") == "single_source"
+        else ""
+    )
+    price_volume_lines = _format_monitor_price_volume_lines(facts)
+    price_volume_section = (
+        "\n\n### 量价观察\n\n" + "\n".join(price_volume_lines)
+        if price_volume_lines
+        else ""
+    )
+    if event.get("kind") == "monitoring_preopen_notice":
+        symbols = ", ".join(str(symbol) for symbol in facts.get("symbols") or []) or "-"
+        first_check_at = str(facts.get("first_check_at") or "")
+        first_check_text = first_check_at[11:16] if len(first_check_at) >= 16 else "09:35"
+        content = (
+            f"## {event.get('title') or 'AI 持仓监控盘前提示'}\n\n"
+            f"{event.get('summary') or ''}\n\n"
+            f"- 今日监控标的：{symbols}\n"
+            f"- 首轮检查：今日 {first_check_text}\n"
+            f"- 监控数量：{facts.get('active_profile_count') or 0}\n\n"
+            "09:35 是首轮行情检查时间，不代表一定会产生交易信号；只有命中已审核规则才会提醒。"
+        )
+    else:
+        content = (
+            f"## {event.get('title') or 'AI 持仓监控提醒'}\n\n"
+            f"{event.get('summary') or ''}\n\n"
+            f"- 标的：{event.get('symbol')}\n"
+            f"- 最新闭合价：{facts.get('last_price', '-')}\n"
+            f"- 数据时间：{facts.get('bar_time') or '-'}\n"
+            f"- 数据来源：{', '.join(facts.get('sources') or []) or '-'}"
+            f"{quality_line}{threshold_line}{price_volume_section}\n\n"
+            "这是研究观察提醒，不会创建、修改或提交任何真实订单。"
+        )
+    receipt = await runtime.manager.send_direct(
+        OutboundMessage(
+            channel=str(delivery["channel"]),
+            chat_id=str(delivery["chat_id"]),
+            content=content,
+            metadata={
+                "_require_delivery_receipt": True,
+                "_delivery_uuid": str(delivery["delivery_id"]),
+                "portfolio_monitor_alert": True,
+                "monitor_alert_cue": alert_cue,
+                "monitor_sticker_path": str(sticker_path) if sticker_path else "",
+                "monitor_event_id": event["event_id"],
+                "session_key": delivery.get("session_key") or "",
+            },
+        )
+    )
+    if receipt is None:
+        raise RuntimeError("Feishu accepted no durable monitoring delivery receipt")
+    return receipt.as_dict()
+
+
+def _get_portfolio_monitoring_runtime():
+    """Return the single-leader monitoring scheduler."""
+
+    global _portfolio_monitoring_runtime
+    if _portfolio_monitoring_runtime is None:
+        from src.portfolio.monitoring import MonitoringRuntime
+
+        service = _get_portfolio_monitoring_service()
+        _portfolio_monitoring_runtime = MonitoringRuntime(
+            store=service.store,
+            delivery_callback=_deliver_portfolio_monitor_event,
+            autopilot_tick_callback=service.autopilot_tick,
+            autopilot_event_callback=service.enqueue_autopilot_event,
+        )
+    return _portfolio_monitoring_runtime
+
+
+def _set_portfolio_monitoring_config(enabled: bool, mode: str | None = None) -> str:
+    """Persist the monitoring kill switch and apply it to this process immediately."""
+
+    selected_mode = (mode or os.getenv("VIBE_TRADING_MONITORING_MODE", "shadow")).strip().lower()
+    if selected_mode not in {"shadow", "deliver"}:
+        selected_mode = "shadow"
+    updates = {
+        "VIBE_TRADING_MONITORING_ENABLED": "1" if enabled else "0",
+        "VIBE_TRADING_MONITORING_MODE": selected_mode,
+        "VIBE_TRADING_MONITOR_MAINTENANCE_ENABLED": "1",
+    }
+    _write_env_values(ENV_PATH, updates)
+    os.environ.update(updates)
+    return selected_mode
+
+
 def _get_channel_runtime():
     """Lazy-init the official IM runtime with the persistent dispatcher."""
     global _channel_runtime, _channel_bus, _channel_manager
@@ -2623,7 +3258,14 @@ def _get_channel_runtime():
 
     _channel_bus = MessageBus()
     config = load_channels_config()
-    _channel_manager = ChannelManager(config, _channel_bus, session_service=service)
+    _channel_manager = ChannelManager(
+        config,
+        _channel_bus,
+        session_service=service,
+        monitor_binding_claimer=(
+            _get_portfolio_monitoring_service().store.claim_binding_code
+        ),
+    )
     _channel_runtime = ChannelRuntime(
         bus=_channel_bus,
         session_service=service,
@@ -2638,11 +3280,11 @@ def _get_channel_runtime():
 
 async def _start_channel_runtime():
     """Start the official channel runtime and configured adapters."""
+    runtime = _get_channel_runtime()
+    await runtime.start(start_manager=True)
     dispatcher = _get_session_dispatcher()
     if dispatcher is not None:
         dispatcher.start()
-    runtime = _get_channel_runtime()
-    await runtime.start(start_manager=True)
     return runtime
 
 
@@ -2674,11 +3316,16 @@ def _get_existing_session_or_404(session_id: str):
 
 @app.post("/sessions", response_model=SessionResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_auth)])
 async def create_session(request: CreateSessionRequest):
-    """Create a chat session."""
+    """Reserve a chat id; persist the session only after its first message."""
     svc = _get_session_service()
     if not svc:
         raise HTTPException(status_code=501, detail="Session runtime not enabled")
-    session = svc.create_session(title=request.title, config=request.config)
+    create_draft = getattr(svc, "create_draft_session", None)
+    session = (
+        create_draft(title=request.title, config=request.config)
+        if callable(create_draft)
+        else svc.create_session(title=request.title, config=request.config)
+    )
     return SessionResponse(
         session_id=session.session_id,
         title=session.title,
@@ -2992,15 +3639,55 @@ async def update_session(session_id: str, req: UpdateSessionRequest):
     svc = _get_session_service()
     if not svc:
         raise HTTPException(status_code=501, detail="Session runtime not enabled")
-    session = svc.store.get_session(session_id)
+    session = svc.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
     if req.title is not None:
         session.title = req.title
     from datetime import datetime
     session.updated_at = datetime.now().isoformat()
-    svc.store.update_session(session)
+    update = getattr(svc, "update_session", None)
+    if callable(update):
+        update(session)
+    else:
+        svc.store.update_session(session)
     return {"status": "updated", "session_id": session_id}
+
+
+@app.post("/sessions/{session_id}/continue-on-feishu", dependencies=[Depends(require_auth)])
+async def continue_session_on_feishu(session_id: str):
+    """Route a web session to its bound AI-monitor Feishu conversation."""
+    _validate_path_param(session_id, "session_id")
+    svc = _get_session_service()
+    if not svc or not svc.get_session(session_id):
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
+    targets = [
+        target
+        for target in _get_portfolio_monitoring_service().store.list_targets()
+        if target.get("channel") == "feishu" and target.get("status") == "active"
+    ]
+    if not targets:
+        raise HTTPException(status_code=409, detail="No active AI-monitor Feishu account is bound")
+
+    session = svc.get_session(session_id)
+    configured_chat_id = str((session.config or {}).get("channel_chat_id") or "")
+    matching = [target for target in targets if target.get("chat_id") == configured_chat_id]
+    if len(matching) == 1:
+        target = matching[0]
+    elif len(targets) == 1:
+        target = targets[0]
+    else:
+        raise HTTPException(
+            status_code=409,
+            detail="More than one AI-monitor Feishu account is bound; open the matching Feishu session first",
+        )
+
+    runtime = await _start_channel_runtime()
+    try:
+        return await runtime.continue_session_in_feishu(session_id, target)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/sessions/{session_id}/messages", dependencies=[Depends(require_auth)])
@@ -3015,6 +3702,11 @@ async def send_message(session_id: str, payload: SendMessageRequest, http_reques
             session_id=session_id,
             content=payload.content,
             source="api",
+            source_metadata={
+                "response_mode": payload.response_mode,
+                "report_profile": payload.report_profile,
+                "routing_decision_id": payload.routing_decision_id,
+            },
             include_shell_tools=_shell_tools_enabled_for_request(http_request),
         )
         return result
@@ -3079,6 +3771,44 @@ async def get_messages(session_id: str, limit: int = Query(100, ge=1, le=1000)):
     ]
 
 
+@app.get("/sessions/{session_id}/usage", dependencies=[Depends(require_auth)])
+async def get_session_usage(session_id: str):
+    """Return durable Token, tool, resource, and cache aggregates for a session."""
+    _validate_path_param(session_id, "session_id")
+    svc, session = _get_existing_session_or_404(session_id)
+    return svc.usage_store.get_summary(
+        "session",
+        session_id,
+        current_attempt_id=session.last_attempt_id,
+    )
+
+
+@app.get("/sessions/{session_id}/usage/events", dependencies=[Depends(require_auth)])
+async def get_session_usage_events(
+    session_id: str,
+    kind: Optional[Literal["llm_call", "tool_call", "resource_call"]] = Query(None),
+    category: Optional[str] = Query(None, max_length=40),
+    attempt_id: Optional[str] = Query(None, max_length=120),
+    cursor: Optional[str] = Query(None, max_length=40),
+    limit: int = Query(50, ge=1, le=100),
+):
+    """List usage events newest-first with optional filters and cursor pagination."""
+    _validate_path_param(session_id, "session_id")
+    svc, _session = _get_existing_session_or_404(session_id)
+    try:
+        return svc.usage_store.list_events(
+            "session",
+            session_id,
+            kind=kind,
+            category=category,
+            attempt_id=attempt_id,
+            cursor=cursor,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/sessions/{session_id}/events", dependencies=[Depends(require_event_stream_auth)])
 async def session_events(
     session_id: str,
@@ -3138,6 +3868,12 @@ async def session_events(
 # ============================================================================
 # File Upload
 # ============================================================================
+
+
+def _normalize_reportlab_glyphs(value: str) -> str:
+    """Use glyphs covered by the bundled CJK fallback fonts."""
+
+    return value.replace("¥", "￥").replace("\u2011", "-")
 
 
 def _render_pdf_reportlab(title: str, content: str) -> bytes:
@@ -3273,6 +4009,7 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
     unsupported_emoji_pattern = re.compile(r"[\ufe0e\ufe0f\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF]")
 
     def replace_emoji(value: str) -> str:
+        value = _normalize_reportlab_glyphs(value)
         rendered = emoji_pattern.sub(
             lambda match: (
                 f'<font color="{emoji_replacements[match.group(0)][1]}">'
@@ -3283,6 +4020,7 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
         return unsupported_emoji_pattern.sub("[ICON]", rendered)
 
     def replace_emoji_plain(value: str) -> str:
+        value = _normalize_reportlab_glyphs(value)
         rendered = emoji_pattern.sub(
             lambda match: f"[{emoji_replacements[match.group(0)][0]}]",
             value,
@@ -3441,7 +4179,7 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
     )
     story = [
         Paragraph(replace_emoji(html.escape(title.strip() or "Research Report")), title_style),
-        Paragraph(f"Generated by Vibe-Trading · {datetime.now().strftime('%Y-%m-%d %H:%M')}", base),
+        Paragraph(f"由 Vibe-Trading 生成 · {datetime.now().strftime('%Y-%m-%d %H:%M')}", base),
         Spacer(1, 8),
     ]
     in_code = False
@@ -3464,6 +4202,10 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
             continue
         if not line:
             story.append(Spacer(1, 5))
+            line_index += 1
+            continue
+        if line.strip() in {"---", "***", "___"}:
+            story.append(Spacer(1, 7))
             line_index += 1
             continue
         heading_match = re.match(r"^(#{1,4})\s+(.*)$", line)
@@ -4773,6 +5515,32 @@ register_portfolio_daily_routes(
     require_local_or_auth,
     get_service=_get_portfolio_daily_service,
     get_scheduler=_get_portfolio_daily_scheduler,
+)
+
+from src.api.portfolio_monitor_routes import register_portfolio_monitor_routes  # noqa: E402
+register_portfolio_monitor_routes(
+    app,
+    require_local_or_auth,
+    get_service=_get_portfolio_monitoring_service,
+    get_runtime=_get_portfolio_monitoring_runtime,
+    set_runtime_config=_set_portfolio_monitoring_config,
+    require_event_stream_auth=require_event_stream_auth,
+)
+
+from src.api.deep_report_routes import register_deep_report_routes  # noqa: E402
+
+
+def _get_deep_report_service():
+    service = _get_session_service()
+    return service.deep_reports if service is not None else None
+
+
+register_deep_report_routes(
+    app,
+    require_local_or_auth,
+    get_service=_get_deep_report_service,
+    get_dispatcher=_get_session_dispatcher,
+    pdf_renderer=_render_pdf_reportlab,
 )
 
 # ============================================================================

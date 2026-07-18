@@ -534,13 +534,31 @@ def test_stock_analysis_reuses_todays_session_and_report_for_followups(tmp_path:
                 channel="feishu",
                 sender_id="u1",
                 chat_id="c1",
+                content="",
+                metadata={
+                    "stock_research_action": "resume_stock_session",
+                    "stock_session_id": service.session.session_id,
+                    "research_action": "holding",
+                    "research_label": route.label,
+                    **route.metadata(),
+                },
+                session_key_override=route.route_key,
+            )
+        )
+        resumed = await bus.consume_outbound()
+
+        await runtime._handle_inbound(
+            InboundMessage(
+                channel="feishu",
+                sender_id="u1",
+                chat_id="c1",
                 content="报告里的风险具体怎么看？",
             )
         )
         followup = await bus.consume_outbound()
-        return runtime, service, chooser, delivered, followup
+        return runtime, service, chooser, delivered, resumed, followup
 
-    runtime, service, chooser, delivered, followup = asyncio.run(scenario())
+    runtime, service, chooser, delivered, resumed, followup = asyncio.run(scenario())
     context = chooser.metadata["stock_research_context"]
     assert chooser.metadata["_stock_research_context"] is True
     assert context["session"]["session_id"] == "stock-session-today"
@@ -550,6 +568,8 @@ def test_stock_analysis_reuses_todays_session_and_report_for_followups(tmp_path:
     ]
     assert delivered.media == [str(tmp_path / "today-holding.pdf")]
     assert delivered.metadata["stock_report_continuation"] is True
+    assert resumed.metadata["stock_session_resumed"] is True
+    assert resumed.metadata["session_id"] == "stock-session-today"
     assert any(
         message.metadata.get("daily_report_context_run_id") == "dpr_today"
         for message in service.messages["stock-session-today"]

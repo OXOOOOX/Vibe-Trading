@@ -17,16 +17,20 @@ import pytest
 from src.tools import build_registry
 from src.tools.financial_rigor_tool import (
     FinancialRigorTool,
+    _terminal_model_present_value,
     _exact,
     _fmt,
     _safe_arith,
     benford_check,
     cross_validate,
     exact_calc,
+    implied_terminal_earnings,
     three_scenario_valuation,
     verify_market_cap,
     verify_valuation,
+    validate_terminal_scenarios,
 )
+from decimal import Decimal
 
 # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -215,7 +219,8 @@ def test_tool_metadata() -> None:
     assert tool.parameters["required"] == ["command"]
     cmds = set(tool.parameters["properties"]["command"]["enum"])
     assert cmds == {"verify_market_cap", "verify_valuation", "cross_validate",
-                    "benford", "calc", "three_scenario"}
+                    "benford", "calc", "three_scenario",
+                    "implied_terminal_earnings", "validate_terminal_scenarios"}
 
 
 def test_tool_is_auto_discovered() -> None:
@@ -253,6 +258,25 @@ def test_execute_unknown_command_is_error() -> None:
     assert "unknown command" in env["error"]
 
 
+def test_profile_command_policy_hides_and_rejects_target_price_helpers() -> None:
+    tool = FinancialRigorTool(allowed_commands={
+        "calc", "implied_terminal_earnings", "validate_terminal_scenarios",
+    })
+    commands = tool.parameters["properties"]["command"]["enum"]
+    assert "three_scenario" not in commands
+    assert "verify_valuation" not in commands
+    denied = json.loads(tool.execute(
+        command="three_scenario",
+        price=10,
+        eps=1,
+        shares=1,
+        growth=[0.1, 0.1, 0.1],
+        pe=[10, 10, 10],
+    ))
+    assert denied["status"] == "error"
+    assert "not allowed" in denied["error"]
+
+
 def test_execute_benford_small_sample_is_not_reliable() -> None:
     env = _run(command="benford", values=[1, 2, 3])
     assert env["status"] == "ok"
@@ -265,3 +289,74 @@ def test_execute_three_scenario_validates_growth_shape() -> None:
         growth=[0.1, 0.2], pe=[25, 20, 15],  # growth has only 2 entries
     )
     assert env["status"] == "error"
+
+
+# ── penetrative equity-research calculations ─────────────────────────────
+
+
+def test_implied_terminal_earnings_round_trips_exact_model() -> None:
+    cap = _terminal_model_present_value(
+        terminal_earnings=Decimal("30"),
+        earnings=(Decimal("10"), Decimal("12"), Decimal("15")),
+        discount_rate=Decimal("0.10"),
+        transition_years=7,
+    )
+    out = implied_terminal_earnings(
+        cap, 10, 12, 15,
+        discount_rates=[0.10],
+        transition_years=7,
+        forecast_years=[2026, 2027, 2028],
+        base_year=2025,
+        source_fact_ids=["fact_cap", "fact_e1", "fact_e2", "fact_e3"],
+    )
+    solution = out["implied_terminal_earnings_by_rate"][0]
+    assert out["applicability"] == "applicable"
+    assert out["model"] == "implied_terminal_earnings"
+    assert out["basis"] == "net_income_proxy"
+    assert out["derived_steady_year"] == 2035
+    assert solution["implied_terminal_earnings"] == pytest.approx(30, rel=1e-4)
+    assert solution["residual_pct"] <= 0.01
+    assert "target prices" in out["limitations"][-2].lower()
+
+
+def test_implied_terminal_earnings_fails_closed_for_negative_e3() -> None:
+    out = implied_terminal_earnings(1000, 10, 5, -1)
+    assert out["applicability"] == "not_applicable"
+    assert out["reason"] == "earnings_e3_must_be_positive"
+
+
+def _terminal_scenarios() -> list[dict[str, Any]]:
+    return [
+        {"scenario_id": "conservative", "tam": 100, "market_share": 0.10, "net_margin": 0.10, "source_fact_ids": ["tam", "share", "margin"]},
+        {"scenario_id": "base", "tam": 120, "market_share": 0.15, "net_margin": 0.12, "source_fact_ids": ["tam", "share", "margin"]},
+        {"scenario_id": "optimistic", "tam": 150, "market_share": 0.20, "net_margin": 0.15, "source_fact_ids": ["tam", "share", "margin"]},
+        {"scenario_id": "stretched", "tam": 180, "market_share": 0.25, "net_margin": 0.18, "source_fact_ids": ["tam", "share", "margin"]},
+    ]
+
+
+def test_terminal_scenarios_are_exact_unweighted_and_ordered() -> None:
+    out = validate_terminal_scenarios(_terminal_scenarios(), currency="CNY", tam_currency="CNY")
+    assert out["validation_status"] == "pass"
+    assert out["probability_weighted_result"] is None
+    earnings = [item["terminal_earnings"] for item in out["scenarios"]]
+    assert earnings == sorted(earnings)
+    assert out["scenarios"][1]["terminal_revenue"] == pytest.approx(18)
+
+
+def test_terminal_scenarios_reject_probability_weighting() -> None:
+    scenarios = _terminal_scenarios()
+    scenarios[0]["probability"] = 0.25
+    with pytest.raises(ValueError, match="probability weighting"):
+        validate_terminal_scenarios(scenarios)
+
+
+def test_execute_implied_terminal_earnings_exposes_not_applicable_without_fallback() -> None:
+    env = _run(
+        command="implied_terminal_earnings",
+        market_cap=1000,
+        earnings_e1=10,
+        earnings_e2=5,
+        earnings_e3=-1,
+    )
+    assert env["status"] == "ok"
+    assert env["applicability"] == "not_applicable"

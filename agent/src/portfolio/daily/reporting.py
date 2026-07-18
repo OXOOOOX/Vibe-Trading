@@ -33,6 +33,25 @@ _PRIORITY_LABELS = {
     "normal": "🔵 常规",
     "low": "🟢 低",
 }
+_SCOPE_LABELS = {
+    "daily": "日线",
+    "intraday": "盘中",
+    "fund_flow": "资金流",
+    "news": "新闻",
+    "fundamentals": "基本面",
+}
+_SCOPE_STATUS_LABELS = {
+    "verified": "已校核",
+    "partial": "部分可用",
+    "not_started": "尚未开盘",
+    "unavailable": "不可用",
+    "not_requested": "未请求",
+}
+_CONDITION_STATUS_LABELS = {
+    "available": "可设置",
+    "not_recommended": "暂不建议",
+    "data_insufficient": "数据不足",
+}
 
 
 def _table_cell(value: Any) -> str:
@@ -50,6 +69,23 @@ def _security_label(item: dict[str, Any]) -> str:
 def _priority_label(priority: Any) -> str:
     key = str(priority or "normal").strip().lower()
     return _PRIORITY_LABELS.get(key, f"🔵 {_table_cell(priority)}")
+
+
+def _scope_summary(brief: dict[str, Any]) -> str:
+    scopes = brief.get("data_scopes") or {}
+    if not isinstance(scopes, dict) or not scopes:
+        return _DATA_STATUS_LABELS.get(str(brief.get("data_status") or ""), "未提供分区状态")
+    parts = []
+    for scope in ("daily", "intraday", "fund_flow", "news", "fundamentals"):
+        raw = scopes.get(scope)
+        if raw is None:
+            continue
+        item = raw if isinstance(raw, dict) else {"status": raw}
+        status = str(item.get("status") or "partial")
+        parts.append(
+            f"{_SCOPE_LABELS.get(scope, scope)}{_SCOPE_STATUS_LABELS.get(status, status)}"
+        )
+    return "｜".join(parts) or "未提供分区状态"
 
 
 def _money(value: Any) -> float:
@@ -353,14 +389,40 @@ def render_holding_markdown(
 ) -> str:
     name = str(holding.get("name") or brief.get("symbol") or "个股")
     label = _security_label({"name": name, "symbol": brief.get("symbol")})
+    trend = brief.get("trend") if isinstance(brief.get("trend"), dict) else {}
+    condition_status = str(brief.get("condition_order_status") or (
+        "available" if brief.get("condition_orders") else "not_recommended"
+    ))
+    condition_summary = str(brief.get("condition_order_summary") or (
+        "具体条件情景见正文。" if brief.get("condition_orders") else "等待趋势和量价信号进一步确认。"
+    ))
+    scope_summary = _scope_summary(brief)
+    display_data_status = (
+        scope_summary
+        if isinstance(brief.get("data_scopes"), dict) and brief.get("data_scopes")
+        else _DATA_STATUS_LABELS.get(data_status, data_status)
+    )
     lines = [
-        f"# {name}每日更新｜{market_date}",
+        f"# {market_date} {label}个股晨报",
         "",
         f"- 标的：{label}",
-        f"- 数据状态：{_DATA_STATUS_LABELS.get(data_status, data_status)}",
+        f"- 数据状态：{display_data_status}",
         f"- 今日结论：{_ACTION_LABELS.get(brief.get('action'), '观察')}",
         f"- 置信度：{_CONFIDENCE_LABELS.get(str(brief.get('confidence', 'low')), brief.get('confidence', '低'))}",
         f"- 受约束建议金额：{brief.get('constrained_amount') or '—'}",
+        "",
+        "## 决策摘要",
+        "",
+        f"- 当前走势：{trend.get('summary') or brief.get('summary') or '今日以观察为主。'}",
+        f"- 趋势阶段：{trend.get('stage') or '待确认'}",
+        f"- 趋势方向：{trend.get('direction') or '待确认'}",
+        f"- 趋势强弱：{trend.get('strength') or '待确认'}",
+        f"- 置信度：{brief.get('confidence') or 'low'}",
+        f"- 条件单状态：{_CONDITION_STATUS_LABELS.get(condition_status, '暂不建议')}",
+        f"- 条件单：{condition_summary}",
+        f"- 数据状态：{scope_summary}",
+        f"- 数据截至：{brief.get('data_as_of') or '未提供'}",
+        f"- 风险提示：{(brief.get('risks') or ['结论失效时应重新校核数据和趋势。'])[0]}",
         "",
         "## 核心判断",
         "",
@@ -384,6 +446,8 @@ def render_holding_markdown(
             f"| {_priority_label(item.get('priority'))} | {_table_cell(item.get('trigger'))} | {_table_cell(item.get('response'))} |"
             for item in conditions
         )
+    elif condition_status == "data_insufficient":
+        lines.append("- 条件单所需价格范围尚未完成校核，本次不提供精确触发价。")
     else:
         lines.append("- 今日不设置新增条件建议。")
     if brief.get("constraint_notes"):

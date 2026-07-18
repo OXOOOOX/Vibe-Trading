@@ -21,6 +21,8 @@ from src.channelsui.mcp_presets_api import normalize_mcp_preset_mentions
 from src.channelsui.transcription_ws import webui_transcription_event
 from src.session.goal_state import goal_state_ws_blob
 from src.session.models import Message, Session
+from src.session.dispatcher import DispatchJob, DispatchStore, SessionDispatcher
+from src.session.models import AttemptStatus
 from src.session.webui_turns import (
     clear_websocket_turn_started,
     mark_websocket_turn_started,
@@ -89,6 +91,7 @@ class FakeDispatcher:
         content: str,
         *,
         source: str,
+        source_event_id: str | None = None,
         source_metadata: dict[str, Any],
         include_shell_tools: bool,
     ) -> dict[str, str]:
@@ -97,6 +100,7 @@ class FakeDispatcher:
                 "session_id": session_id,
                 "content": content,
                 "source": source,
+                "source_event_id": source_event_id,
                 "source_metadata": source_metadata,
                 "include_shell_tools": include_shell_tools,
             }
@@ -110,6 +114,80 @@ class FakeDispatcher:
     async def cancel_session(self, session_id: str) -> dict[str, Any]:
         self.cancelled.append(session_id)
         return {"status": "cancelled", "running": True, "queued": 2}
+
+
+class TerminalSessionService:
+    def __init__(self) -> None:
+        self.sessions = {
+            "session-1": Session(session_id="session-1", title="terminal test")
+        }
+        self.messages: dict[str, list[Message]] = {"session-1": []}
+        self.attempts: dict[tuple[str, str], Any] = {}
+        self.executed: list[str] = []
+        self.store = self
+
+    def get_session(self, session_id: str) -> Session | None:
+        return self.sessions.get(session_id)
+
+    def get_attempt(self, session_id: str, attempt_id: str):
+        return self.attempts.get((session_id, attempt_id))
+
+    def get_messages(self, session_id: str, limit: int = 200) -> list[Message]:
+        return self.messages.get(session_id, [])[-limit:]
+
+    async def execute_message(self, session_id: str, content: str, **kwargs) -> None:
+        self.executed.append(content)
+        attempt_id = kwargs["attempt_id"]
+        self.messages[session_id].append(
+            Message(
+                session_id=session_id,
+                role="assistant",
+                content=f"agent reply: {content}",
+                linked_attempt_id=attempt_id,
+            )
+        )
+        self.attempts[(session_id, attempt_id)] = type(
+            "AttemptResult",
+            (),
+            {"status": AttemptStatus.COMPLETED, "error": None},
+        )()
+
+    def cancel_current(self, _session_id: str) -> bool:
+        return False
+
+
+class TerminalChannel:
+    is_running = True
+
+
+class TerminalManager:
+    def __init__(self, *, failures: int = 0) -> None:
+        self.channel = TerminalChannel()
+        self.failures = failures
+        self.messages: list[OutboundMessage] = []
+
+    def get_channel(self, name: str):
+        return self.channel if name == "feishu" else None
+
+    async def send_direct(self, message: OutboundMessage) -> None:
+        self.messages.append(message)
+        if self.failures > 0:
+            self.failures -= 1
+            raise RuntimeError("connection closed after provider acceptance")
+
+    async def stop_all(self) -> None:
+        return None
+
+    def get_status(self) -> dict[str, Any]:
+        return {
+            "feishu": {
+                "running": True,
+                "last_received_at": "2026-07-15T00:00:00+00:00",
+                "last_persisted_at": "2026-07-15T00:00:01+00:00",
+                "last_error": None,
+                "inflight_messages": 0,
+            }
+        }
 
 
 def test_channel_manager_can_construct_websocket_with_default_gateway() -> None:
@@ -412,8 +490,9 @@ def test_channel_runtime_uses_dispatcher_research_policy_and_preserves_routing_m
             {
                 "session_id": "session-1",
                 "content": "research this portfolio",
-                "source": "feishu",
-                "source_metadata": {
+                    "source": "feishu",
+                    "source_event_id": "m-1",
+                    "source_metadata": {
                     "channel_session_key": "feishu:chat-1:root-1",
                     "channel_chat_id": "chat-1",
                     "message_id": "m-1",
@@ -434,6 +513,167 @@ def test_channel_runtime_uses_dispatcher_research_policy_and_preserves_routing_m
         assert cancelled.metadata["session_cancel"] is True
         assert "running=1" in cancelled.content
         assert "queued=2" in cancelled.content
+
+    asyncio.run(scenario())
+
+
+def test_channel_runtime_hands_web_session_to_bound_feishu_chat(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        from src.channels.runtime import ChannelRuntime
+
+        bus = MessageBus()
+        service = FakeSessionService()
+        session = service.create_session(title="招商银行研究")
+        manager = TerminalManager()
+        runtime = ChannelRuntime(
+            bus=bus,
+            session_service=service,
+            manager=manager,
+            session_map_path=tmp_path / "channel_sessions.json",
+        )
+
+        result = await runtime.continue_session_in_feishu(
+            session.session_id,
+            {
+                "target_id": "target-1",
+                "channel": "feishu",
+                "chat_id": "ou_bound_user",
+                "chat_type": "p2p",
+                "session_key": "feishu:ou_bound_user",
+            },
+        )
+
+        assert result["status"] == "continued_in_feishu"
+        assert runtime._session_map["feishu:ou_bound_user"] == session.session_id
+        assert manager.messages == [
+            OutboundMessage(
+                channel="feishu",
+                chat_id="ou_bound_user",
+                content="已切换到网页会话「招商银行研究」。接下来直接在这里继续聊即可。",
+                metadata={"_channel_runtime": True, "session_handoff": True},
+            )
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_channel_runtime_recovers_pending_job_and_retries_same_terminal_uuid(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        from src.channels.runtime import ChannelRuntime
+
+        service = TerminalSessionService()
+        store = DispatchStore(tmp_path / "dispatch.db")
+        pending = store.add(
+            DispatchJob(
+                session_id="session-1",
+                content="请分析 513120",
+                source="feishu",
+                source_event_id="om-pending",
+                source_metadata={
+                    "channel_chat_id": "ou-user",
+                    "channel_session_key": "feishu:ou-user",
+                    "message_id": "om-pending",
+                    "chat_type": "p2p",
+                },
+                delivery_status="pending",
+            )
+        )
+        dispatcher = SessionDispatcher(service, store=store, max_concurrency=1)
+        manager = TerminalManager(failures=2)
+        runtime = ChannelRuntime(
+            bus=MessageBus(),
+            session_service=service,
+            manager=manager,  # type: ignore[arg-type]
+            dispatcher=dispatcher,
+            session_map_path=tmp_path / "sessions.json",
+        )
+
+        async def no_wait(_delay: float) -> None:
+            return None
+
+        runtime._delivery_retry_pause = no_wait  # type: ignore[method-assign]
+        await runtime.start(start_manager=False)
+        dispatcher.start()
+        try:
+            for _ in range(200):
+                current = store.get(pending.job_id)
+                if current and current.delivery_status == "delivered":
+                    break
+                await asyncio.sleep(0.01)
+            current = store.get(pending.job_id)
+            assert current is not None
+            assert current.status == "completed"
+            assert current.delivery_status == "delivered"
+            assert current.delivery_attempts == 3
+            assert service.executed == ["请分析 513120"]
+            assert len(manager.messages) == 3
+            uuids = {message.metadata["_delivery_uuid"] for message in manager.messages}
+            assert len(uuids) == 1
+            assert manager.messages[-1].content == "agent reply: 请分析 513120"
+            status = runtime.status()
+            assert status["recent_persisted_at"] == "2026-07-15T00:00:01+00:00"
+            assert status["pending_terminal_deliveries"] == 0
+        finally:
+            await runtime.stop()
+            await dispatcher.stop()
+
+    asyncio.run(scenario())
+
+
+def test_channel_runtime_marks_interrupted_running_job_failed_without_replay(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        from src.channels.runtime import ChannelRuntime
+
+        service = TerminalSessionService()
+        store = DispatchStore(tmp_path / "dispatch.db")
+        running = store.add(
+            DispatchJob(
+                session_id="session-1",
+                content="long research",
+                source="feishu",
+                source_event_id="om-running",
+                source_metadata={
+                    "channel_chat_id": "ou-user",
+                    "channel_session_key": "feishu:ou-user",
+                    "message_id": "om-running",
+                    "chat_type": "p2p",
+                },
+                status="running",
+                delivery_status="pending",
+            )
+        )
+        dispatcher = SessionDispatcher(service, store=store, max_concurrency=1)
+        manager = TerminalManager()
+        runtime = ChannelRuntime(
+            bus=MessageBus(),
+            session_service=service,
+            manager=manager,  # type: ignore[arg-type]
+            dispatcher=dispatcher,
+            session_map_path=tmp_path / "sessions.json",
+        )
+        await runtime.start(start_manager=False)
+        dispatcher.start()
+        try:
+            for _ in range(200):
+                current = store.get(running.job_id)
+                if current and current.delivery_status == "delivered":
+                    break
+                await asyncio.sleep(0.01)
+            current = store.get(running.job_id)
+            assert current is not None
+            assert current.status == "failed"
+            assert "restarted" in str(current.error)
+            assert current.delivery_status == "delivered"
+            assert service.executed == []
+            assert len(manager.messages) == 1
+            assert "避免重复研究" in manager.messages[0].content
+        finally:
+            await runtime.stop()
+            await dispatcher.stop()
 
     asyncio.run(scenario())
 
@@ -504,6 +744,9 @@ def test_channel_runtime_new_command_resets_session_and_creates_fresh_one(tmp_pa
             reset_reply = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
             assert "开启新对话" in reset_reply.content
             assert reset_reply.metadata.get("session_reset") is True
+            assert reset_reply.metadata.get("session_pending") is True
+            assert "session_id" not in reset_reply.metadata
+            assert len(service.created) == 1
 
             await bus.publish_inbound(
                 InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="after reset")
@@ -543,8 +786,9 @@ def test_channel_runtime_new_command_with_no_existing_session(tmp_path: Path) ->
 
         assert "开启新对话" in reply.content
         assert reply.metadata.get("session_reset") is True
+        assert reply.metadata.get("session_pending") is True
         assert service.sent == []
-        assert len(service.created) == 1
+        assert len(service.created) == 0
 
     asyncio.run(scenario())
 
@@ -586,6 +830,8 @@ def test_channel_runtime_reset_and_newsession_aliases_work(tmp_path: Path) -> No
             )
             reply2 = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
             assert "开启新对话" in reply2.content
+            assert reply2.metadata.get("session_pending") is True
+            assert len(service.created) == 2
         finally:
             await runtime.stop()
 
@@ -725,7 +971,8 @@ def test_channel_runtime_research_topics_switch_and_resume_for_followups(
         assert followup_a.metadata["session_id"] == "session-2"
         assert first_b.metadata["session_id"] == "session-3"
         assert resumed_a.metadata["session_id"] == "session-2"
-        assert new_a.metadata["session_id"] == "session-4"
+        assert new_a.metadata["session_pending"] is True
+        assert "session_id" not in new_a.metadata
         assert fresh_a.metadata["session_id"] == "session-4"
         mapping = json.loads(map_path.read_text(encoding="utf-8"))
         assert mapping["feishu:c1"] == "session-4"
@@ -798,8 +1045,10 @@ def test_channel_runtime_refreshes_active_portfolio_report(
         assert service.sent[0] == ("session-1", "initial portfolio context")
         assert service.sent[1][0] == "session-1"
         assert "生成一份细致的组合报告" in service.sent[1][1]
+        assert "相比上次的变化" in service.sent[1][1]
         assert refreshed.metadata["delivery_mode"] == "report_pdf"
         assert refreshed.metadata["research_refresh"] is True
+        assert refreshed.metadata["research_refresh_diff"] is True
         assert Path(refreshed.media[0]).read_bytes() == b"%PDF-refresh"
 
     asyncio.run(scenario())
@@ -963,14 +1212,14 @@ def test_channel_runtime_attaches_pdf_to_completed_feishu_research(
         pdf_path = Path(outbound.media[0])
         assert pdf_path.name == "2026-07-13_军工基金（512680.SH）单标的持仓分析.pdf"
         assert pdf_path.read_bytes() == b"%PDF-test"
-        assert outbound.content == (
-            "✅ 盘前分析已完成\n"
-            "报告：🔍 军工基金（512680.SH）单标的持仓分析\n"
-            "完整正文和表格见 PDF 附件；飞书中仅保留这条简要说明。\n"
-            "后续可直接发送文字，在当前专题 Session 中继续讨论。"
-        )
+        assert "✅ 盘前分析已完成" in outbound.content
+        assert "报告：🔍 军工基金（512680.SH）单标的持仓分析" in outbound.content
+        assert "当前走势：" in outbound.content
+        assert "条件单：" in outbound.content
+        assert "完整正文和表格见 PDF 附件" in outbound.content
         assert "agent reply" not in outbound.content
         assert outbound.metadata["delivery_mode"] == "report_pdf"
+        assert outbound.metadata["research_completion"]["symbol"] == "512680.SH"
 
     asyncio.run(scenario())
 
@@ -983,12 +1232,141 @@ def test_channel_runtime_pdf_report_note_includes_report_title() -> None:
         "# 🔍 军工基金（512680.SH）单标的持仓分析\n\n| 项目 | 数值 |",
     )
 
-    assert note == (
-        "✅ 个股分析已完成\n"
-        "报告：🔍 军工基金（512680.SH）单标的持仓分析\n"
-        "完整正文和表格见 PDF 附件；飞书中仅保留这条简要说明。\n"
-        "后续可直接发送文字，在当前专题 Session 中继续讨论。"
+    assert "✅ 个股分析已完成" in note
+    assert "报告：🔍 军工基金（512680.SH）单标的持仓分析" in note
+    assert "当前走势：" in note
+    assert "条件单：" in note
+    assert "后续可在当前专题 Session 中继续讨论" in note
+
+
+def test_pdf_report_body_removes_model_preamble_and_duplicate_title() -> None:
+    from src.channels.runtime import _pdf_report_body
+
+    body = _pdf_report_body(
+        "我已经准备好分析，但先说明一些过程。\n\n---\n\n"
+        "# 512680.SH（军工ETF）持仓分析报告\n\n"
+        "---\n\n## 决策摘要\n\n- 当前走势：震荡。"
     )
+
+    assert body.startswith("## 决策摘要")
+    assert "我已经准备好" not in body
+    assert "# 512680.SH" not in body
+
+
+def test_research_evidence_gap_blocks_stale_report_when_tools_are_missing() -> None:
+    from src.channels.runtime import _research_evidence_gap
+
+    gap = _research_evidence_gap(
+        "holding",
+        [
+            {
+                "type": "tool_call",
+                "tool": "portfolio_state",
+                "result_preview": '{"status":"error","error":"Tool not found"}',
+            },
+            {
+                "type": "tool_call",
+                "tool": "load_skill",
+                "result_preview": '{"status":"ok"}',
+            },
+        ],
+    )
+
+    assert gap == ("portfolio_state", "get_data_context")
+
+
+def test_research_evidence_gap_accepts_partial_scoped_data_context() -> None:
+    from src.channels.runtime import _research_evidence_gap
+
+    gap = _research_evidence_gap(
+        "holding",
+        [
+            {
+                "type": "tool_call",
+                "tool": "portfolio_state",
+                "result_preview": '{"status":"ok","state":{"holdings":[]}}',
+            },
+            {
+                "type": "tool_call",
+                "tool": "get_data_context",
+                "result_preview": '{"request_id":"ctx","status":"partial"',
+            },
+        ],
+    )
+
+    assert gap == ()
+
+
+def test_feishu_explicit_symbol_continuation_prefers_same_chat_report_session(tmp_path: Path) -> None:
+    from src.channels.runtime import ChannelRuntime
+
+    service = FakeSessionService()
+    base_key = "feishu:ou_user"
+    route_key = f"{base_key}:research:symbol:588870.SH"
+    report_session = service.create_session(
+        title="飞书·个股·科创50指（588870.SH）",
+        config={
+            "channel": "feishu",
+            "channel_chat_id": "ou_user",
+            "channel_session_key": route_key,
+            "research_session": {
+                "base_key": base_key,
+                "route_key": route_key,
+                "kind": "symbol",
+                "action": "holding",
+                "label": "科创50指个股分析",
+                "symbol": "588870.SH",
+            },
+        },
+    )
+    service.messages[report_session.session_id].append(
+        Message(
+            session_id=report_session.session_id,
+            role="assistant",
+            content=(
+                "# 科创50ETF（588870.SH）持仓分析\n\n"
+                "## 决策摘要\n\n- 当前走势：震荡修复。\n\n"
+                "## 详细分析\n\n" + "完整正文。" * 180
+            ),
+        )
+    )
+    duplicate = service.create_session(
+        title="飞书·个股·科创50指（588870.SH）",
+        config={
+            "channel": "feishu",
+            "channel_chat_id": "ou_user",
+            "channel_session_key": route_key,
+            "research_session": {
+                "base_key": base_key,
+                "route_key": route_key,
+                "kind": "symbol",
+                "action": "holding",
+                "label": "科创50指个股分析",
+                "symbol": "588870.SH",
+            },
+        },
+    )
+    runtime = ChannelRuntime(
+        bus=MessageBus(),
+        session_service=service,
+        manager=None,
+        session_map_path=tmp_path / "sessions.json",
+    )
+    runtime._session_map = {base_key: duplicate.session_id, route_key: duplicate.session_id}
+
+    resumed = runtime._resume_recent_research_route(
+        InboundMessage(
+            channel="feishu",
+            sender_id="ou_user",
+            chat_id="ou_user",
+            content="回到刚才关于588870的飞书对话",
+        )
+    )
+
+    assert resumed.session_key == route_key
+    assert runtime._session_map[base_key] == report_session.session_id
+    assert resumed.metadata["session_route_resumed"] is True
+    assert resumed.metadata["research_symbol"] == "588870.SH"
 
 
 def test_channel_runtime_pdf_filename_uses_date_and_report_title() -> None:
@@ -1242,6 +1620,16 @@ def test_channel_runtime_session_map_persisted_after_reset(tmp_path: Path) -> No
 
             await bus.publish_inbound(
                 InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/new")
+            )
+            await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+
+            data = json.loads(map_path.read_text(encoding="utf-8"))
+            assert "feishu:c1" not in data
+            assert "feishu:c1:general" not in data
+            assert len(service.created) == 1
+
+            await bus.publish_inbound(
+                InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="fresh")
             )
             await asyncio.wait_for(bus.consume_outbound(), timeout=1)
 

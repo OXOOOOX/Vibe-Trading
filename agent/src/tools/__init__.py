@@ -16,7 +16,7 @@ import pkgutil
 from collections.abc import Mapping
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from src.agent.tools import BaseTool, ToolRegistry
 
@@ -73,6 +73,8 @@ def build_registry(
     warn_callback: Callable[[str], None] | None = None,
     interactive: bool | None = None,
     exclude_tool_names: set[str] | None = None,
+    financial_rigor_commands: set[str] | None = None,
+    report_workspace_handler: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
     _mcp_server_tool_name_segments: Mapping[str, str] | None = None,
 ) -> ToolRegistry:
     """Build the tool registry via auto-discovery, optionally enriched with MCP tools.
@@ -124,6 +126,11 @@ def build_registry(
         UpdateResearchGoalStatusTool,
     )
     from src.tools.autopilot_tool import RunResearchAutopilotTool
+    from src.tools.financial_snapshot_analysis_tool import FinancialSnapshotAnalysisTool
+    from src.tools.financial_rigor_tool import FinancialRigorTool
+    from src.tools.report_audit_tool import ReportAuditTool
+    from src.tools.report_evidence_tool import RecordReportEvidenceTool
+    from src.tools.report_workspace_tool import ReportWorkspaceTool
     from src.tools.remember_tool import RememberTool
     from src.tools.swarm_tool import SwarmTool
 
@@ -135,7 +142,13 @@ def build_registry(
     }
     # Tools that need the host session id injected: they create or mutate the
     # session's research goal, and the LLM never knows the session id.
-    session_injected_classes = goal_tool_classes | {RunResearchAutopilotTool}
+    session_injected_classes = goal_tool_classes | {
+        RunResearchAutopilotTool,
+        FinancialSnapshotAnalysisTool,
+        FinancialRigorTool,
+        ReportAuditTool,
+        RecordReportEvidenceTool,
+    }
     registry = ToolRegistry()
     for cls in _discover_subclasses():
         try:
@@ -150,6 +163,17 @@ def build_registry(
                 continue
             if cls is RememberTool and persistent_memory is not None:
                 registry.register(cls(memory=persistent_memory))
+            elif cls is FinancialRigorTool:
+                registry.register(cls(
+                    default_session_id=session_id,
+                    event_callback=event_callback,
+                    allowed_commands=financial_rigor_commands,
+                ))
+            elif cls is ReportWorkspaceTool:
+                registry.register(cls(
+                    handler=report_workspace_handler,
+                    event_callback=event_callback,
+                ))
             elif cls in session_injected_classes:
                 registry.register(cls(default_session_id=session_id, event_callback=event_callback))
             elif cls is SwarmTool:
@@ -252,7 +276,15 @@ def build_registry(
     return registry
 
 
-def build_filtered_registry(tool_names: list[str], *, include_shell_tools: bool = False) -> ToolRegistry:
+def build_filtered_registry(
+    tool_names: list[str],
+    *,
+    include_shell_tools: bool = False,
+    session_id: str | None = None,
+    event_callback: Callable[[str, dict], None] | None = None,
+    financial_rigor_commands: set[str] | None = None,
+    report_workspace_handler: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+) -> ToolRegistry:
     """Build a ToolRegistry with only specified tools.
 
     Local-tools-only filtered builder. Swarm workers should call
@@ -263,11 +295,19 @@ def build_filtered_registry(tool_names: list[str], *, include_shell_tools: bool 
     Args:
         tool_names: Tool names to include.
         include_shell_tools: Whether to include filtered shell execution tools.
+        session_id: Optional session id injected into session-aware local tools.
+        event_callback: Optional callback for progress and report-ledger events.
 
     Returns:
         ToolRegistry containing only the requested tools.
     """
-    full = build_registry(include_shell_tools=include_shell_tools)
+    full = build_registry(
+        include_shell_tools=include_shell_tools,
+        session_id=session_id,
+        event_callback=event_callback,
+        financial_rigor_commands=financial_rigor_commands,
+        report_workspace_handler=report_workspace_handler,
+    )
     return _filter_registry(full, tool_names, include_shell_tools=include_shell_tools)
 
 

@@ -244,6 +244,41 @@ class SessionStore:
             attempt.to_dict(),
         )
 
+    def list_attempts(self, session_id: str | None = None) -> List[Attempt]:
+        """List persisted attempts, including work orphaned by a restart.
+
+        Agent tasks themselves live in the server process.  Walking the
+        durable attempt files is therefore the source of truth during startup
+        reconciliation, when the in-memory task registry is necessarily
+        empty.
+        """
+
+        if session_id:
+            session_dirs = [self._session_dir(session_id)]
+        elif self.base_dir.exists():
+            session_dirs = [path for path in self.base_dir.iterdir() if path.is_dir()]
+        else:
+            session_dirs = []
+
+        attempts: List[Attempt] = []
+        for session_dir in session_dirs:
+            attempts_dir = session_dir / "attempts"
+            if not attempts_dir.exists():
+                continue
+            for attempt_dir in attempts_dir.iterdir():
+                if not attempt_dir.is_dir():
+                    continue
+                data = self._read_json(attempt_dir / "attempt.json")
+                if data is None:
+                    continue
+                try:
+                    attempts.append(Attempt.from_dict(data))
+                except (TypeError, ValueError):
+                    logger.warning("Skipping invalid attempt record: %s", attempt_dir)
+
+        attempts.sort(key=lambda item: item.created_at, reverse=True)
+        return attempts
+
     # ---- IO Helpers ----
 
     @staticmethod

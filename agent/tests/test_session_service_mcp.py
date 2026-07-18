@@ -8,7 +8,11 @@ from pathlib import Path
 
 from src.session.events import EventBus
 from src.session.models import Attempt, AttemptStatus
-from src.session.service import SessionService
+from src.session.service import (
+    _EQUITY_DEEP_REPORT_MAX_ITERATIONS,
+    _STANDARD_AGENT_MAX_ITERATIONS,
+    SessionService,
+)
 from src.session.store import SessionStore
 
 
@@ -21,8 +25,11 @@ class _DummyIndex:
 
 
 class _DummyAgentLoop:
-    def __init__(self, *, registry, llm, event_callback, max_iterations, persistent_memory) -> None:
-        del registry, llm, event_callback, max_iterations, persistent_memory
+    observed_max_iterations: list[int] = []
+
+    def __init__(self, *, registry, llm, event_callback, max_iterations, persistent_memory, usage_recorder) -> None:
+        del registry, llm, event_callback, persistent_memory, usage_recorder
+        self.observed_max_iterations.append(max_iterations)
 
     def run(self, *, user_message: str, history, session_id: str) -> dict[str, str]:
         del user_message, history, session_id
@@ -70,6 +77,17 @@ def test_run_with_agent_keeps_event_loop_responsive_during_registry_build(
     assert result["status"] == "completed"
     assert tick_times, "Expected the event loop ticker to run while registry build was pending"
     assert tick_times[0] < 0.18, f"Registry build blocked the event loop for too long: {tick_times[0]:.3f}s"
+    assert _DummyAgentLoop.observed_max_iterations[-1] == _STANDARD_AGENT_MAX_ITERATIONS
+
+
+def test_equity_deep_report_has_dedicated_iteration_budget() -> None:
+    assert _EQUITY_DEEP_REPORT_MAX_ITERATIONS > _STANDARD_AGENT_MAX_ITERATIONS
+
+
+def test_deep_report_gate_defaults_to_disabled(monkeypatch) -> None:
+    monkeypatch.delenv("VIBE_TRADING_DEEP_REPORT_ENABLED", raising=False)
+
+    assert SessionService._deep_report_enabled() is False
 
 
 def test_completed_attempt_persists_react_trace(monkeypatch, tmp_path: Path) -> None:

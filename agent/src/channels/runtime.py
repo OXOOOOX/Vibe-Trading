@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -26,6 +27,7 @@ from src.channels.research_sessions import (
 )
 from src.channels.utils import safe_filename
 from src.config.paths import get_data_dir
+from src.portfolio.research_digest import build_research_digest, digest_from_brief
 from src.portfolio.state import normalize_symbol
 from src.session.models import Message, Session
 
@@ -35,6 +37,16 @@ _REPORT_DATE_ISO = re.compile(r"(?<!\d)(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})(?!\
 _REPORT_DATE_CN = re.compile(r"(?<!\d)(20\d{2})年(\d{1,2})月(\d{1,2})日")
 _REPORT_TRAILING_DATE = re.compile(
     r"[\s:：_—-]*(?:20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}|20\d{2}年\d{1,2}月\d{1,2}日)\s*$"
+)
+_RESEARCH_CONTINUATION_MARKERS = (
+    "回到刚才",
+    "回到之前",
+    "继续刚才",
+    "接着刚才",
+    "刚才关于",
+    "这份报告",
+    "刚才的session",
+    "刚才的会话",
 )
 _SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -69,11 +81,22 @@ def _shanghai_time(value: str | None) -> str:
     return parsed.strftime("%H:%M")
 
 
+def _pdf_report_body(content: str) -> str:
+    """Remove model preamble and the duplicate H1 from the rendered PDF body."""
+
+    text = str(content or "").strip()
+    heading = re.search(r"(?m)^#\s+\S.*$", text)
+    if heading is None:
+        return text
+    body = text[heading.end() :].lstrip()
+    return re.sub(r"^(?:---\s*)+", "", body).lstrip()
+
+
 def _render_research_pdf(title: str, content: str, target: Path) -> Path:
     """Persist a PDF using the same ReportLab renderer as the Web export."""
     from api_server import _render_pdf_reportlab
 
-    payload = _render_pdf_reportlab(title, content)
+    payload = _render_pdf_reportlab(title, _pdf_report_body(content))
     if not payload.startswith(b"%PDF-"):
         raise RuntimeError("PDF renderer returned an invalid document")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -81,6 +104,14 @@ def _render_research_pdf(title: str, content: str, target: Path) -> Path:
     temp.write_bytes(payload)
     temp.replace(target)
     return target
+
+
+def _render_deep_report_pdf_bytes(title: str, content: str) -> bytes:
+    """Reuse the server's deterministic ReportLab renderer for persisted reports."""
+
+    from api_server import _render_pdf_reportlab
+
+    return _render_pdf_reportlab(title, content)
 
 
 def _report_title(report: str, fallback: str = "研究报告") -> str:
@@ -136,20 +167,77 @@ def _looks_like_report(content: str) -> bool:
     return has_title and (sections >= 2 or tables >= 4)
 
 
-def _research_delivery_note(label: str, report: str) -> str:
-    """Build the short Feishu companion text for a PDF research report."""
-    title = ""
-    for line in report.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("# "):
-            title = stripped[2:].strip()
-            break
+_REQUIRED_RESEARCH_EVIDENCE = {
+    "holding": ("portfolio_state", "get_data_context"),
+    "portfolio": ("portfolio_state", "get_data_context"),
+    "premarket": ("portfolio_state", "get_data_context"),
+    "custom_stock": ("get_data_context",),
+}
 
+
+def _research_evidence_gap(
+    action: str,
+    react_trace: list[dict[str, Any]],
+) -> tuple[str, ...]:
+    """Return required evidence tools that did not complete successfully."""
+
+    required = _REQUIRED_RESEARCH_EVIDENCE.get(str(action or ""), ())
+    if not required:
+        return ()
+
+    successful: set[str] = set()
+    for item in react_trace or []:
+        if item.get("type") != "tool_call":
+            continue
+        tool = str(item.get("tool") or "")
+        if tool not in required:
+            continue
+        preview = str(item.get("result_preview") or "")
+        lowered = preview.lower()
+        failed = any(
+            marker in lowered
+            for marker in (
+                '"status": "error"',
+                '"status":"error"',
+                "tool '",
+                "not found",
+                "unknown tool",
+            )
+        )
+        if not failed:
+            successful.add(tool)
+
+    return tuple(tool for tool in required if tool not in successful)
+
+
+def _research_evidence_block_notice(label: str, gap: tuple[str, ...]) -> str:
+    names = {
+        "portfolio_state": "当前持仓",
+        "get_data_context": "行情/新闻数据",
+    }
+    missing = "、".join(names.get(tool, tool) for tool in gap)
+    return (
+        f"⚠️ {label}本次未生成可交付报告。\n"
+        f"未成功校核：{missing or '研究数据'}。为避免把旧行情包装成新报告，"
+        "系统已拦截 PDF；上一份报告仍保留。请重新点击“刷新盘中判断”或“重新分析”。"
+    )
+
+
+def _research_delivery_note(
+    label: str, report: str, digest: dict[str, Any] | None = None
+) -> str:
+    """Build a useful text fallback for the structured Feishu completion card."""
+    digest = dict(digest or build_research_digest(report, label=label).to_dict())
+    title = str(digest.get("title") or label)
     lines = [f"✅ {label}已完成"]
     if title and title != label:
         lines.append(f"报告：{title}")
-    lines.append("完整正文和表格见 PDF 附件；飞书中仅保留这条简要说明。")
-    lines.append("后续可直接发送文字，在当前专题 Session 中继续讨论。")
+    lines.append(f"当前走势：{digest.get('trend_summary') or '请查看 PDF 获取完整判断。'}")
+    lines.append(f"条件单：{digest.get('condition_summary') or '本次未提取到新增条件建议。'}")
+    market_as_of = str(digest.get("market_as_of") or "").strip()
+    if market_as_of:
+        lines.append(f"数据截至：{market_as_of}")
+    lines.append("完整正文和表格见 PDF 附件；后续可在当前专题 Session 中继续讨论。")
     return "\n".join(lines)
 
 
@@ -206,11 +294,23 @@ class ChannelRuntime:
         )
         self.session_map_path = session_map_path or (get_data_dir() / "channels" / "sessions.json")
         self._session_map: dict[str, str] = {}
+        self._pending_session_resets: dict[str, dict[str, Any]] = {}
         self._consumer_task: asyncio.Task[None] | None = None
         self._manager_task: asyncio.Task[Any] | None = None
         self._handler_tasks: set[asyncio.Task[None]] = set()
+        self._terminal_delivery_task: asyncio.Task[None] | None = None
+        self._terminal_delivery_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._queued_terminal_jobs: set[str] = set()
         self._running = False
         self._daily_runs_by_chat: dict[str, str] = {}
+        self._terminal_delivery_enabled = bool(
+            self.manager is not None
+            and self.dispatcher is not None
+            and callable(getattr(self.dispatcher, "add_listener", None))
+            and getattr(self.dispatcher, "store", None) is not None
+        )
+        if self._terminal_delivery_enabled:
+            self.dispatcher.add_listener(self._on_dispatch_job)
 
     async def start(self, *, start_manager: bool = True) -> None:
         """Start channel processing and, optionally, platform adapters."""
@@ -218,14 +318,22 @@ class ChannelRuntime:
             return
         self._session_map = self._load_session_map()
         self._running = True
+        self.bus.require_inbound_acceptance = True
         if start_manager and self.manager is not None:
             self._manager_task = asyncio.create_task(self.manager.start_all())
             await asyncio.sleep(0)
         self._consumer_task = asyncio.create_task(self._consume_loop())
+        if self._terminal_delivery_enabled:
+            self._terminal_delivery_task = asyncio.create_task(
+                self._terminal_delivery_loop(), name="channel-terminal-delivery"
+            )
+            for job in self.dispatcher.store.undelivered_terminal():
+                self._queue_terminal_delivery(job.job_id)
 
     async def stop(self) -> None:
         """Stop channel processing and platform adapters."""
         self._running = False
+        self.bus.require_inbound_acceptance = False
         if self._consumer_task is not None:
             self._consumer_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -237,6 +345,11 @@ class ChannelRuntime:
             with suppress(asyncio.CancelledError):
                 await task
         self._handler_tasks.clear()
+        if self._terminal_delivery_task is not None:
+            self._terminal_delivery_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._terminal_delivery_task
+            self._terminal_delivery_task = None
         if self.manager is not None:
             await self.manager.stop_all()
         if self._manager_task is not None:
@@ -246,12 +359,31 @@ class ChannelRuntime:
 
     def status(self) -> dict[str, Any]:
         """Return runtime and channel status."""
+        channels = self.manager.get_status() if self.manager is not None else {}
+        feishu = channels.get("feishu", {})
+        pending_deliveries = (
+            self.dispatcher.store.pending_delivery_count()
+            if self._terminal_delivery_enabled
+            else 0
+        )
+        persisted_at = feishu.get("last_persisted_at")
+        recent_error = feishu.get("last_error")
+        if self._terminal_delivery_enabled:
+            persisted_at = persisted_at or self.dispatcher.store.latest_persisted_at(
+                "feishu"
+            )
+            recent_error = recent_error or self.dispatcher.store.latest_error("feishu")
         return {
             "running": self._running,
             "inbound_queue": self.bus.inbound_size,
             "outbound_queue": self.bus.outbound_size,
             "session_count": len(self._session_map),
-            "channels": self.manager.get_status() if self.manager is not None else {},
+            "recent_received_at": feishu.get("last_received_at"),
+            "recent_persisted_at": persisted_at,
+            "recent_error": recent_error,
+            "inflight_messages": int(feishu.get("inflight_messages") or 0),
+            "pending_terminal_deliveries": pending_deliveries,
+            "channels": channels,
         }
 
     async def _consume_loop(self) -> None:
@@ -260,6 +392,226 @@ class ChannelRuntime:
             task = asyncio.create_task(self._handle_inbound(msg))
             self._handler_tasks.add(task)
             task.add_done_callback(self._handler_tasks.discard)
+            task.add_done_callback(lambda completed, inbound=msg: self._finish_inbound(inbound, completed))
+
+    @staticmethod
+    def _finish_inbound(msg: InboundMessage, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            msg.reject(asyncio.CancelledError())
+            return
+        error = task.exception()
+        if error is not None:
+            msg.reject(error)
+        else:
+            msg.accept({"handled": True})
+
+    def _on_dispatch_job(self, job: Any) -> None:
+        """Queue durable channel delivery whenever a dispatch job becomes terminal."""
+        if not self._terminal_delivery_enabled or not self._running:
+            return
+        if str(getattr(job, "status", "")) not in {"completed", "failed", "cancelled"}:
+            return
+        if str(getattr(job, "delivery_status", "")) not in {
+            "pending",
+            "delivering",
+            "retrying",
+        }:
+            return
+        self._queue_terminal_delivery(str(job.job_id))
+
+    def _queue_terminal_delivery(self, job_id: str) -> None:
+        if not job_id or job_id in self._queued_terminal_jobs:
+            return
+        self._queued_terminal_jobs.add(job_id)
+        self._terminal_delivery_queue.put_nowait(job_id)
+
+    async def _terminal_delivery_loop(self) -> None:
+        while True:
+            job_id = await self._terminal_delivery_queue.get()
+            self._queued_terminal_jobs.discard(job_id)
+            job = self.dispatcher.store.get(job_id)
+            if job is None or job.delivery_status == "delivered":
+                continue
+            channel = self.manager.get_channel(job.source) if self.manager is not None else None
+            if channel is None or not channel.is_running:
+                await asyncio.sleep(1)
+                if self._running:
+                    self._queue_terminal_delivery(job_id)
+                continue
+            try:
+                await self._deliver_terminal_job(job)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep the durable worker alive
+                current = self.dispatcher.store.start_delivery_attempt(job_id)
+                if current is not None:
+                    current = self.dispatcher.store.mark_delivery_retry(
+                        job_id, f"{type(exc).__name__}: {exc}"
+                    )
+                logger.exception("Unable to prepare terminal delivery for job %s", job_id)
+                if (
+                    current is not None
+                    and current.delivery_status == "retrying"
+                    and self._running
+                ):
+                    await self._delivery_retry_pause(
+                        1 if current.delivery_attempts == 1 else 3
+                    )
+                    self._queue_terminal_delivery(job_id)
+
+    async def _deliver_terminal_job(self, job: Any) -> None:
+        store = self.dispatcher.store
+        outbound, delivery_kind = await self._terminal_outbound(job)
+        stable_uuid = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"vibe-trading:dispatch:{job.job_id}:{delivery_kind}",
+            )
+        )
+        outbound.metadata.update(
+            {
+                "_channel_runtime": True,
+                "_delivery_uuid": stable_uuid,
+                "_delivery_kind": delivery_kind,
+                "dispatch_job_id": job.job_id,
+                "attempt_id": job.attempt_id,
+                "session_id": job.session_id,
+            }
+        )
+
+        while True:
+            current = store.get(job.job_id)
+            if current is None or current.delivery_status == "delivered":
+                return
+            if current.delivery_attempts >= 3 and current.delivery_status != "delivering":
+                return
+            current = store.start_delivery_attempt(job.job_id)
+            if current is None:
+                return
+            try:
+                await self.manager.send_direct(outbound)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - persisted retry state is intentional
+                error = f"{type(exc).__name__}: {exc}"
+                current = store.mark_delivery_retry(job.job_id, error)
+                logger.warning(
+                    "Terminal channel delivery failed for job %s (attempt %s/3): %s",
+                    job.job_id,
+                    getattr(current, "delivery_attempts", "?"),
+                    error,
+                )
+                attempts = int(getattr(current, "delivery_attempts", 3) or 3)
+                if attempts >= 3:
+                    return
+                await self._delivery_retry_pause(1 if attempts == 1 else 3)
+                continue
+            store.mark_delivered(job.job_id)
+            return
+
+    async def _delivery_retry_pause(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+
+    async def _terminal_outbound(self, job: Any) -> tuple[OutboundMessage, str]:
+        metadata = dict(getattr(job, "source_metadata", {}) or {})
+        metadata.pop("include_shell_tools", None)
+        chat_id = str(metadata.get("channel_chat_id") or "")
+        if not chat_id:
+            raise RuntimeError(f"dispatch job {job.job_id} has no channel_chat_id")
+        msg = InboundMessage(
+            channel=str(job.source),
+            sender_id="",
+            chat_id=chat_id,
+            content=str(job.content),
+            metadata=metadata,
+            session_key_override=str(metadata.get("channel_session_key") or "") or None,
+            source_event_id=getattr(job, "source_event_id", None),
+        )
+
+        if job.status == "completed":
+            reply = next(
+                (
+                    message
+                    for message in reversed(
+                        self.session_service.get_messages(job.session_id, limit=200)
+                    )
+                    if message.role == "assistant"
+                    and message.linked_attempt_id == job.attempt_id
+                ),
+                None,
+            )
+            if reply is None:
+                content = "任务已完成，但读取最终回答失败。请重新发送问题。"
+                media: list[str] = []
+                delivery_kind = "completed-answer-missing"
+            else:
+                evidence_gap = self._attempt_research_evidence_gap(
+                    msg,
+                    session_id=job.session_id,
+                    attempt_id=job.attempt_id,
+                )
+                media = (
+                    []
+                    if evidence_gap
+                    else await self._research_pdf_media(
+                        msg,
+                        session_id=job.session_id,
+                        attempt_id=job.attempt_id,
+                        reply=reply,
+                    )
+                )
+                is_research_report = _is_completed_feishu_research(
+                    msg, job.attempt_id, reply
+                )
+                is_pdf_report = is_research_report and bool(media)
+                label = str(metadata.get("research_label") or "研究报告").strip()
+                if evidence_gap:
+                    metadata["research_data_blocked"] = True
+                    metadata["research_missing_evidence"] = list(evidence_gap)
+                    content = _research_evidence_block_notice(label, evidence_gap)
+                elif is_pdf_report:
+                    digest = build_research_digest(reply.content, label=label).to_dict()
+                    metadata["research_completion"] = digest
+                    content = _research_delivery_note(label, reply.content, digest)
+                elif is_research_report:
+                    content = (
+                        f"⚠️ {label}已完成，但 PDF 生成失败。\n"
+                        "为避免在飞书中发送大量表格正文，本次未发送报告内容；请重试生成报告。"
+                    )
+                else:
+                    content = reply.content
+                delivery_kind = (
+                    "research-evidence-blocked" if evidence_gap else "completed-answer"
+                )
+                if is_pdf_report:
+                    metadata["delivery_mode"] = "report_pdf"
+        elif job.status == "cancelled":
+            content = "任务已取消；如需继续，请重新发送问题。"
+            media = []
+            delivery_kind = "cancelled-notice"
+        else:
+            raw_error = str(getattr(job, "error", "") or "处理失败")
+            if "service restarted during execution" in raw_error:
+                content = (
+                    "服务重启时该任务正在执行，已停止任务以避免重复研究。"
+                    "请重新发送问题。"
+                )
+            else:
+                concise_error = " ".join(raw_error.split())[:180]
+                content = f"任务处理失败：{concise_error}。请稍后重试。"
+            media = []
+            delivery_kind = "failed-notice"
+
+        return (
+            OutboundMessage(
+                channel=str(job.source),
+                chat_id=chat_id,
+                content=content,
+                media=media,
+                metadata=self._response_metadata(msg, **metadata),
+            ),
+            delivery_kind,
+        )
 
     async def _handle_inbound(self, msg: InboundMessage) -> None:
         try:
@@ -322,14 +674,21 @@ class ChannelRuntime:
                 await self._run_daily_portfolio(msg)
                 return
 
+            msg = self._resume_recent_research_route(msg)
             session_id = self._session_for(msg)
             if bool((msg.metadata or {}).get("research_activate")):
                 self._activate_research_session(msg, session_id)
+            source_event_id = (
+                msg.source_event_id
+                or str((msg.metadata or {}).get("message_id") or "")
+                or None
+            )
             if self.dispatcher is not None:
                 result = await self.dispatcher.submit(
                     session_id,
                     msg.content,
                     source=msg.channel,
+                    source_event_id=source_event_id,
                     source_metadata={
                         "channel_session_key": msg.session_key,
                         "channel_chat_id": msg.chat_id,
@@ -343,19 +702,43 @@ class ChannelRuntime:
                     msg.content,
                     include_shell_tools=False,
                 )
+            if isinstance(result, dict):
+                msg.accept(result)
+            if (
+                self._terminal_delivery_enabled
+                and self.dispatcher is not None
+                and source_event_id is not None
+            ):
+                return
             attempt_id = result.get("attempt_id") if isinstance(result, dict) else None
             reply = await self._wait_for_reply(session_id, attempt_id)
-            media = await self._research_pdf_media(
+            evidence_gap = self._attempt_research_evidence_gap(
                 msg,
                 session_id=session_id,
                 attempt_id=attempt_id,
-                reply=reply,
+            )
+            media = (
+                []
+                if evidence_gap
+                else await self._research_pdf_media(
+                    msg,
+                    session_id=session_id,
+                    attempt_id=attempt_id,
+                    reply=reply,
+                )
             )
             is_research_report = _is_completed_feishu_research(msg, attempt_id, reply)
             is_pdf_report = is_research_report and bool(media)
             label = str((msg.metadata or {}).get("research_label") or "研究报告").strip()
-            if is_pdf_report:
-                outbound_content = _research_delivery_note(label, reply.content)
+            completion_metadata: dict[str, Any] = {}
+            if evidence_gap:
+                completion_metadata["research_data_blocked"] = True
+                completion_metadata["research_missing_evidence"] = list(evidence_gap)
+                outbound_content = _research_evidence_block_notice(label, evidence_gap)
+            elif is_pdf_report:
+                digest = build_research_digest(reply.content, label=label).to_dict()
+                completion_metadata["research_completion"] = digest
+                outbound_content = _research_delivery_note(label, reply.content, digest)
             elif is_research_report:
                 outbound_content = (
                     f"⚠️ {label}已完成，但 PDF 生成失败。\n"
@@ -374,6 +757,7 @@ class ChannelRuntime:
                         _channel_runtime=True,
                         attempt_id=attempt_id,
                         session_id=session_id,
+                        **completion_metadata,
                         **({"delivery_mode": "report_pdf"} if is_pdf_report else {}),
                     ),
                 )
@@ -429,6 +813,149 @@ class ChannelRuntime:
         self._session_map[base_key] = session_id
         self._save_session_map()
 
+    async def continue_session_in_feishu(
+        self, session_id: str, delivery_target: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Make a web session the active conversation for a bound Feishu chat.
+
+        The mapping is persisted only after Feishu acknowledges the short
+        handoff notice, so a failed delivery never silently redirects a chat.
+        """
+        session = self.session_service.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Session {session_id} not found")
+        if self.manager is None:
+            raise RuntimeError("Feishu channel manager is unavailable")
+
+        chat_id = str(delivery_target.get("chat_id") or "").strip()
+        if not chat_id:
+            raise ValueError("The Feishu delivery target has no chat ID")
+        session_key = str(delivery_target.get("session_key") or f"feishu:{chat_id}")
+        if not session_key.startswith("feishu:"):
+            raise ValueError("The delivery target is not a Feishu conversation")
+
+        title = str(getattr(session, "title", "") or session_id)
+        await self.manager.send_direct(
+            OutboundMessage(
+                channel="feishu",
+                chat_id=chat_id,
+                content=f"已切换到网页会话「{title}」。接下来直接在这里继续聊即可。",
+                metadata={"_channel_runtime": True, "session_handoff": True},
+            )
+        )
+        self._session_map[session_key] = session_id
+        self._save_session_map()
+        return {
+            "status": "continued_in_feishu",
+            "session_id": session_id,
+            "target_id": str(delivery_target.get("target_id") or ""),
+            "chat_type": str(delivery_target.get("chat_type") or "p2p"),
+        }
+
+    def _resume_recent_research_route(self, msg: InboundMessage) -> InboundMessage:
+        """Resolve explicit same-chat continuation before semantic session search."""
+
+        if msg.channel != "feishu":
+            return msg
+        normalized_text = re.sub(r"\s+", "", str(msg.content or "")).lower()
+        if not any(marker in normalized_text for marker in _RESEARCH_CONTINUATION_MARKERS):
+            return msg
+        match = re.search(r"(?<!\d)(\d{6})(?:\.(SH|SZ|BJ))?(?!\d)", msg.content, re.I)
+        symbol = normalize_symbol(
+            f"{match.group(1)}.{match.group(2)}" if match and match.group(2) else match.group(1)
+        ).upper() if match else ""
+        base_key = self._base_session_key(msg)
+
+        candidate_ids: list[str] = []
+        if symbol:
+            route_key = f"{base_key}:research:symbol:{symbol}"
+            mapped = self._session_map.get(route_key)
+            if mapped:
+                candidate_ids.append(mapped)
+        else:
+            found = self._latest_report_for_chat(msg)
+            if found:
+                candidate_ids.append(found[0])
+
+        list_sessions = getattr(self.session_service, "list_sessions", None)
+        if callable(list_sessions):
+            sessions = list(list_sessions(limit=500))
+            sessions.sort(
+                key=lambda item: str(
+                    getattr(item, "updated_at", None)
+                    or getattr(item, "created_at", None)
+                    or ""
+                ),
+                reverse=True,
+            )
+            for session in sessions:
+                config = dict(getattr(session, "config", {}) or {})
+                research = dict(config.get("research_session") or {})
+                if config.get("channel") != msg.channel or config.get("channel_chat_id") != msg.chat_id:
+                    continue
+                session_symbol = str(research.get("symbol") or "")
+                if symbol and normalize_symbol(session_symbol).upper() != symbol:
+                    continue
+                session_id = str(getattr(session, "session_id", "") or "")
+                if session_id and session_id not in candidate_ids:
+                    candidate_ids.append(session_id)
+
+        get_session = getattr(self.session_service, "get_session", None)
+        if candidate_ids:
+            def candidate_score(session_id: str) -> tuple[int, str, str]:
+                messages = self.session_service.get_messages(session_id, limit=200)
+                reports = [
+                    message
+                    for message in messages
+                    if message.role == "assistant" and _looks_like_report(message.content)
+                ]
+                latest_report = max(
+                    (str(message.created_at or "") for message in reports),
+                    default="",
+                )
+                latest_message = max(
+                    (str(message.created_at or "") for message in messages),
+                    default="",
+                )
+                return (1 if reports else 0, latest_report, latest_message)
+
+            candidate_ids.sort(key=candidate_score, reverse=True)
+        session = get_session(candidate_ids[0]) if candidate_ids and callable(get_session) else None
+        if session is None:
+            return msg
+        config = dict(getattr(session, "config", {}) or {})
+        research = dict(config.get("research_session") or {})
+        session_id = str(getattr(session, "session_id", "") or "")
+        resolved_symbol = str(research.get("symbol") or symbol)
+        route_key = str(
+            research.get("route_key")
+            or (
+                f"{base_key}:research:symbol:{resolved_symbol}"
+                if resolved_symbol
+                else config.get("channel_session_key")
+                or base_key
+            )
+        )
+        self._session_map[route_key] = session_id
+        self._session_map[base_key] = session_id
+        self._save_session_map()
+        metadata = {
+            **dict(msg.metadata or {}),
+            "research_activate": True,
+            "research_base_session_key": base_key,
+            "research_route_key": route_key,
+            "research_session_kind": str(research.get("kind") or "symbol" if resolved_symbol else ""),
+            "research_action": str(research.get("action") or "holding" if resolved_symbol else ""),
+            "research_label": str(research.get("label") or getattr(session, "title", "研究专题")),
+            "research_symbol": resolved_symbol,
+            "session_route_resumed": True,
+        }
+        return replace(
+            msg,
+            metadata=metadata,
+            session_key_override=route_key,
+        )
+
     def _is_session_busy(self, session_id: str) -> bool:
         get_session = getattr(self.session_service, "get_session", None)
         session = get_session(session_id) if callable(get_session) else None
@@ -449,23 +976,35 @@ class ChannelRuntime:
         open_hub: bool = False,
         **metadata: Any,
     ) -> None:
-        await self.bus.publish_outbound(
-            OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=content,
-                metadata=self._response_metadata(
-                    msg,
-                    _channel_runtime=True,
-                    _research_hub=open_hub,
-                    research_base_session_key=self._base_session_key(msg),
-                    **metadata,
-                ),
-            )
+        outbound = OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=content,
+            metadata=self._response_metadata(
+                msg,
+                _channel_runtime=True,
+                _research_hub=open_hub,
+                research_base_session_key=self._base_session_key(msg),
+                **metadata,
+            ),
         )
+        if msg.acceptance is not None and self.manager is not None:
+            source_event_id = msg.source_event_id or str(
+                (msg.metadata or {}).get("message_id") or ""
+            )
+            if source_event_id:
+                outbound.metadata["_delivery_uuid"] = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"vibe-trading:control:{msg.channel}:{source_event_id}",
+                    )
+                )
+            await self.manager.send_direct(outbound)
+            return
+        await self.bus.publish_outbound(outbound)
 
     async def _start_new_conversation(self, msg: InboundMessage) -> None:
-        """Replace only the active logical topic with a blank Session."""
+        """Reset the active topic without persisting a blank Session."""
         base_key = self._base_session_key(msg)
         current_id = self._session_map.get(base_key)
         current_route = self._active_route_key(base_key, current_id)
@@ -491,19 +1030,26 @@ class ChannelRuntime:
                 },
             }
         config["channel_session_key"] = route_key
-        created = self.session_service.create_session(title=title, config=config)
-        new_id = _session_id(created)
-        self._session_map[route_key] = new_id
-        self._session_map[base_key] = new_id
-        self._save_session_map()
+        self._pending_session_resets[base_key] = {
+            "route_key": route_key,
+            "title": title,
+            "config": config,
+        }
+        mapping_changed = False
+        for key in {base_key, route_key}:
+            if self._session_map.get(key) == current_id:
+                self._session_map.pop(key, None)
+                mapping_changed = True
+        if mapping_changed:
+            self._save_session_map()
         research = dict(config.get("research_session") or {})
         label = str(research.get("label") or friendly_route_name(base_key, route_key))
         await self._publish_research_control(
             msg,
-            f"✅ 已为{label}开启新对话，其他专题 Session 保持不变。",
+            f"✅ 已为{label}开启新对话；Session 将在发送下一条消息时创建，其他专题保持不变。",
             session_reset=True,
             previous_session_id=current_id,
-            session_id=new_id,
+            session_pending=True,
             research_route_key=route_key,
         )
 
@@ -587,8 +1133,14 @@ class ChannelRuntime:
                 "research_action": action,
                 "research_label": route.label,
                 "research_refresh": True,
+                "research_refresh_diff": True,
                 **route.metadata(),
             }
+        )
+        prompt += (
+            "\n\n这是同一专题的刷新任务。请先对照当前 Session 中上一份报告的决策摘要，"
+            "在新报告的决策摘要后增加“## 相比上次的变化”，明确列出上次结论、"
+            "当前变化、新增或失效证据以及本次数据截至时间；不要把刷新创建成新的专题。"
         )
         return replace(
             msg,
@@ -632,7 +1184,25 @@ class ChannelRuntime:
 
     async def _send_previous_report_pdf(self, msg: InboundMessage) -> None:
         """Send the newest complete report from this chat without invoking the model."""
-        found = self._latest_report_for_chat(msg)
+        preferred_session_id = str(
+            (msg.metadata or {}).get("report_source_session_id") or ""
+        )
+        found: tuple[str, Message] | None = None
+        if preferred_session_id:
+            report = next(
+                (
+                    message
+                    for message in reversed(
+                        self.session_service.get_messages(preferred_session_id, limit=200)
+                    )
+                    if message.role == "assistant" and _looks_like_report(message.content)
+                ),
+                None,
+            )
+            if report is not None:
+                found = (preferred_session_id, report)
+        if found is None:
+            found = self._latest_report_for_chat(msg)
         if found is None:
             await self.bus.publish_outbound(
                 OutboundMessage(
@@ -650,6 +1220,7 @@ class ChannelRuntime:
 
         source_session_id, report = found
         title = _report_title(report.content)
+        digest = build_research_digest(report.content, label=title).to_dict()
         safe_session_id = re.sub(r"[^A-Za-z0-9_-]+", "_", source_session_id)[:80] or "session"
         target = (
             self.session_map_path.parent
@@ -685,17 +1256,14 @@ class ChannelRuntime:
             OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
-                content=(
-                    "✅ PDF 已生成\n"
-                    f"报告：{title}\n"
-                    "完整正文和表格见 PDF 附件；后续可直接在当前聊天继续讨论。"
-                ),
+                content=_research_delivery_note(title, report.content, digest),
                 media=[str(rendered)],
                 metadata=self._response_metadata(
                     msg,
                     _channel_runtime=True,
                     delivery_mode="report_pdf",
                     report_source_session_id=source_session_id,
+                    research_completion=digest,
                 ),
             )
         )
@@ -737,6 +1305,27 @@ class ChannelRuntime:
                 attempt_id,
             )
             return []
+
+    def _attempt_research_evidence_gap(
+        self,
+        msg: InboundMessage,
+        *,
+        session_id: str,
+        attempt_id: str | None,
+    ) -> tuple[str, ...]:
+        """Fail closed when a completed research draft lacks required evidence."""
+
+        action = str((msg.metadata or {}).get("research_action") or "")
+        if action not in _REQUIRED_RESEARCH_EVIDENCE or not attempt_id:
+            return ()
+        store = getattr(self.session_service, "store", None)
+        get_attempt = getattr(store, "get_attempt", None)
+        if not callable(get_attempt):
+            return ()
+        attempt = get_attempt(session_id, attempt_id)
+        if attempt is None:
+            return ()
+        return _research_evidence_gap(action, list(attempt.react_trace or []))
 
     @staticmethod
     def _session_stock_symbol(session: Any) -> str:
@@ -880,6 +1469,73 @@ class ChannelRuntime:
             }
         return None
 
+    def _deep_report_matches_chat(self, session_id: str, msg: InboundMessage) -> bool:
+        session = self.session_service.get_session(session_id)
+        if session is None:
+            return False
+        config = dict(getattr(session, "config", {}) or {})
+        return (
+            str(config.get("channel") or "") == msg.channel
+            and str(config.get("channel_chat_id") or "") == msg.chat_id
+        )
+
+    def _today_deep_report(
+        self,
+        symbol: str,
+        *,
+        today: str,
+        msg: InboundMessage | None = None,
+    ) -> dict[str, Any] | None:
+        """Return today's completed penetrative report for one exact symbol."""
+
+        service = getattr(self.session_service, "deep_reports", None)
+        latest = getattr(service, "latest_for_symbol", None)
+        if not callable(latest):
+            return None
+        record = latest(normalize_symbol(symbol).upper(), report_date=today)
+        if (
+            record is None
+            or record.status != "completed"
+            or record.quality_status == "failed_validation"
+            or (msg is not None and not self._deep_report_matches_chat(record.session_id, msg))
+        ):
+            return None
+        return {
+            "report_id": record.report_id,
+            "session_id": record.session_id,
+            "report_date": record.report_date,
+            "revision": record.revision,
+            "quality_status": record.quality_status,
+            "security_name": record.security_name,
+            "symbol": record.symbol,
+            "data_as_of": record.data_as_of,
+        }
+
+    def _daily_report_digest(
+        self, report: dict[str, Any], *, symbol: str
+    ) -> dict[str, Any] | None:
+        """Load the structured holding brief used to render a daily PDF."""
+        if self.daily_run_service is None:
+            return None
+        store = getattr(self.daily_run_service, "store", None)
+        run_id = str(report.get("run_id") or "")
+        if store is None or not run_id:
+            return None
+        safe_symbol = re.sub(r"[^A-Za-z0-9._-]+", "_", symbol)[:40] or "holding"
+        brief = store.read_json(run_id, f"outputs/holdings/{safe_symbol}/brief.json")
+        if not isinstance(brief, dict):
+            return None
+        title = f"{brief.get('name') or symbol} · 个股日报"
+        digest = digest_from_brief(brief, title=title).to_dict()
+        digest.update(
+            {
+                "delivery_kind": "daily_artifact",
+                "run_id": run_id,
+                "artifact_id": str(report.get("artifact_id") or ""),
+            }
+        )
+        return digest
+
     async def _seed_stock_report_context(
         self,
         session_id: str,
@@ -1000,7 +1656,8 @@ class ChannelRuntime:
         if action == "prepare":
             session = self._today_stock_session(msg, symbol, today=today)
             report = self._today_stock_report(symbol, today=today)
-            if session or report:
+            deep_report = self._today_deep_report(symbol, today=today, msg=msg)
+            if session or report or deep_report:
                 label = str(metadata.get("research_label") or symbol)
                 name = label.removesuffix("个股分析").strip() or symbol
                 await self.bus.publish_outbound(
@@ -1018,6 +1675,7 @@ class ChannelRuntime:
                                 "analysis_action": str(metadata.get("research_action") or "holding"),
                                 "session": session or {},
                                 "report": report or {},
+                                "deep_report": deep_report or {},
                             },
                         ),
                     )
@@ -1030,6 +1688,13 @@ class ChannelRuntime:
         if action == "start_stock_research":
             self.reset_session(msg.session_key)
             metadata.pop("stock_research_action", None)
+            return replace(msg, metadata=metadata)
+
+        if action == "start_deep_stock_research":
+            self.reset_session(msg.session_key)
+            metadata.pop("stock_research_action", None)
+            metadata["response_mode"] = "deep_report"
+            metadata["report_profile"] = "equity_deep_research"
             return replace(msg, metadata=metadata)
 
         if action == "resume_stock_session":
@@ -1090,11 +1755,13 @@ class ChannelRuntime:
                     f"已发送 {symbol} 今日个股日报（revision {report['revision']}）。\n"
                     "报告正文也已载入当前 Session，接下来可直接针对报告提问。"
                 )
+                digest = self._daily_report_digest(report, symbol=symbol)
             else:
                 content = (
                     f"已载入 {symbol} 今日个股日报（revision {report['revision']}）。\n"
                     "现在直接发送要补充研究的问题即可；不会重复生成原报告。"
                 )
+                digest = None
             await self.bus.publish_outbound(
                 OutboundMessage(
                     channel=msg.channel,
@@ -1108,6 +1775,56 @@ class ChannelRuntime:
                         daily_run_id=str(report["run_id"]),
                         delivery_mode="report_pdf" if media else "report_context",
                         stock_report_continuation=True,
+                        **({"research_completion": digest} if digest else {}),
+                    ),
+                )
+            )
+            return None
+
+        if action in {"send_deep_stock_report", "continue_deep_stock_report"}:
+            service = getattr(self.session_service, "deep_reports", None)
+            report_id = str(metadata.get("deep_report_id") or "")
+            record = service.get(report_id) if service is not None and report_id else None
+            if (
+                record is None
+                or record.status != "completed"
+                or record.quality_status == "failed_validation"
+                or normalize_symbol(record.symbol).upper() != symbol
+                or record.report_date != today
+                or not self._deep_report_matches_chat(record.session_id, msg)
+            ):
+                raise ValueError("今天的穿透式深度研究已不存在、过期或与当前股票不匹配。")
+            self._activate_existing_stock_session(msg, record.session_id)
+            media: list[str] = []
+            if action == "send_deep_stock_report":
+                try:
+                    path, record = service.ensure_pdf(record.report_id, _render_deep_report_pdf_bytes)
+                except Exception as exc:
+                    raise ValueError(f"穿透式报告 PDF 生成失败：{exc}") from exc
+                media = [str(path)]
+                content = (
+                    f"已发送 {symbol} 穿透式深度研究（revision {record.revision}，"
+                    f"{record.quality_status}）。报告上下文仍绑定在当前 Session，可直接继续提问。"
+                )
+            else:
+                content = (
+                    f"已切换到 {symbol} 穿透式深度研究 Session：`{record.session_id}`。\n"
+                    "现在直接发送问题即可继续研究，不会重复生成原报告。"
+                )
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=content,
+                    media=media,
+                    metadata=self._response_metadata(
+                        msg,
+                        _channel_runtime=True,
+                        session_id=record.session_id,
+                        report_id=record.report_id,
+                        report_profile=record.profile,
+                        delivery_mode="report_pdf" if media else "report_context",
+                        deep_report_continuation=True,
                     ),
                 )
             )
@@ -1122,17 +1839,34 @@ class ChannelRuntime:
             self._ensure_channel_policy(existing, msg)
             return existing
         metadata = dict(msg.metadata or {})
-        title = str(metadata.get("research_session_title") or f"{msg.channel}:{msg.chat_id}")
-        config: dict[str, Any] = {
-            "channel": msg.channel,
-            "channel_chat_id": msg.chat_id,
-            "channel_session_key": key,
-            "channel_policy": {
-                "research_only": True,
-                "allow_shell_tools": False,
-                "allow_trading_tools": False,
-            },
-        }
+        base_key = self._base_session_key(msg)
+        pending = self._pending_session_resets.get(base_key)
+        pending_route = str((pending or {}).get("route_key") or "")
+        explicit_route = str(metadata.get("research_route_key") or "")
+        use_pending = bool(
+            pending
+            and key in {base_key, pending_route}
+            and (not explicit_route or explicit_route == pending_route)
+        )
+        if pending and explicit_route and explicit_route != pending_route:
+            self._pending_session_resets.pop(base_key, None)
+        if use_pending:
+            self._pending_session_resets.pop(base_key, None)
+            key = pending_route or key
+            title = str(pending.get("title") or f"{msg.channel}:{msg.chat_id}")
+            config = dict(pending.get("config") or {})
+        else:
+            title = str(metadata.get("research_session_title") or f"{msg.channel}:{msg.chat_id}")
+            config = {
+                "channel": msg.channel,
+                "channel_chat_id": msg.chat_id,
+                "channel_session_key": key,
+                "channel_policy": {
+                    "research_only": True,
+                    "allow_shell_tools": False,
+                    "allow_trading_tools": False,
+                },
+            }
         if metadata.get("research_route_key"):
             config["research_session"] = {
                 "base_key": str(metadata.get("research_base_session_key") or ""),
@@ -1150,6 +1884,8 @@ class ChannelRuntime:
         )
         session_id = _session_id(session)
         self._session_map[key] = session_id
+        if use_pending:
+            self._session_map[base_key] = session_id
         self._save_session_map()
         return session_id
 

@@ -23,6 +23,7 @@ from src.portfolio.state import load_state, normalize_symbol
 
 
 _MIN_REPORT_COVERAGE_RATIO = 0.5
+_WORKER_CONTEXT_MAX_CHARS = 28_000
 
 
 def _now_local() -> str:
@@ -36,6 +37,14 @@ def _stable_hash(value: Any) -> str:
 
 def _safe_symbol(symbol: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", symbol)[:40] or "holding"
+
+
+def _safe_filename_part(value: Any, *, fallback: str) -> str:
+    """Preserve readable names while removing characters invalid in filenames."""
+
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(value or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ._")
+    return cleaned[:60] or fallback
 
 
 def _retention_days() -> int:
@@ -86,9 +95,9 @@ def _analysis_gate(
 ) -> dict[str, Any]:
     """Decide whether enough frozen data exists to justify model/report work.
 
-    A holding is eligible only when its context contains both a market payload
-    and at least one research document.  If fewer than half of the holdings are
-    eligible, the whole report is stopped before any model Session is created.
+    A holding is eligible only when its context contains a decision-usable daily
+    market scope and at least one research document. If fewer than half of the
+    holdings are eligible, the whole report stops before any model Session.
     """
 
     normalized = []
@@ -100,19 +109,42 @@ def _analysis_gate(
     market_symbols: set[str] = set()
     research_symbols: set[str] = set()
     for context in contexts:
+        decision_scopes = context.get("decision_scopes") if isinstance(context, dict) else None
+        if isinstance(decision_scopes, dict):
+            for raw_symbol, scopes in decision_scopes.items():
+                daily = scopes.get("daily_trend") if isinstance(scopes, dict) else None
+                if (
+                    isinstance(daily, dict)
+                    and daily.get("status") == "verified"
+                    and daily.get("actionability") == "price_actionable"
+                ):
+                    try:
+                        market_symbols.add(normalize_symbol(str(raw_symbol)).upper())
+                    except Exception:
+                        market_symbols.add(str(raw_symbol).upper())
         market = context.get("market") if isinstance(context, dict) else None
         if isinstance(market, dict):
             for series in market.get("series") or []:
                 symbol = _context_symbol(series)
-                if symbol and (
-                    series.get("latest") is not None
-                    or bool(series.get("bars"))
-                    or int(series.get("bar_count") or 0) > 0
+                interval = str(series.get("interval") or "1D")
+                if (
+                    symbol
+                    and interval == "1D"
+                    and series.get("actionability") == "price_actionable"
+                    and (
+                        series.get("latest") is not None
+                        or bool(series.get("bars"))
+                        or int(series.get("bar_count") or 0) > 0
+                    )
                 ):
                     market_symbols.add(symbol)
             for quote in market.get("quotes") or []:
                 symbol = _context_symbol(quote)
-                if symbol and quote.get("last_price") is not None:
+                if (
+                    symbol
+                    and quote.get("last_price") is not None
+                    and quote.get("actionability") == "price_actionable"
+                ):
                     market_symbols.add(symbol)
 
         research = context.get("research") if isinstance(context, dict) else None
@@ -208,6 +240,238 @@ def _contexts_for_symbol(
             item["research"] = research
         projected.append(item)
     return projected
+
+
+def _symbol_decision_scopes(
+    contexts: list[dict[str, Any]], symbol: str
+) -> dict[str, Any]:
+    """Return the newest per-conclusion quality contract for one symbol."""
+
+    normalized = normalize_symbol(symbol).upper()
+    for context in reversed(contexts):
+        scopes = context.get("decision_scopes") if isinstance(context, dict) else None
+        if not isinstance(scopes, dict):
+            continue
+        candidate = scopes.get(normalized)
+        if isinstance(candidate, dict):
+            return candidate
+        for raw_symbol, value in scopes.items():
+            if str(raw_symbol).upper() == normalized and isinstance(value, dict):
+                return value
+    # Backward compatibility for persisted v1 contexts and test fixtures.
+    series = [
+        item
+        for context in contexts
+        for item in ((context.get("market") or {}).get("series") or [])
+        if _context_symbol(item) == normalized
+    ]
+    daily_candidates = [
+        item for item in series if str(item.get("interval") or "1D") == "1D"
+    ]
+    intraday_candidates = [
+        item for item in series if str(item.get("interval") or "1D") != "1D"
+    ]
+
+    def legacy_scope(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        actionable = next(
+            (item for item in candidates if item.get("actionability") == "price_actionable"),
+            None,
+        )
+        chosen = actionable or (candidates[0] if candidates else {})
+        return {
+            "status": "verified" if actionable else "unavailable" if candidates else "not_requested",
+            "actionability": "price_actionable" if actionable else "analysis_only",
+            "as_of": _latest_timestamp(chosen),
+            "blocked_reasons": list(chosen.get("blocked_reasons") or []),
+            "reason": ", ".join(chosen.get("blocked_reasons") or []) or None,
+        }
+
+    daily = legacy_scope(daily_candidates)
+    intraday = legacy_scope(intraday_candidates)
+    basis = intraday if intraday.get("actionability") == "price_actionable" else (
+        daily if daily.get("actionability") == "price_actionable" else None
+    )
+    return {
+        "daily_trend": daily,
+        "intraday": intraday,
+        "condition_order": {
+            "status": "verified" if basis else "unavailable",
+            "actionability": "price_actionable" if basis else "analysis_only",
+            "basis": "intraday" if basis is intraday else "daily" if basis is daily else None,
+            "as_of": (basis or {}).get("as_of"),
+            "reason": None if basis else "legacy context has no actionable price series",
+        },
+        "fund_flow": {"status": "not_requested", "actionability": "analysis_only"},
+        "news": {"status": "partial"},
+        "fundamentals": {"status": "partial"},
+        "reports": {"status": "partial"},
+    }
+
+
+def _compact_value(value: Any, *, depth: int = 0) -> Any:
+    """Bound nested provider payloads without ever producing malformed JSON."""
+
+    if depth >= 4:
+        return str(value)[:240]
+    if isinstance(value, dict):
+        return {
+            str(key): _compact_value(child, depth=depth + 1)
+            for key, child in list(value.items())[:24]
+        }
+    if isinstance(value, list):
+        return [_compact_value(child, depth=depth + 1) for child in value[:12]]
+    if isinstance(value, str):
+        return value[:700]
+    return value
+
+
+def _compact_worker_context(
+    contexts: list[dict[str, Any]], symbol: str, *, max_chars: int = _WORKER_CONTEXT_MAX_CHARS
+) -> dict[str, Any]:
+    """Build a deterministic, valid and decision-scoped worker input DTO."""
+
+    normalized = normalize_symbol(symbol).upper()
+
+    def build(*, lean: bool) -> dict[str, Any]:
+        output: list[dict[str, Any]] = []
+        for context in contexts:
+            market = context.get("market") if isinstance(context.get("market"), dict) else {}
+            compact_series = []
+            for series in market.get("series") or []:
+                if _context_symbol(series) != normalized:
+                    continue
+                interval = str(series.get("interval") or "")
+                bar_limit = 20 if lean else (60 if interval == "1D" else 30)
+                compact_series.append(
+                    {
+                        "symbol": normalized,
+                        "interval": interval,
+                        "adjustment": series.get("adjustment"),
+                        "bar_count": series.get("bar_count"),
+                        "coverage": series.get("coverage"),
+                        "latest": _compact_value(series.get("latest")),
+                        "decision_status": series.get("decision_status"),
+                        "actionability": series.get("actionability"),
+                        "selected_quote": series.get("selected_quote"),
+                        "blocked_reasons": list(series.get("blocked_reasons") or []),
+                        "freshness": series.get("freshness"),
+                        "retrieval": series.get("retrieval"),
+                        "source_attempts": [
+                            _compact_value(item)
+                            for item in (series.get("source_attempts") or [])[-(3 if lean else 6) :]
+                        ],
+                        "bars": [
+                            _compact_value(item)
+                            for item in (series.get("bars") or [])[-bar_limit:]
+                        ],
+                    }
+                )
+
+            compact_research: dict[str, Any] = {}
+            research = context.get("research") if isinstance(context.get("research"), dict) else {}
+            for domain_name, domain in research.items():
+                if not isinstance(domain, dict):
+                    continue
+                items = domain.get("items") if isinstance(domain.get("items"), dict) else {}
+                symbol_item = items.get(normalized) if isinstance(items, dict) else None
+                if not isinstance(symbol_item, dict):
+                    symbol_item = {}
+                documents = []
+                for document in (symbol_item.get("documents") or [])[: (3 if lean else 6)]:
+                    if not isinstance(document, dict):
+                        continue
+                    documents.append(
+                        {
+                            key: _compact_value(document.get(key))
+                            for key in (
+                                "title",
+                                "published_at",
+                                "date",
+                                "url",
+                                "source",
+                                "summary",
+                                "data",
+                            )
+                            if document.get(key) is not None
+                        }
+                    )
+                compact_research[domain_name] = {
+                    "status": domain.get("status"),
+                    "mode": symbol_item.get("mode"),
+                    "warning": symbol_item.get("warning"),
+                    "documents": documents,
+                }
+
+            scopes = context.get("decision_scopes") if isinstance(context.get("decision_scopes"), dict) else {}
+            provider_health = [
+                {
+                    key: row.get(key)
+                    for key in (
+                        "source",
+                        "capability",
+                        "effective_status",
+                        "last_latency_ms",
+                        "consecutive_failures",
+                        "circuit_open",
+                        "last_error",
+                        "updated_at",
+                        "request_attempt_count",
+                    )
+                }
+                for row in (context.get("provider_health") or [])[: (10 if lean else 20)]
+                if isinstance(row, dict)
+            ]
+            output.append(
+                {
+                    "request_id": context.get("request_id"),
+                    "status": context.get("status"),
+                    "purpose": context.get("purpose"),
+                    "retrieved_at": context.get("retrieved_at"),
+                    "symbol": normalized,
+                    "decision_scopes": scopes.get(normalized) if isinstance(scopes, dict) else {},
+                    "market": {
+                        "status": market.get("status"),
+                        "series": compact_series,
+                        "quotes": [
+                            _compact_value(item)
+                            for item in market.get("quotes") or []
+                            if _context_symbol(item) == normalized
+                        ][:2],
+                    },
+                    "research": compact_research,
+                    "provider_health": provider_health,
+                }
+            )
+        return {"schema_version": 2, "symbol": normalized, "contexts": output}
+
+    full = build(lean=False)
+    if len(json.dumps(full, ensure_ascii=False, default=str)) <= max_chars:
+        return full
+    lean = build(lean=True)
+    if len(json.dumps(lean, ensure_ascii=False, default=str)) <= max_chars:
+        return lean
+    # The final fallback contains only the safety contract and latest quotes.
+    return {
+        "schema_version": 2,
+        "symbol": normalized,
+        "contexts": [
+            {
+                "request_id": item.get("request_id"),
+                "status": item.get("status"),
+                "purpose": item.get("purpose"),
+                "retrieved_at": item.get("retrieved_at"),
+                "decision_scopes": _symbol_decision_scopes([item], normalized),
+                "market": {
+                    "quotes": [
+                        _compact_value(quote)
+                        for quote in ((item.get("market") or {}).get("quotes") or [])
+                        if _context_symbol(quote) == normalized
+                    ][:1]
+                },
+            }
+            for item in contexts[-2:]
+        ],
+    }
 
 
 def _latest_timestamp(value: Any) -> str | None:
@@ -1019,12 +1283,17 @@ class DailyPortfolioRunService:
         symbol = normalize_symbol(str(holding.get("symbol") or holding.get("code") or "")).upper()
         if self.session_service is None:
             return fallback_brief(symbol, "Session 服务未启用，保守降级为观察。"), None
-        compact_context = json.dumps(contexts, ensure_ascii=False, default=str)
-        if len(compact_context) > 28_000:
-            compact_context = compact_context[:28_000] + "…"
+        scoped_quality = _symbol_decision_scopes(contexts, symbol)
+        compact_context = json.dumps(
+            _compact_worker_context(contexts, symbol),
+            ensure_ascii=False,
+            default=str,
+        )
         prompt = f"""你是组合晨会中的个股研究 Worker。只分析 {symbol}，不得调用或推断任何真实交易动作。
-输入已经冻结；不要重新获取组合持仓或行情。数据状态为 {data_status}。只有冻结数据中
-actionability=price_actionable 的行情才可支持价格和仓位判断；analysis_only 时不得输出
+输入已经冻结；不要重新获取组合持仓或行情。整体数据状态为 {data_status}，但必须以
+decision_scopes 的分区状态决定各段结论：daily_trend 只控制日线趋势，intraday 只控制
+盘中判断，condition_order 控制精确条件价，新闻或基本面缺失不得污染已校核的趋势结论。
+对应范围 actionability=price_actionable 才可支持精确价格；analysis_only 时不得输出该范围的
 精确买卖价、仓位比例、加减仓数量或强价格敏感结论。
 
 持仓事实：{json.dumps(holding, ensure_ascii=False, default=str)}
@@ -1032,8 +1301,9 @@ actionability=price_actionable 的行情才可支持价格和仓位判断；anal
 冻结数据上下文：{compact_context}
 
 只输出一个 JSON 对象，不要 Markdown，不要解释。字段：
-{{"summary":"一句话", "action":"observe|add|reduce|exit", "confidence":"low|medium|high", "suggested_amount":数字或null, "reasons":["..."], "risks":["..."], "watch_points":["..."], "condition_orders":[{{"trigger":"...", "response":"...", "priority":"normal|high"}}], "data_limited":false}}
-若数据不完整、冲突或陈旧，必须 action=observe、suggested_amount=null、data_limited=true。"""
+{{"summary":"一句话", "trend":{{"summary":"一句话", "stage":"上升|下降|震荡|筑底|待确认", "direction":"向上|向下|横盘|待确认", "strength":"强|中|弱|待确认"}}, "action":"observe|add|reduce|exit", "confidence":"low|medium|high", "suggested_amount":数字或null, "reasons":["..."], "risks":["..."], "watch_points":["..."], "condition_order_status":"available|not_recommended|data_insufficient", "condition_order_summary":"一句话", "condition_orders":[{{"trigger":"...", "confirmation":"...", "invalidation":"...", "response":"...", "priority":"normal|high"}}], "data_scopes":{json.dumps(scoped_quality, ensure_ascii=False, default=str)}, "data_limited":false}}
+只有 daily_trend 本身不可用时才设置 data_limited=true 并强制观察；新闻、研报或基本面局部缺失只写入 data_scopes。
+若 condition_order 不可用，必须 condition_order_status=data_insufficient 且 condition_orders=[]；没有合格情景则写 not_recommended。"""
         session = self.session_service.create_session(
             title=f"DailyRun {run_id} {symbol}",
             config={
@@ -1054,7 +1324,39 @@ actionability=price_actionable 的行情才可支持价格和仓位判断；anal
         if reply is None:
             raise BriefContractError("worker session did not produce an assistant response")
         brief = parse_holding_brief(reply.content, symbol=symbol)
-        if data_status in {"limited", "offline"}:
+        daily_scope = scoped_quality.get("daily_trend") if isinstance(scoped_quality, dict) else {}
+        condition_scope = scoped_quality.get("condition_order") if isinstance(scoped_quality, dict) else {}
+        daily_actionable = (
+            isinstance(daily_scope, dict)
+            and daily_scope.get("status") == "verified"
+            and daily_scope.get("actionability") == "price_actionable"
+        )
+        condition_actionable = (
+            isinstance(condition_scope, dict)
+            and condition_scope.get("status") == "verified"
+            and condition_scope.get("actionability") == "price_actionable"
+        )
+        brief["data_scopes"] = {
+            "daily": daily_scope or {"status": "unavailable", "reason": "missing daily scope"},
+            "intraday": scoped_quality.get("intraday") or {"status": "not_requested"},
+            "fund_flow": scoped_quality.get("fund_flow") or {"status": "not_requested"},
+            "news": scoped_quality.get("news") or {"status": "not_requested"},
+            "fundamentals": scoped_quality.get("fundamentals") or {"status": "not_requested"},
+        }
+        brief["data_limited"] = not daily_actionable
+        if not condition_actionable:
+            brief.update(
+                {
+                    "condition_order_status": "data_insufficient",
+                    "condition_order_summary": "条件单所需价格范围尚未完成校核，暂不提供精确触发价。",
+                    "condition_orders": [],
+                }
+            )
+        elif brief.get("condition_orders"):
+            brief["condition_order_status"] = "available"
+        elif brief.get("condition_order_status") == "data_insufficient":
+            brief["condition_order_status"] = "not_recommended"
+        if not daily_actionable:
             brief.update(
                 {
                     "action": "observe",
@@ -1085,20 +1387,29 @@ actionability=price_actionable 的行情才可支持价格和仓位判断；anal
         holding_markdowns: list[str] = []
         for brief in aggregate["briefs"]:
             symbol = str(brief["symbol"])
+            holding = holdings.get(symbol, {})
+            security_name = str(holding.get("name") or symbol).strip() or symbol
+            safe_security_name = _safe_filename_part(
+                security_name, fallback=_safe_symbol(symbol)
+            )
             markdown = render_holding_markdown(
                 market_date=market_date,
-                holding=holdings.get(symbol, {}),
+                holding=holding,
                 brief=brief,
                 data_status=data_status,
             )
             holding_markdowns.append(markdown)
-            title = f"{symbol} 每日更新 {market_date}"
+            title = f"{market_date} {security_name}（{symbol}）个股晨报"
             artifacts.append(
                 self.store.write_artifact(
                     run_id,
                     kind="holding_daily_json",
                     symbol=symbol,
-                    filename=f"{market_date}_{_safe_symbol(symbol)}_daily.json",
+                    security_name=security_name,
+                    filename=(
+                        f"{market_date}_{_safe_symbol(symbol)}_"
+                        f"{safe_security_name}_个股晨报.json"
+                    ),
                     payload=json.dumps(
                         brief, ensure_ascii=False, indent=2, sort_keys=True
                     ).encode("utf-8"),
@@ -1111,7 +1422,11 @@ actionability=price_actionable 的行情才可支持价格和仓位判断；anal
                     run_id,
                     kind="holding_daily_markdown",
                     symbol=symbol,
-                    filename=f"{market_date}_{_safe_symbol(symbol)}_daily.md",
+                    security_name=security_name,
+                    filename=(
+                        f"{market_date}_{_safe_symbol(symbol)}_"
+                        f"{safe_security_name}_个股晨报.md"
+                    ),
                     payload=markdown.encode("utf-8"),
                     media_type="text/markdown",
                     revision=revision,
@@ -1124,7 +1439,11 @@ actionability=price_actionable 的行情才可支持价格和仓位判断；anal
                 run_id,
                 kind="holding_daily_pdf",
                 symbol=symbol,
-                filename=f"{market_date}_{_safe_symbol(symbol)}_daily.pdf",
+                security_name=security_name,
+                filename=(
+                    f"{market_date}_{_safe_symbol(symbol)}_"
+                    f"{safe_security_name}_个股晨报.pdf"
+                ),
                 payload=pdf,
                 revision=revision,
             )
@@ -1137,7 +1456,7 @@ actionability=price_actionable 的行情才可支持价格和仓位判断；anal
                 holding_markdowns
             )
         pdf = await asyncio.to_thread(
-            self.pdf_renderer, f"组合盘前综合报告 {market_date}", master
+            self.pdf_renderer, f"{market_date} 组合晨会综合报告", master
         )
         if not pdf.startswith(b"%PDF-"):
             raise RuntimeError("invalid master PDF")
@@ -1146,7 +1465,7 @@ actionability=price_actionable 的行情才可支持价格和仓位判断；anal
             self.store.write_artifact(
                 run_id,
                 kind="master_pdf",
-                filename=f"{market_date}_portfolio_morning_report.pdf",
+                filename=f"{market_date}_组合晨会综合报告.pdf",
                 payload=pdf,
                 revision=revision,
             ),
@@ -1155,7 +1474,7 @@ actionability=price_actionable 的行情才可支持价格和仓位判断；anal
             self.store.write_artifact(
                 run_id,
                 kind="master_markdown",
-                filename=f"{market_date}_portfolio_morning_report.md",
+                filename=f"{market_date}_组合晨会综合报告.md",
                 payload=master.encode("utf-8"),
                 media_type="text/markdown",
                 revision=revision,

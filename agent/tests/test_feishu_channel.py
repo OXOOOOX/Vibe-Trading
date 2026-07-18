@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
 
-from src.channels.bus.events import OutboundMessage
+from src.channels.bus.events import DeliveryReceipt, OutboundMessage
 from src.channels.bus.queue import MessageBus
 from src.channels.feishu import (
     FeishuChannel,
     FeishuConfig,
     _direct_research_action,
     _is_new_research_request,
+    _monitor_binding_code,
     _pdf_delivery_request,
     _research_control_action,
 )
@@ -55,6 +57,279 @@ def test_feishu_strict_delivery_rejects_missing_provider_receipt(
     asyncio.run(scenario())
 
 
+def test_feishu_monitor_alert_combines_sticker_and_uses_delivery_id_uuid(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = FeishuChannel(FeishuConfig(), MessageBus())
+    channel._client = object()
+    sticker = tmp_path / "ymca.webp"
+    sticker.write_bytes(b"authorized-sticker")
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(channel, "_upload_image_sync", lambda path: "img_monitor_1")
+
+    def fake_send(receive_id_type, receive_id, msg_type, content, delivery_uuid=None):
+        captured.update(
+            receive_id_type=receive_id_type,
+            receive_id=receive_id,
+            msg_type=msg_type,
+            content=content,
+            delivery_uuid=delivery_uuid,
+        )
+        return "om-monitor-1"
+
+    monkeypatch.setattr(channel, "_send_message_sync", fake_send)
+    receipt = asyncio.run(
+        channel.send(
+            OutboundMessage(
+                channel="feishu",
+                chat_id="ou_user",
+                content="## 600036.SH 突破提醒",
+                metadata={
+                    "portfolio_monitor_alert": True,
+                    "monitor_sticker_path": str(sticker),
+                    "_delivery_uuid": "delivery-123",
+                    "_require_delivery_receipt": True,
+                },
+            )
+        )
+    )
+
+    assert isinstance(receipt, DeliveryReceipt)
+    assert receipt.remote_message_id == "om-monitor-1"
+    assert receipt.provider_request_id == "delivery-123"
+    assert captured["msg_type"] == "interactive"
+    assert captured["delivery_uuid"] == "delivery-123"
+    card = json.loads(str(captured["content"]))
+    assert [element["tag"] for element in card["elements"]] == ["markdown", "img"]
+    assert card["elements"][1]["img_key"] == "img_monitor_1"
+    assert card["elements"][1]["alt"]["content"] == "YMCA 关键价位提醒"
+
+
+def test_feishu_monitor_alert_image_failure_degrades_to_text_only_card(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = FeishuChannel(FeishuConfig(), MessageBus())
+    channel._client = object()
+    sticker = tmp_path / "ymca.gif"
+    sticker.write_bytes(b"gif")
+    sent: list[tuple] = []
+
+    monkeypatch.setattr(channel, "_upload_image_sync", lambda path: None)
+    monkeypatch.setattr(
+        channel,
+        "_send_message_sync",
+        lambda *args: sent.append(args) or "om-monitor-fallback",
+    )
+
+    asyncio.run(
+        channel.send(
+            OutboundMessage(
+                channel="feishu",
+                chat_id="oc_group",
+                content="monitor alert",
+                metadata={
+                    "portfolio_monitor_alert": True,
+                    "monitor_sticker_path": str(sticker),
+                    "_delivery_uuid": "delivery-fallback",
+                    "_require_delivery_receipt": True,
+                },
+            )
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0][0:3] == ("chat_id", "oc_group", "interactive")
+    assert sent[0][4] == "delivery-fallback"
+    assert json.loads(sent[0][3])["elements"] == [
+        {"tag": "markdown", "content": "monitor alert"}
+    ]
+
+
+def test_feishu_monitor_alert_without_cue_sends_one_text_only_card_with_delivery_uuid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = FeishuChannel(FeishuConfig(), MessageBus())
+    channel._client = object()
+    sent: list[tuple] = []
+
+    def unexpected_upload(_path: str):
+        raise AssertionError("a cue-free alert must not upload a sticker")
+
+    monkeypatch.setattr(channel, "_upload_image_sync", unexpected_upload)
+    monkeypatch.setattr(
+        channel,
+        "_send_message_sync",
+        lambda *args: sent.append(args) or "om-monitor-plain",
+    )
+
+    asyncio.run(
+        channel.send(
+            OutboundMessage(
+                channel="feishu",
+                chat_id="ou_user",
+                content="plain monitoring alert",
+                metadata={
+                    "portfolio_monitor_alert": True,
+                    "monitor_alert_cue": "none",
+                    "monitor_sticker_path": "",
+                    "_delivery_uuid": "delivery-plain",
+                    "_require_delivery_receipt": True,
+                },
+            )
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0][0:3] == ("open_id", "ou_user", "interactive")
+    assert sent[0][4] == "delivery-plain"
+    assert json.loads(sent[0][3])["elements"] == [
+        {"tag": "markdown", "content": "plain monitoring alert"}
+    ]
+
+
+def test_feishu_stable_delivery_uuid_is_reused_across_uncertain_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = FeishuChannel(FeishuConfig(), MessageBus())
+    channel._client = object()
+    captured: list[str | None] = []
+
+    def fake_send(*args):
+        captured.append(args[4])
+        return "om-result"
+
+    monkeypatch.setattr(channel, "_send_message_sync", fake_send)
+    message = OutboundMessage(
+        channel="feishu",
+        chat_id="ou_user",
+        content="final answer",
+        metadata={
+            "_require_delivery_receipt": True,
+            "_delivery_uuid": "9ca707c4-1322-5b24-a820-e39b764268b7",
+        },
+    )
+
+    asyncio.run(channel.send(message))
+    asyncio.run(channel.send(message))
+
+    assert captured[0] == captured[1]
+    assert captured[0]
+
+
+def test_feishu_does_not_fallback_after_uncertain_strict_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = FeishuChannel(FeishuConfig(reply_to_message=True), MessageBus())
+    channel._client = object()
+    creates: list[tuple] = []
+    monkeypatch.setattr(channel, "_reply_message_sync", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        channel,
+        "_send_message_sync",
+        lambda *args: creates.append(args) or "om-created",
+    )
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeError, match="outcome is uncertain"):
+            await channel.send(
+                OutboundMessage(
+                    channel="feishu",
+                    chat_id="ou_user",
+                    content="answer",
+                    metadata={
+                        "message_id": "om-origin",
+                        "_require_delivery_receipt": True,
+                        "_delivery_uuid": "stable-root",
+                    },
+                )
+            )
+
+    asyncio.run(scenario())
+    assert creates == []
+
+
+def test_feishu_releases_inflight_and_withholds_reaction_until_persisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        bus = MessageBus()
+        bus.require_inbound_acceptance = True
+        channel = FeishuChannel(FeishuConfig(allow_from=["ou_user"]), bus)
+        channel._client = object()
+        reactions: list[str] = []
+
+        async def fake_reaction(message_id: str, _emoji: str):
+            reactions.append(message_id)
+            return "reaction-1"
+
+        monkeypatch.setattr(channel, "_add_reaction", fake_reaction)
+        message = SimpleNamespace(
+            message_id="om-durable",
+            chat_id="oc-chat",
+            chat_type="p2p",
+            message_type="text",
+            content=json.dumps({"text": "请分析 513120"}, ensure_ascii=False),
+            mentions=[],
+            parent_id=None,
+            root_id=None,
+            thread_id=None,
+        )
+        sender = SimpleNamespace(
+            sender_type="user",
+            sender_id=SimpleNamespace(open_id="ou_user"),
+        )
+        event = SimpleNamespace(event=SimpleNamespace(message=message, sender=sender))
+
+        first = asyncio.create_task(channel._on_message(event))
+        rejected = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+        assert reactions == []
+        rejected.reject(RuntimeError("dispatch db unavailable"))
+        with pytest.raises(RuntimeError, match="dispatch db unavailable"):
+            await first
+        assert "om-durable" not in channel._processed_message_ids
+        assert channel._inflight_message_ids == {}
+        assert reactions == []
+
+        retry = asyncio.create_task(channel._on_message(event))
+        accepted = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+        assert accepted.source_event_id == "om-durable"
+        accepted.accept({"job_id": "job-1"})
+        await retry
+        await asyncio.sleep(0)
+
+        assert reactions == ["om-durable"]
+        assert "om-durable" in channel._processed_message_ids
+        assert channel._last_persisted_at is not None
+
+    asyncio.run(scenario())
+
+
+def test_feishu_sync_callback_propagates_async_failure_to_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = FeishuChannel(FeishuConfig(), MessageBus())
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever)
+    thread.start()
+    channel._loop = loop
+
+    async def fail(_data):
+        raise RuntimeError("persist failed")
+
+    monkeypatch.setattr(channel, "_on_message", fail)
+    data = SimpleNamespace(
+        event=SimpleNamespace(message=SimpleNamespace(message_id="om-fail"))
+    )
+    try:
+        with pytest.raises(RuntimeError, match="persist failed"):
+            channel._on_message_sync(data)
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
+
+
 def test_feishu_group_policy_matches_only_the_bot_mention() -> None:
     channel = FeishuChannel(FeishuConfig(), MessageBus())
     channel._bot_open_id = "ou_bot"
@@ -67,6 +342,80 @@ def test_feishu_group_policy_matches_only_the_bot_mention() -> None:
     assert channel._is_group_message_for_bot(addressed) is True
     assert channel._is_group_message_for_bot(not_addressed) is False
     assert channel._strip_leading_bot_mention("@_user_1 /status", [bot_mention]) == "/status"
+
+
+def test_feishu_monitor_binding_code_parser_requires_explicit_command() -> None:
+    assert _monitor_binding_code("绑定监控 ABCD-EFGH") == "ABCD-EFGH"
+    assert _monitor_binding_code("监控绑定 abcd efgh") == "ABCD-EFGH"
+    assert _monitor_binding_code("/bind-monitor ABCDEFGH") == "ABCD-EFGH"
+    assert _monitor_binding_code("ABCD-EFGH") is None
+    assert _monitor_binding_code("不要绑定监控 ABCD-EFGH") is None
+
+
+@pytest.mark.parametrize("chat_type", ["p2p", "group"])
+def test_feishu_monitor_binding_claims_private_or_group_before_allowlist(
+    chat_type: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claimed: dict = {}
+    notices: list[dict] = []
+
+    def claim(**kwargs):
+        claimed.update(kwargs)
+        return {
+            "target_id": "target-1",
+            "chat_id": kwargs["chat_id"],
+            "chat_type": kwargs["chat_type"],
+        }
+
+    config = FeishuConfig(group_policy="mention", allow_from=[])
+    channel = FeishuChannel(
+        config,
+        MessageBus(),
+        monitor_binding_claimer=claim,
+    )
+    channel._bot_open_id = "ou_bot"
+
+    async def fake_notice(**kwargs):
+        notices.append(kwargs)
+
+    monkeypatch.setattr(channel, "_send_research_notice", fake_notice)
+    mentions = [_mention("ou_bot")] if chat_type == "group" else []
+    prefix = "@_user_1 " if chat_type == "group" else ""
+    message = SimpleNamespace(
+        message_id=f"om_bind_{chat_type}",
+        chat_id="oc_monitor_group" if chat_type == "group" else "oc_private_chat",
+        chat_type=chat_type,
+        message_type="text",
+        content=json.dumps({"text": f"{prefix}绑定监控 ABCD-EFGH"}, ensure_ascii=False),
+        mentions=mentions,
+        parent_id=None,
+        root_id=None,
+        thread_id=None,
+    )
+    sender = SimpleNamespace(
+        sender_type="user",
+        sender_id=SimpleNamespace(open_id="ou_user"),
+    )
+
+    asyncio.run(
+        channel._on_message(
+            SimpleNamespace(event=SimpleNamespace(message=message, sender=sender))
+        )
+    )
+
+    expected_chat_id = "oc_monitor_group" if chat_type == "group" else "ou_user"
+    assert claimed == {
+        "code": "ABCD-EFGH",
+        "channel": "feishu",
+        "chat_id": expected_chat_id,
+        "chat_type": chat_type,
+        "sender_id": "ou_user",
+        "session_key": f"feishu:{expected_chat_id}",
+    }
+    assert notices[0]["reply_chat_id"] == expected_chat_id
+    assert "绑定" in notices[0]["content"]
+    assert channel.bus.inbound_size == 0
 
 
 def test_feishu_open_group_policy_accepts_messages_without_mentions() -> None:
@@ -275,6 +624,7 @@ def test_feishu_stock_reuse_card_offers_session_report_and_fresh_paths() -> None
         "resume_stock_session",
         "send_stock_daily_report",
         "continue_stock_daily_report",
+        "start_deep_stock_research",
         "start_stock_research",
     }
     assert all(item["symbol"] == "600036.SH" for item in callbacks)
@@ -283,6 +633,44 @@ def test_feishu_stock_reuse_card_offers_session_report_and_fresh_paths() -> None
         item for item in callbacks if item["action"] == "send_stock_daily_report"
     )["artifact_id"] == "pdf-today"
     assert "不会重复生成" in _elements_with_tag(card, "markdown")[0]["content"]
+
+
+def test_feishu_stock_reuse_card_reuses_persisted_deep_report_by_id() -> None:
+    card = FeishuChannel._build_stock_reuse_card(
+        {
+            "symbol": "301308.SZ",
+            "name": "江波龙",
+            "analysis_action": "holding",
+            "deep_report": {
+                "report_id": "report_0123456789abcdef",
+                "session_id": "session-deep",
+                "revision": 3,
+                "quality_status": "passed_with_gaps",
+            },
+        },
+        reply_chat_id="ou_user",
+        chat_type="p2p",
+        session_key=None,
+    )
+    callbacks = [
+        button["behaviors"][0]["value"]
+        for button in _elements_with_tag(card, "button")
+    ]
+
+    deep_actions = {
+        item["action"]: item
+        for item in callbacks
+        if item["action"] in {"send_deep_stock_report", "continue_deep_stock_report"}
+    }
+    assert set(deep_actions) == {"send_deep_stock_report", "continue_deep_stock_report"}
+    assert all(
+        item["deep_report_id"] == "report_0123456789abcdef"
+        for item in deep_actions.values()
+    )
+    summary = _elements_with_tag(card, "markdown")[0]["content"]
+    assert "已完成，部分结论保留" in summary
+    assert "passed_with_gaps" not in summary
+    assert "revision" not in summary
 
 
 def test_feishu_daily_completion_and_holding_picker_use_artifact_callbacks() -> None:
@@ -303,6 +691,49 @@ def test_feishu_daily_completion_and_holding_picker_use_artifact_callbacks() -> 
         "show_daily_reports",
         "rerun_daily",
     }
+
+    research = FeishuChannel._build_research_completion_card(
+        {
+            "title": "科创50ETF持仓分析",
+            "symbol": "588870.SH",
+            "market_as_of": "2026-07-16 09:47",
+            "trend_summary": "重新站回关键支撑，但资金仍在分化。",
+            "condition_status": "available",
+            "condition_summary": "仅保留突破确认和回踩确认两个观察情景。",
+            "conditions": [
+                {
+                    "trigger": "放量站稳关键位",
+                    "confirmation": "连续确认",
+                    "invalidation": "跌回关键位下方",
+                    "response": "人工复核后再决定",
+                }
+            ],
+            "data_scopes": [
+                {"scope": "daily", "status": "verified"},
+                {"scope": "intraday", "status": "verified"},
+                {"scope": "news", "status": "partial", "reason": "部分来源延迟"},
+            ],
+        },
+        reply_chat_id="ou_user",
+        chat_type="p2p",
+        session_key="feishu:ou_user",
+        route_key="feishu:ou_user:research:symbol:588870.SH",
+    )
+    research_actions = {
+        button["behaviors"][0]["value"]["action"]
+        for button in _elements_with_tag(research, "button")
+    }
+    assert research_actions == {
+        "send_current_report",
+        "continue_condition_order",
+        "refresh_research_report",
+        "regenerate_research_report",
+    }
+    research_text = _elements_with_tag(research, "markdown")[0]["content"]
+    assert "日线已校核｜盘中已校核" in research_text
+    assert "当前走势" in research_text
+    assert "条件单 · 可设置" in research_text
+    assert "新闻：部分来源延迟" in research_text
 
     picker = FeishuChannel._build_daily_report_picker_card(
         [
@@ -432,7 +863,7 @@ def test_feishu_bot_menu_events_dispatch_without_user_messages(monkeypatch) -> N
         channel._loop = asyncio.get_running_loop()
         captured: list[tuple[str, str]] = []
 
-        async def fake_handle(sender_id: str, event_key: str) -> None:
+        async def fake_handle(sender_id: str, event_key: str, _event_id: str = "") -> None:
             captured.append((sender_id, event_key))
 
         monkeypatch.setattr(channel, "_handle_bot_menu_action", fake_handle)

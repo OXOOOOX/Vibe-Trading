@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import importlib.util
 import json
 import os
@@ -13,7 +14,8 @@ import uuid
 from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from rich.console import Console
@@ -21,7 +23,12 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 
-from src.channels.bus.events import OutboundMessage
+from src.channels.bus.events import (
+    DeliveryReceipt,
+    DeliveryRejectedError,
+    DeliveryUncertainError,
+    OutboundMessage,
+)
 from src.channels.bus.queue import MessageBus
 from src.channels.base import BaseChannel
 from src.channels.research_sessions import (
@@ -105,6 +112,13 @@ _RESEARCH_ACTIONS = {
     "send_stock_daily_report",
     "continue_stock_daily_report",
     "start_stock_research",
+    "start_deep_stock_research",
+    "send_deep_stock_report",
+    "continue_deep_stock_report",
+    "send_current_report",
+    "continue_condition_order",
+    "refresh_research_report",
+    "regenerate_research_report",
 }
 _DIRECT_RESEARCH_ACTIONS = {
     "组合晨会": "morning_meeting",
@@ -122,6 +136,11 @@ _RESEARCH_CONTROL_TEXT = {
 }
 _PDF_REQUEST_VERBS = ("发送", "发给", "给我", "生成", "导出", "转成", "做成", "保存为")
 _PDF_PREVIOUS_REPORT_MARKERS = ("这份", "这个", "刚才", "刚刚", "上面", "前面", "当前")
+_MONITOR_BINDING_PATTERN = re.compile(
+    r"^[\s\u3000]*(?:绑定监控|监控绑定|/bind-monitor)\s*[:：]?\s*"
+    r"([2-9A-HJ-NP-Z]{4})[\s-]*([2-9A-HJ-NP-Z]{4})[\s\u3000！!。.]*$",
+    re.IGNORECASE,
+)
 
 
 def _is_new_research_request(text: str) -> bool:
@@ -146,6 +165,24 @@ def _pdf_delivery_request(text: str) -> tuple[bool, bool]:
 
 def _plain_text(content: str) -> dict[str, str]:
     return {"tag": "plain_text", "content": content}
+
+
+def _research_completion_card_enabled() -> bool:
+    """Allow a quick rollback while shipping the richer completion card by default."""
+
+    return os.getenv("FEISHU_RESEARCH_COMPLETION_CARD_V2", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _monitor_binding_code(text: str) -> str | None:
+    """Extract one explicit, human-entered monitoring delivery code."""
+
+    match = _MONITOR_BINDING_PATTERN.fullmatch(str(text or "").upper())
+    return f"{match.group(1)}-{match.group(2)}" if match else None
 
 
 def _direct_research_action(text: str) -> str | None:
@@ -667,7 +704,13 @@ class FeishuChannel(BaseChannel):
     def default_config(cls) -> dict[str, Any]:
         return FeishuConfig().model_dump(by_alias=True)
 
-    def __init__(self, config: Any, bus: MessageBus):
+    def __init__(
+        self,
+        config: Any,
+        bus: MessageBus,
+        *,
+        monitor_binding_claimer: Callable[..., dict[str, Any]] | None = None,
+    ):
         if isinstance(config, dict):
             config = FeishuConfig.model_validate(config)
         super().__init__(config, bus)
@@ -676,6 +719,9 @@ class FeishuChannel(BaseChannel):
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
+        self._inflight_message_ids: dict[
+            str, asyncio.Future[BaseException | None]
+        ] = {}
         self._processed_card_action_ids: OrderedDict[str, None] = OrderedDict()
         self._processed_bot_menu_event_ids: OrderedDict[str, None] = OrderedDict()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -683,6 +729,19 @@ class FeishuChannel(BaseChannel):
         self._bot_open_id: str | None = None
         self._background_tasks: set[asyncio.Task] = set()
         self._reaction_ids: dict[str, str] = {}  # message_id → reaction_id
+        self._monitor_binding_claimer = monitor_binding_claimer
+        self._last_received_at: str | None = None
+        self._last_persisted_at: str | None = None
+        self._last_error: dict[str, str] | None = None
+
+    def health_status(self) -> dict[str, Any]:
+        """Expose the durable inbound boundary instead of only socket state."""
+        return {
+            "last_received_at": self._last_received_at,
+            "last_persisted_at": self._last_persisted_at,
+            "last_error": self._last_error,
+            "inflight_messages": len(self._inflight_message_ids),
+        }
 
     # ------------------------------------------------------------------
     # QR login — writes credentials directly to config.json
@@ -1236,6 +1295,7 @@ class FeishuChannel(BaseChannel):
         analysis_action = str(context.get("analysis_action") or "holding")
         session = dict(context.get("session") or {})
         report = dict(context.get("report") or {})
+        deep_report = dict(context.get("deep_report") or {})
         common = {
             "symbol": symbol,
             "name": name,
@@ -1252,10 +1312,22 @@ class FeishuChannel(BaseChannel):
         if report:
             status_lines.append(
                 f"- 个股日报：{report.get('market_date') or '今日'} · "
-                f"revision {report.get('revision') or 1}"
+                f"第 {report.get('revision') or 1} 版"
             )
         else:
             status_lines.append("- 个股日报：今天尚未生成")
+        if deep_report:
+            quality_label = {
+                "passed": "证据完整，已通过校验",
+                "passed_with_gaps": "已完成，部分结论保留",
+                "failed_validation": "尚未形成正式报告",
+            }.get(str(deep_report.get("quality_status") or ""), "状态待确认")
+            status_lines.append(
+                f"- 穿透式深度研究：第 {deep_report.get('revision') or 1} 版 · "
+                f"{quality_label}"
+            )
+        else:
+            status_lines.append("- 穿透式深度研究：今天尚未生成")
         status_lines.append("发送或载入已有报告都不会重复生成；随后可直接继续提问。")
 
         elements: list[dict[str, Any]] = [
@@ -1300,6 +1372,40 @@ class FeishuChannel(BaseChannel):
                     ),
                 ]
             )
+        if deep_report:
+            deep_common = {
+                "deep_report_id": str(deep_report.get("report_id") or ""),
+                "session_id": str(deep_report.get("session_id") or ""),
+                **common,
+            }
+            buttons.extend(
+                [
+                    cls._research_button(
+                        "发送穿透报告 PDF",
+                        "send_deep_stock_report",
+                        route,
+                        button_type="primary" if not session and not report else "default",
+                        element_id="stock_send_deep_pdf",
+                        **deep_common,
+                    ),
+                    cls._research_button(
+                        "继续穿透研究",
+                        "continue_deep_stock_report",
+                        route,
+                        element_id="stock_continue_deep_report",
+                        **deep_common,
+                    ),
+                ]
+            )
+        buttons.append(
+            cls._research_button(
+                "穿透式深度研究",
+                "start_deep_stock_research",
+                route,
+                element_id="stock_start_deep_research",
+                **common,
+            )
+        )
         buttons.append(
             cls._research_button(
                 "重新生成完整分析",
@@ -1402,6 +1508,158 @@ class FeishuChannel(BaseChannel):
                     },
                 ]
             },
+        }
+
+    @classmethod
+    def _build_research_completion_card(
+        cls,
+        digest: dict[str, Any],
+        *,
+        reply_chat_id: str,
+        chat_type: str,
+        session_key: str | None,
+        route_key: str | None = None,
+        source_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Render the compact decision surface paired with a completed PDF."""
+
+        route = cls._research_route(
+            reply_chat_id=reply_chat_id,
+            chat_type=chat_type,
+            session_key=session_key,
+        )
+        title = str(digest.get("title") or "研究报告")[:80]
+        symbol = str(digest.get("symbol") or "")
+        trend = str(digest.get("trend_summary") or "请查看 PDF 获取完整判断。").strip()[:420]
+        condition_status = str(digest.get("condition_status") or "not_recommended")
+        condition_summary = str(
+            digest.get("condition_summary") or "本次暂不建议新增条件单。"
+        ).strip()[:360]
+        as_of = str(digest.get("market_as_of") or "").strip()
+
+        status_labels = {
+            "verified": "已校核",
+            "partial": "部分可用",
+            "not_started": "尚未开盘",
+            "unavailable": "不可用",
+            "not_requested": "未请求",
+        }
+        scope_labels = {
+            "daily": "日线",
+            "intraday": "盘中",
+            "fund_flow": "资金流",
+            "news": "新闻",
+            "fundamentals": "基本面",
+        }
+        scope_parts: list[str] = []
+        gaps: list[str] = []
+        for raw in digest.get("data_scopes") or []:
+            if not isinstance(raw, dict):
+                continue
+            scope = str(raw.get("scope") or "")
+            status = str(raw.get("status") or "partial")
+            label = scope_labels.get(scope, scope or "数据")
+            if scope in {"daily", "intraday", "fund_flow"}:
+                scope_parts.append(f"{label}{status_labels.get(status, status)}")
+            if status in {"partial", "unavailable"}:
+                reason = str(raw.get("reason") or status_labels.get(status, status))
+                gaps.append(f"{label}：{reason}")
+        data_badge = "｜".join(scope_parts[:3]) or "数据范围见 PDF"
+        if as_of:
+            data_badge += f" · 截至 {as_of}"
+
+        status_heading = {
+            "available": "可设置",
+            "not_recommended": "暂不建议",
+            "data_insufficient": "数据不足",
+        }.get(condition_status, "暂不建议")
+        body_lines = [
+            f"**数据状态**：{data_badge}",
+            f"**当前走势**：{trend}",
+            f"**条件单 · {status_heading}**：{condition_summary}",
+        ]
+        if gaps:
+            body_lines.append("**局部数据缺口**：" + "；".join(gaps[:2]))
+
+        conditions = [item for item in (digest.get("conditions") or []) if isinstance(item, dict)][:2]
+        for index, item in enumerate(conditions, start=1):
+            details = [f"触发：{str(item.get('trigger') or '').strip()}"]
+            if item.get("confirmation"):
+                details.append(f"确认：{str(item['confirmation']).strip()}")
+            if item.get("invalidation"):
+                details.append(f"失效：{str(item['invalidation']).strip()}")
+            details.append(f"动作：{str(item.get('response') or '').strip()}")
+            body_lines.append(f"**情景 {index}**：" + "；".join(details))
+
+        common = {
+            "symbol": symbol,
+            "name": title,
+            "analysis_action": "holding" if symbol else "portfolio",
+            "route_key": str(route_key or ""),
+            "source_session_id": str(source_session_id or ""),
+            "delivery_kind": str(digest.get("delivery_kind") or "research_report"),
+            "run_id": str(digest.get("run_id") or ""),
+            "artifact_id": str(digest.get("artifact_id") or ""),
+        }
+        buttons = [
+            cls._research_button(
+                "查看 / 重发 PDF",
+                "send_current_report",
+                route,
+                button_type="primary",
+                element_id="research_resend_pdf",
+                **common,
+            ),
+            cls._research_button(
+                "继续问条件单",
+                "continue_condition_order",
+                route,
+                element_id="research_condition_followup",
+                **common,
+            ),
+            cls._research_button(
+                "刷新盘中判断",
+                "refresh_research_report",
+                route,
+                element_id="research_refresh_intraday",
+                **common,
+            ),
+            cls._research_button(
+                "重新分析",
+                "regenerate_research_report",
+                route,
+                element_id="research_regenerate",
+                **common,
+            ),
+        ]
+        elements: list[dict[str, Any]] = [
+            {"tag": "markdown", "content": "\n\n".join(body_lines)}
+        ]
+        for index in range(0, len(buttons), 2):
+            elements.append(
+                {
+                    "tag": "column_set",
+                    "flex_mode": "flow",
+                    "horizontal_spacing": "8px",
+                    "columns": [
+                        {
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 1,
+                            "elements": [button],
+                        }
+                        for button in buttons[index : index + 2]
+                    ],
+                }
+            )
+        return {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {
+                "template": "green" if condition_status != "data_insufficient" else "orange",
+                "title": _plain_text(f"{title} · 分析完成"),
+            },
+            "body": {"elements": elements},
         }
 
     @classmethod
@@ -1590,17 +1848,58 @@ class FeishuChannel(BaseChannel):
         self, *, content: str, reply_chat_id: str, chat_type: str
     ) -> None:
         if not self._client:
-            return
+            raise RuntimeError("Feishu client is not ready")
         receive_id_type = "chat_id" if chat_type == "group" else "open_id"
         body = json.dumps({"text": content}, ensure_ascii=False)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
+        message_id = await loop.run_in_executor(
             None,
             self._send_message_sync,
             receive_id_type,
             reply_chat_id,
             "text",
             body,
+        )
+        if not message_id:
+            raise RuntimeError("Feishu rejected the research notice")
+
+    async def _claim_monitor_binding(
+        self,
+        *,
+        code: str,
+        sender_id: str,
+        chat_id: str,
+        chat_type: str,
+    ) -> None:
+        reply_chat_id = chat_id if chat_type == "group" else sender_id
+        if self._monitor_binding_claimer is None:
+            content = "当前服务尚未启用持仓监控绑定，请回到持仓页面检查服务配置。"
+        else:
+            try:
+                target = await asyncio.to_thread(
+                    self._monitor_binding_claimer,
+                    code=code,
+                    channel="feishu",
+                    chat_id=reply_chat_id,
+                    chat_type=chat_type,
+                    sender_id=sender_id,
+                    session_key=f"feishu:{reply_chat_id}",
+                )
+            except ValueError:
+                content = "验证码无效、已过期或已被使用，请回到持仓页面重新生成。"
+            except Exception as exc:
+                self.logger.warning("Failed to claim monitoring binding code: {}", exc)
+                content = "绑定暂时失败，请稍后回到持仓页面重试。"
+            else:
+                target_label = "当前群聊" if target.get("chat_type") == "group" else "当前私聊"
+                content = (
+                    f"已将{target_label}绑定为 AI 持仓监控提醒目标。"
+                    "你可以回到持仓页面继续选择标的和审核监控计划。"
+                )
+        await self._send_research_notice(
+            content=content,
+            reply_chat_id=reply_chat_id,
+            chat_type=chat_type,
         )
 
     @staticmethod
@@ -1673,25 +1972,46 @@ class FeishuChannel(BaseChannel):
             return
         if event_id and event_id in self._processed_bot_menu_event_ids:
             return
-        if event_id:
+        if not self._loop or not self._loop.is_running():
+            raise RuntimeError("Feishu runtime loop is unavailable for bot menu event")
+
+        coroutine = self._handle_bot_menu_action(sender_id, event_key, event_id)
+
+        def _remember_success() -> None:
+            if not event_id:
+                return
             self._processed_bot_menu_event_ids[event_id] = None
             while len(self._processed_bot_menu_event_ids) > 1000:
                 self._processed_bot_menu_event_ids.popitem(last=False)
-        if not self._loop or not self._loop.is_running():
-            return
-        future = asyncio.run_coroutine_threadsafe(
-            self._handle_bot_menu_action(sender_id, event_key), self._loop
-        )
 
         def _log_bot_menu_failure(completed: Any) -> None:
             try:
                 completed.result()
             except Exception:
                 self.logger.exception("Error handling Feishu bot menu event")
+            else:
+                _remember_success()
 
-        future.add_done_callback(_log_bot_menu_failure)
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is self._loop:
+            task = asyncio.create_task(coroutine)
+            task.add_done_callback(_log_bot_menu_failure)
+            return
 
-    async def _handle_bot_menu_action(self, sender_id: str, event_key: str) -> None:
+        future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        try:
+            future.result(timeout=2.0)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise
+        _remember_success()
+
+    async def _handle_bot_menu_action(
+        self, sender_id: str, event_key: str, event_id: str = ""
+    ) -> None:
         base_session_key = f"feishu:{sender_id}"
         if event_key == BOT_MENU_RESEARCH_HUB:
             await self._send_research_card(
@@ -1716,6 +2036,7 @@ class FeishuChannel(BaseChannel):
             },
             session_key=base_session_key,
             is_dm=True,
+            source_event_id=event_id or None,
         )
 
     def _on_card_action_trigger(self, data: Any) -> Any:
@@ -1735,11 +2056,6 @@ class FeishuChannel(BaseChannel):
         event_id = str(getattr(getattr(data, "header", None), "event_id", "") or "")
         if event_id and event_id in self._processed_card_action_ids:
             return self._card_action_response("该操作已经提交。")
-        if event_id:
-            self._processed_card_action_ids[event_id] = None
-            while len(self._processed_card_action_ids) > 1000:
-                self._processed_card_action_ids.popitem(last=False)
-
         form_value = dict(getattr(action, "form_value", None) or {})
         if value["action"] == "custom_stock":
             raw_code = str(form_value.get("stock_code") or "").strip()
@@ -1760,23 +2076,48 @@ class FeishuChannel(BaseChannel):
                 "source_message_id": str(
                     getattr(context, "open_message_id", "") or ""
                 ),
+                "source_event_id": event_id,
             }
         )
 
         if not self._loop or not self._loop.is_running():
             return self._card_action_response("飞书连接正在启动，请稍后重试。", error=True)
 
-        future = asyncio.run_coroutine_threadsafe(
-            self._handle_research_card_action(value), self._loop
-        )
+        coroutine = self._handle_research_card_action(value)
+
+        def _remember_success() -> None:
+            if not event_id:
+                return
+            self._processed_card_action_ids[event_id] = None
+            while len(self._processed_card_action_ids) > 1000:
+                self._processed_card_action_ids.popitem(last=False)
 
         def _log_callback_failure(completed: Any) -> None:
             try:
                 completed.result()
             except Exception:
                 self.logger.exception("Error handling research card action")
+            else:
+                _remember_success()
 
-        future.add_done_callback(_log_callback_failure)
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is self._loop:
+            task = asyncio.create_task(coroutine)
+            task.add_done_callback(_log_callback_failure)
+        else:
+            future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+            try:
+                future.result(timeout=2.0)
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                return self._card_action_response("提交超时，请稍后重试。", error=True)
+            except Exception:
+                self.logger.exception("Error handling research card action")
+                return self._card_action_response("提交失败，请稍后重试。", error=True)
+            _remember_success()
         if value["action"] in {"show_stock_picker", "show_daily_reports"}:
             return self._card_action_response(
                 "正在打开个股日报。"
@@ -1798,6 +2139,13 @@ class FeishuChannel(BaseChannel):
             "send_stock_daily_report": "今日个股日报发送",
             "continue_stock_daily_report": "今日报告载入",
             "start_stock_research": "完整个股分析",
+            "start_deep_stock_research": "穿透式深度研究",
+            "send_deep_stock_report": "穿透报告发送",
+            "continue_deep_stock_report": "穿透研究继续",
+            "send_current_report": "当前报告发送",
+            "continue_condition_order": "条件单复核",
+            "refresh_research_report": "盘中判断刷新",
+            "regenerate_research_report": "完整重新分析",
         }.get(value["action"], "研究任务")
         return self._card_action_response(f"已提交{label}。")
 
@@ -1809,12 +2157,101 @@ class FeishuChannel(BaseChannel):
             or payload.get("session_key")
             or f"feishu:{reply_chat_id}"
         )
+        route_session_key = str(payload.get("route_key") or base_session_key)
         try:
+            if payload["action"] == "send_current_report":
+                daily_artifact = (
+                    payload.get("delivery_kind") == "daily_artifact"
+                    and payload.get("run_id")
+                    and payload.get("artifact_id")
+                )
+                await self._handle_message(
+                    sender_id=payload["sender_id"],
+                    chat_id=reply_chat_id,
+                    content="",
+                    metadata={
+                        "message_id": payload.get("source_message_id", ""),
+                        "chat_type": chat_type,
+                        "msg_type": "interactive",
+                        "research_base_session_key": base_session_key,
+                        "report_source_session_id": payload.get("source_session_id", ""),
+                        **(
+                            {
+                                "daily_report_action": "send_daily_report",
+                                "daily_run_id": payload.get("run_id", ""),
+                                "artifact_id": payload.get("artifact_id", ""),
+                                "symbol": payload.get("symbol", ""),
+                            }
+                            if daily_artifact
+                            else {"pdf_from_previous_report": True}
+                        ),
+                    },
+                    session_key=route_session_key,
+                    is_dm=chat_type == "p2p",
+                    source_event_id=payload.get("source_event_id") or None,
+                )
+                return
+
+            if payload["action"] == "continue_condition_order":
+                symbol = str(payload.get("symbol") or "当前标的")
+                await self._handle_message(
+                    sender_id=payload["sender_id"],
+                    chat_id=reply_chat_id,
+                    content=(
+                        f"请继续复核 {symbol} 的条件单观察方案。先刷新对应决策范围的数据，"
+                        "分别说明日线结构、盘中行情与资金流的校核状态和数据截至时间。"
+                        "只有对应行情范围 price_actionable 时才给精确触发价；否则说明等待信号，"
+                        "不要把局部数据缺口扩大成整份报告都无法判断。"
+                    ),
+                    metadata={
+                        "message_id": payload.get("source_message_id", ""),
+                        "chat_type": chat_type,
+                        "msg_type": "interactive",
+                        "research_action": str(payload.get("analysis_action") or "holding"),
+                        "research_activate": True,
+                        "research_base_session_key": base_session_key,
+                        "research_route_key": route_session_key,
+                        "research_symbol": str(payload.get("symbol") or ""),
+                    },
+                    session_key=route_session_key,
+                    is_dm=chat_type == "p2p",
+                    source_event_id=payload.get("source_event_id") or None,
+                )
+                return
+
+            if payload["action"] == "refresh_research_report" or (
+                payload["action"] == "regenerate_research_report"
+                and not str(payload.get("symbol") or "")
+            ):
+                await self._handle_message(
+                    sender_id=payload["sender_id"],
+                    chat_id=reply_chat_id,
+                    content="",
+                    metadata={
+                        "message_id": payload.get("source_message_id", ""),
+                        "chat_type": chat_type,
+                        "msg_type": "interactive",
+                        "research_control": RESEARCH_CONTROL_REFRESH_REPORT,
+                        "research_base_session_key": base_session_key,
+                        "research_route_key": route_session_key,
+                    },
+                    session_key=route_session_key,
+                    is_dm=chat_type == "p2p",
+                    source_event_id=payload.get("source_event_id") or None,
+                )
+                return
+
+            if payload["action"] == "regenerate_research_report":
+                payload = {**payload, "action": "start_stock_research"}
+
             if payload["action"] in {
                 "resume_stock_session",
                 "send_stock_daily_report",
                 "continue_stock_daily_report",
                 "start_stock_research",
+                "start_deep_stock_research",
+                "send_deep_stock_report",
+                "continue_deep_stock_report",
             }:
                 analysis_action = str(payload.get("analysis_action") or "holding")
                 symbol = str(payload.get("symbol") or "")
@@ -1834,7 +2271,7 @@ class FeishuChannel(BaseChannel):
                 await self._handle_message(
                     sender_id=payload["sender_id"],
                     chat_id=reply_chat_id,
-                    content=prompt if payload["action"] == "start_stock_research" else "",
+                    content=prompt if payload["action"] in {"start_stock_research", "start_deep_stock_research"} else "",
                     metadata={
                         "message_id": payload.get("source_message_id", ""),
                         "chat_type": chat_type,
@@ -1843,12 +2280,14 @@ class FeishuChannel(BaseChannel):
                         "stock_session_id": payload.get("session_id", ""),
                         "daily_run_id": payload.get("run_id", ""),
                         "artifact_id": payload.get("artifact_id", ""),
+                        "deep_report_id": payload.get("deep_report_id", ""),
                         "research_action": analysis_action,
                         "research_label": route.label,
                         **route.metadata(),
                     },
                     session_key=route.route_key,
                     is_dm=chat_type == "p2p",
+                    source_event_id=payload.get("source_event_id") or None,
                 )
                 return
 
@@ -1876,6 +2315,7 @@ class FeishuChannel(BaseChannel):
                     },
                     session_key=base_session_key,
                     is_dm=chat_type == "p2p",
+                    source_event_id=payload.get("source_event_id") or None,
                 )
                 return
 
@@ -1895,6 +2335,7 @@ class FeishuChannel(BaseChannel):
                     },
                     session_key=base_session_key,
                     is_dm=chat_type == "p2p",
+                    source_event_id=payload.get("source_event_id") or None,
                 )
                 return
 
@@ -1943,6 +2384,7 @@ class FeishuChannel(BaseChannel):
                 },
                 session_key=route.route_key,
                 is_dm=chat_type == "p2p",
+                source_event_id=payload.get("source_event_id") or None,
             )
         except Exception as exc:
             await self._send_research_notice(
@@ -2136,6 +2578,33 @@ class FeishuChannel(BaseChannel):
         if remaining.strip():
             elements.extend(self._split_headings(remaining))
         return elements or [{"tag": "markdown", "content": content}]
+
+    @staticmethod
+    def _valid_monitor_sticker_path(file_path: str) -> bool:
+        """Validate the narrowly-scoped monitoring sticker at send time."""
+
+        if not file_path or os.path.splitext(file_path)[1].lower() not in {".gif", ".png", ".webp"}:
+            return False
+        try:
+            size = os.path.getsize(file_path)
+        except OSError:
+            return False
+        return os.path.isfile(file_path) and 0 < size <= 10 * 1024 * 1024
+
+    @staticmethod
+    def _build_monitor_alert_card(content: str, image_key: str | None = None) -> dict[str, Any]:
+        """Build one alert card, optionally combining the authorized sticker."""
+
+        elements: list[dict[str, Any]] = [{"tag": "markdown", "content": content}]
+        if image_key:
+            elements.append(
+                {
+                    "tag": "img",
+                    "img_key": image_key,
+                    "alt": {"tag": "plain_text", "content": "YMCA 关键价位提醒"},
+                }
+            )
+        return {"config": {"wide_screen_mode": True}, "elements": elements}
 
     @staticmethod
     def _split_elements_by_table_limit(
@@ -2588,7 +3057,15 @@ class FeishuChannel(BaseChannel):
             self.logger.debug("error fetching parent message {}: {}", message_id, e)
             return None
 
-    def _reply_message_sync(self, parent_message_id: str, msg_type: str, content: str, *, reply_in_thread: bool = False) -> bool:
+    def _reply_message_sync(
+        self,
+        parent_message_id: str,
+        msg_type: str,
+        content: str,
+        *,
+        reply_in_thread: bool = False,
+        delivery_uuid: str | None = None,
+    ) -> bool:
         """Reply to an existing Feishu message using the Reply API (synchronous).
 
         Args:
@@ -2601,6 +3078,8 @@ class FeishuChannel(BaseChannel):
             body_builder = ReplyMessageRequestBody.builder().msg_type(msg_type).content(content)
             if reply_in_thread:
                 body_builder = body_builder.reply_in_thread(True)
+            if delivery_uuid:
+                body_builder = body_builder.uuid(delivery_uuid)
             request = (
                 ReplyMessageRequest.builder()
                 .message_id(parent_message_id)
@@ -2639,22 +3118,29 @@ class FeishuChannel(BaseChannel):
         return None
 
     def _send_message_sync(
-        self, receive_id_type: str, receive_id: str, msg_type: str, content: str
+        self,
+        receive_id_type: str,
+        receive_id: str,
+        msg_type: str,
+        content: str,
+        delivery_uuid: str | None = None,
     ) -> str | None:
         """Send a single message and return the message_id on success."""
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
         try:
+            body_builder = (
+                CreateMessageRequestBody.builder()
+                .receive_id(receive_id)
+                .msg_type(msg_type)
+                .content(content)
+            )
+            if delivery_uuid:
+                body_builder = body_builder.uuid(delivery_uuid)
             request = (
                 CreateMessageRequest.builder()
                 .receive_id_type(receive_id_type)
-                .request_body(
-                    CreateMessageRequestBody.builder()
-                    .receive_id(receive_id)
-                    .msg_type(msg_type)
-                    .content(content)
-                    .build()
-                )
+                .request_body(body_builder.build())
                 .build()
             )
             response = self._client.im.v1.message.create(request)
@@ -2666,12 +3152,22 @@ class FeishuChannel(BaseChannel):
                     response.msg,
                     response.get_log_id(),
                 )
+                if delivery_uuid:
+                    raise DeliveryRejectedError(
+                        f"Feishu rejected {msg_type} message: code={response.code}, msg={response.msg}"
+                    )
                 return None
             msg_id = getattr(response.data, "message_id", None)
             self.logger.debug("{} message sent to {}: {}", msg_type, receive_id, msg_id)
             return msg_id
-        except Exception:
+        except DeliveryRejectedError:
+            raise
+        except Exception as exc:
             self.logger.exception("Error sending {} message", msg_type)
+            if delivery_uuid:
+                raise DeliveryUncertainError(
+                    f"Feishu {msg_type} delivery outcome is uncertain"
+                ) from exc
             return None
 
     def _create_streaming_card_sync(
@@ -3007,7 +3503,7 @@ class FeishuChannel(BaseChannel):
                 )
                 buf.card_id = None
 
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage) -> DeliveryReceipt | None:
         """Send a message through Feishu, including media (images/files) if present."""
         if not self._client:
             raise RuntimeError("Feishu client is not initialized")
@@ -3018,6 +3514,43 @@ class FeishuChannel(BaseChannel):
             require_delivery_receipt = bool(
                 msg.metadata.get("_require_delivery_receipt")
             )
+
+            if msg.metadata.get("portfolio_monitor_alert"):
+                image_key = None
+                sticker_path = str(msg.metadata.get("monitor_sticker_path") or "")
+                if self._valid_monitor_sticker_path(sticker_path):
+                    image_key = await loop.run_in_executor(
+                        None,
+                        self._upload_image_sync,
+                        sticker_path,
+                    )
+                    if not image_key:
+                        # The core alert is durable and must still be delivered
+                        # when the optional image upload is unavailable.
+                        self.logger.warning(
+                            "YMCA monitoring sticker upload failed; sending text-only card"
+                        )
+                card = self._build_monitor_alert_card(msg.content, image_key)
+                delivery_uuid = str(msg.metadata.get("_delivery_uuid") or "").strip() or None
+                message_id = await loop.run_in_executor(
+                    None,
+                    self._send_message_sync,
+                    receive_id_type,
+                    msg.chat_id,
+                    "interactive",
+                    json.dumps(card, ensure_ascii=False),
+                    delivery_uuid,
+                )
+                if not message_id:
+                    raise DeliveryRejectedError(
+                        "Feishu rejected the portfolio monitoring card"
+                    )
+                return DeliveryReceipt(
+                    provider="feishu",
+                    remote_message_id=str(message_id),
+                    provider_request_id=delivery_uuid,
+                    accepted_at=datetime.now(timezone.utc).isoformat(),
+                )
 
             if msg.metadata.get("_research_hub"):
                 chat_type = str(msg.metadata.get("chat_type") or "p2p")
@@ -3168,6 +3701,8 @@ class FeishuChannel(BaseChannel):
                 reply_message_id = _msg_id
 
             first_send = True  # tracks whether the reply has already been used
+            delivery_uuid_root = str(msg.metadata.get("_delivery_uuid") or "").strip()
+            send_ordinal = 0
 
             def _do_send(m_type: str, content: str) -> str | bool:
                 """Send via reply (first message) or create (subsequent).
@@ -3176,28 +3711,43 @@ class FeishuChannel(BaseChannel):
                 reply_to_message is enabled; otherwise a Reply API call for an
                 existing topic must not create a new topic.
                 """
-                nonlocal first_send
+                nonlocal first_send, send_ordinal
+                request_uuid = None
+                if delivery_uuid_root:
+                    request_uuid = str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"{delivery_uuid_root}:{send_ordinal}:{m_type}",
+                        )
+                    )
+                send_ordinal += 1
                 if reply_message_id:
                     # If we're in a topic, always use reply to stay in the topic
                     if has_thread_id:
                         ok = self._reply_message_sync(
                             reply_message_id, m_type, content,
                             reply_in_thread=self._should_use_reply_in_thread(msg.metadata),
+                            delivery_uuid=request_uuid,
                         )
                         if ok:
                             return ok
+                        if require_delivery_receipt:
+                            raise RuntimeError(f"Feishu reply outcome is uncertain for {m_type}")
                     elif first_send:
                         # If we're not in a topic but replying to message, only first uses reply
                         first_send = False
                         ok = self._reply_message_sync(
                             reply_message_id, m_type, content,
                             reply_in_thread=self._should_use_reply_in_thread(msg.metadata),
+                            delivery_uuid=request_uuid,
                         )
                         if ok:
                             return ok
+                        if require_delivery_receipt:
+                            raise RuntimeError(f"Feishu reply outcome is uncertain for {m_type}")
                     # Fall back to regular send if reply fails
                 message_id = self._send_message_sync(
-                    receive_id_type, msg.chat_id, m_type, content
+                    receive_id_type, msg.chat_id, m_type, content, request_uuid
                 )
                 if not message_id:
                     raise RuntimeError(f"Feishu rejected the {m_type} message")
@@ -3246,6 +3796,47 @@ class FeishuChannel(BaseChannel):
                             f"Feishu rejected file upload: {os.path.basename(file_path)}"
                         )
 
+            research_completion = msg.metadata.get("research_completion")
+            if (
+                isinstance(research_completion, dict)
+                and research_completion
+                and _research_completion_card_enabled()
+            ):
+                chat_type = str(msg.metadata.get("chat_type") or "p2p")
+                base_key = str(
+                    msg.metadata.get("research_base_session_key")
+                    or f"feishu:{msg.chat_id}"
+                )
+                card = self._build_research_completion_card(
+                    research_completion,
+                    reply_chat_id=msg.chat_id,
+                    chat_type=chat_type,
+                    session_key=base_key,
+                    route_key=str(msg.metadata.get("research_route_key") or "") or None,
+                    source_session_id=str(
+                        msg.metadata.get("report_source_session_id")
+                        or msg.metadata.get("session_id")
+                        or ""
+                    )
+                    or None,
+                )
+                last_message_id = str(
+                    await loop.run_in_executor(
+                        None,
+                        _do_send,
+                        "interactive",
+                        json.dumps(card, ensure_ascii=False),
+                    )
+                )
+                if require_delivery_receipt:
+                    return DeliveryReceipt(
+                        provider="feishu",
+                        remote_message_id=last_message_id,
+                        provider_request_id=delivery_uuid_root or None,
+                        accepted_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                return None
+
             if msg.metadata.get("portfolio_daily_complete"):
                 chat_type = str(msg.metadata.get("chat_type") or "p2p")
                 base_key = str(
@@ -3268,30 +3859,44 @@ class FeishuChannel(BaseChannel):
                 )
                 return
 
+            last_message_id: str | None = None
             if msg.content and msg.content.strip():
                 fmt = self._detect_msg_format(msg.content)
 
                 if fmt == "text":
                     # Short plain text – send as simple text message
                     text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
-                    await loop.run_in_executor(None, _do_send, "text", text_body)
+                    last_message_id = str(
+                        await loop.run_in_executor(None, _do_send, "text", text_body)
+                    )
 
                 elif fmt == "post":
                     # Medium content with links – send as rich-text post
                     post_body = self._markdown_to_post(msg.content)
-                    await loop.run_in_executor(None, _do_send, "post", post_body)
+                    last_message_id = str(
+                        await loop.run_in_executor(None, _do_send, "post", post_body)
+                    )
 
                 else:
                     # Complex / long content – send as interactive card
                     elements = self._build_card_elements(msg.content)
                     for chunk in self._split_elements_by_table_limit(elements):
                         card = {"config": {"wide_screen_mode": True}, "elements": chunk}
-                        await loop.run_in_executor(
+                        last_message_id = str(await loop.run_in_executor(
                             None,
                             _do_send,
                             "interactive",
                             json.dumps(card, ensure_ascii=False),
-                        )
+                        ))
+
+            if require_delivery_receipt and last_message_id:
+                return DeliveryReceipt(
+                    provider="feishu",
+                    remote_message_id=last_message_id,
+                    provider_request_id=delivery_uuid_root or None,
+                    accepted_at=datetime.now(timezone.utc).isoformat(),
+                )
+            return None
 
         except Exception:
             self.logger.exception("Error sending message")
@@ -3300,12 +3905,107 @@ class FeishuChannel(BaseChannel):
     def _on_message_sync(self, data: Any) -> None:
         """
         Sync handler for incoming messages (called from WebSocket thread).
-        Schedules async handling in the main event loop.
+        Wait briefly for durable acceptance so the SDK cannot acknowledge early.
         """
-        if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+        message_id = str(
+            getattr(getattr(getattr(data, "event", None), "message", None), "message_id", "")
+            or "unknown"
+        )
+        if not self._loop or not self._loop.is_running():
+            raise RuntimeError(f"Feishu runtime loop is unavailable for {message_id}")
+        future = asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+        try:
+            future.result(timeout=2.0)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            self.logger.error(
+                "Feishu callback timed out before durable acceptance: message_id=%s, stage=acceptance",
+                message_id,
+            )
+            raise
+        except Exception:
+            self.logger.exception(
+                "Feishu callback rejected: message_id=%s, stage=acceptance",
+                message_id,
+            )
+            raise
 
     async def _on_message(self, data: P2ImMessageReceiveV1) -> None:
+        """Serialize duplicate deliveries and commit dedup only after success."""
+        event = data.event
+        message = event.message
+        sender = event.sender
+        message_id = str(message.message_id)
+
+        if sender.sender_type == "bot":
+            return
+        if message.chat_type == "group" and not self._is_group_message_for_bot(message):
+            return
+        if message_id in self._processed_message_ids:
+            return
+
+        existing = self._inflight_message_ids.get(message_id)
+        if existing is not None:
+            error = await asyncio.shield(existing)
+            if error is not None:
+                raise RuntimeError(
+                    f"concurrent Feishu delivery failed for {message_id}"
+                ) from error
+            return
+
+        self._last_received_at = datetime.now(timezone.utc).isoformat()
+        gate: asyncio.Future[BaseException | None] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._inflight_message_ids[message_id] = gate
+        sender_id = sender.sender_id.open_id if sender.sender_id else "unknown"
+        should_react = self.is_allowed(sender_id)
+        if message.message_type == "text":
+            try:
+                payload = json.loads(message.content) if message.content else {}
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            text = self._strip_leading_bot_mention(
+                str(payload.get("text") or ""), getattr(message, "mentions", None)
+            )
+            should_react = should_react or bool(_monitor_binding_code(text))
+
+        try:
+            await self._process_message(data)
+        except BaseException as exc:
+            self._last_error = {
+                "message_id": message_id,
+                "stage": "acceptance",
+                "error": f"{type(exc).__name__}: {exc}",
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+            if not gate.done():
+                gate.set_result(exc)
+            self.logger.exception(
+                "Feishu message failed: message_id=%s, stage=acceptance", message_id
+            )
+            raise
+        else:
+            self._processed_message_ids[message_id] = None
+            while len(self._processed_message_ids) > 1000:
+                self._processed_message_ids.popitem(last=False)
+            self._last_persisted_at = datetime.now(timezone.utc).isoformat()
+            self._last_error = None
+            if not gate.done():
+                gate.set_result(None)
+            if should_react:
+                task = asyncio.create_task(
+                    self._add_reaction(message_id, self.config.react_emoji)
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._on_background_task_done)
+                task.add_done_callback(
+                    lambda completed: self._on_reaction_added(message_id, completed)
+                )
+        finally:
+            self._inflight_message_ids.pop(message_id, None)
+
+    async def _process_message(self, data: P2ImMessageReceiveV1) -> None:
         """Handle incoming message from Feishu."""
         try:
             event = data.event
@@ -3330,14 +4030,26 @@ class FeishuChannel(BaseChannel):
                 self.logger.debug("skipping group message (not mentioned)")
                 return
 
-            # Deduplication check
-            if message_id in self._processed_message_ids:
-                return
-            self._processed_message_ids[message_id] = None
-
-            # Trim cache
-            while len(self._processed_message_ids) > 1000:
-                self._processed_message_ids.popitem(last=False)
+            # A one-time monitoring code authorizes only this delivery target,
+            # so it must be claimable before the broader assistant allowlist.
+            # Group chats still have to address the bot under the group policy.
+            if msg_type == "text":
+                try:
+                    binding_payload = json.loads(message.content) if message.content else {}
+                except (json.JSONDecodeError, TypeError):
+                    binding_payload = {}
+                binding_text = str(binding_payload.get("text") or "")
+                mentions = getattr(message, "mentions", None)
+                binding_text = self._strip_leading_bot_mention(binding_text, mentions)
+                binding_code = _monitor_binding_code(binding_text)
+                if binding_code:
+                    await self._claim_monitor_binding(
+                        code=binding_code,
+                        sender_id=sender_id,
+                        chat_id=chat_id,
+                        chat_type=chat_type,
+                    )
+                    return
 
             # Early permission check — avoid side effects for unauthorized users.
             # Group chats are silently ignored; DMs get a pairing code.
@@ -3354,13 +4066,6 @@ class FeishuChannel(BaseChannel):
                 return
 
             # Add reaction (non-blocking — tracked background task)
-            task = asyncio.create_task(
-                self._add_reaction(message_id, self.config.react_emoji)
-            )
-            self._background_tasks.add(task)
-            task.add_done_callback(self._on_background_task_done)
-            task.add_done_callback(lambda t: self._on_reaction_added(message_id, t))
-
             # Parse content
             content_parts = []
             media_paths = []
@@ -3487,6 +4192,7 @@ class FeishuChannel(BaseChannel):
                     },
                     session_key=base_session_key,
                     is_dm=chat_type == "p2p",
+                    source_event_id=message_id,
                 )
                 return
 
@@ -3566,10 +4272,12 @@ class FeishuChannel(BaseChannel):
                 },
                 session_key=outbound_session_key,
                 is_dm=chat_type == "p2p",
+                source_event_id=message_id,
             )
 
         except Exception:
             self.logger.exception("Error processing message")
+            raise
 
     def _on_reaction_created(self, data: Any) -> None:
         """Ignore reaction events so they do not generate SDK noise."""

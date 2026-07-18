@@ -9,6 +9,7 @@ from typing import Any
 
 ALLOWED_ACTIONS = {"observe", "add", "reduce", "exit"}
 ALLOWED_CONFIDENCE = {"low", "medium", "high"}
+ALLOWED_CONDITION_STATUSES = {"available", "not_recommended", "data_insufficient"}
 
 
 class BriefContractError(ValueError):
@@ -70,16 +71,39 @@ def parse_holding_brief(text: str, *, symbol: str) -> dict[str, Any]:
                     "trigger": trigger,
                     "response": response,
                     "priority": str(item.get("priority") or "normal").strip(),
+                    "confirmation": str(item.get("confirmation") or "").strip() or None,
+                    "invalidation": str(item.get("invalidation") or "").strip() or None,
                 }
             )
 
     data_limited = bool(raw.get("data_limited", False))
+    condition_status = str(raw.get("condition_order_status") or "").strip()
+    if condition_status not in ALLOWED_CONDITION_STATUSES:
+        condition_status = (
+            "data_insufficient"
+            if data_limited
+            else "available"
+            if conditions
+            else "not_recommended"
+        )
     if data_limited:
         action = "observe"
         normalized_amount = None
+    if data_limited or condition_status == "data_insufficient":
+        conditions = []
+        condition_status = "data_insufficient"
+
+    raw_trend = raw.get("trend") if isinstance(raw.get("trend"), dict) else {}
+    trend = {
+        "summary": str(raw_trend.get("summary") or raw.get("summary") or reasons[0]).strip(),
+        "stage": str(raw_trend.get("stage") or "待确认").strip(),
+        "direction": str(raw_trend.get("direction") or "待确认").strip(),
+        "strength": str(raw_trend.get("strength") or "待确认").strip(),
+    }
+    data_scopes = raw.get("data_scopes") if isinstance(raw.get("data_scopes"), dict) else {}
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "symbol": symbol,
         "summary": str(raw.get("summary") or reasons[0]).strip(),
         "action": action,
@@ -89,6 +113,10 @@ def parse_holding_brief(text: str, *, symbol: str) -> dict[str, Any]:
         "risks": risks[:6],
         "watch_points": watch[:6],
         "condition_orders": conditions[:4],
+        "condition_order_status": condition_status,
+        "condition_order_summary": str(raw.get("condition_order_summary") or "").strip(),
+        "trend": trend,
+        "data_scopes": data_scopes,
         "data_limited": data_limited,
     }
 
@@ -97,7 +125,7 @@ def fallback_brief(symbol: str, reason: str, *, data_limited: bool = True) -> di
     """Return a conservative contract-valid result after a worker failure."""
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "symbol": symbol,
         "summary": "本次未形成可靠的主动调整结论，今日仅观察。",
         "action": "observe",
@@ -107,5 +135,14 @@ def fallback_brief(symbol: str, reason: str, *, data_limited: bool = True) -> di
         "risks": ["分析结果不完整，不应据此扩大风险暴露。"],
         "watch_points": ["等待数据和分析恢复后重新运行。"],
         "condition_orders": [],
+        "condition_order_status": "data_insufficient" if data_limited else "not_recommended",
+        "condition_order_summary": "相关数据尚未形成可靠的条件单判断。",
+        "trend": {
+            "summary": "本次未形成可靠的主动调整结论，今日仅观察。",
+            "stage": "待确认",
+            "direction": "待确认",
+            "strength": "待确认",
+        },
+        "data_scopes": {},
         "data_limited": data_limited,
     }

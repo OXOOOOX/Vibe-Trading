@@ -21,11 +21,15 @@ def test_market_analysis_is_premarket_before_1130_shanghai() -> None:
     assert "不得引用尚未发生的当日盘中行情" in prompt
     assert "2026-07-13 08:15 Asia/Shanghai" in prompt
     assert "market.bars_handles[]" in prompt
-    assert "数据受限模式" in prompt
+    assert "decision_scopes" in prompt
     assert "不得再对其子集重复请求 context" in prompt
     assert "actionability=analysis_only" in prompt
     assert "不得绕过 selected_quote=null" in prompt
     assert "精确买卖价、仓位比例、加减仓数量" in prompt
+    assert "不得抹去已校核日线支持的趋势结论" in prompt
+    assert "user_observed" in prompt
+    assert "待核实信息" in prompt
+    assert "## 决策摘要" in prompt
 
 
 def test_market_analysis_switches_to_intraday_at_1130_shanghai() -> None:

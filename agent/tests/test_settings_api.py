@@ -26,6 +26,9 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
                 "MAX_RETRIES=3",
                 "LANGCHAIN_REASONING_EFFORT=max",
                 "TUSHARE_TOKEN=your-tushare-token",
+                "VIBE_TRADING_DEEP_REPORT_ENABLED=0",
+                "VIBE_TRADING_DEEP_REPORT_PROFILES=equity_deep_research",
+                "VIBE_TRADING_MONITOR_AUTO_DEEP_REPORT_ENABLED=0",
             ]
         )
         + "\n",
@@ -36,6 +39,9 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setattr(api_server, "_baostock_supported", lambda: False)
     monkeypatch.setattr(api_server, "_baostock_installed", lambda: False)
     monkeypatch.delenv("API_AUTH_KEY", raising=False)
+    monkeypatch.setenv("VIBE_TRADING_DEEP_REPORT_ENABLED", "0")
+    monkeypatch.setenv("VIBE_TRADING_DEEP_REPORT_PROFILES", "equity_deep_research")
+    monkeypatch.setenv("VIBE_TRADING_MONITOR_AUTO_DEEP_REPORT_ENABLED", "0")
     return TestClient(api_server.app, client=("127.0.0.1", 50000))
 
 
@@ -128,6 +134,73 @@ def test_get_data_source_settings_treats_placeholder_as_unconfigured(
     assert not Path(body["env_path"]).is_absolute()
     assert body["env_path"].endswith(".env")
     assert not (tmp_path / ".env").exists()
+
+
+def test_research_settings_switch_persists_and_applies_without_restart(
+    client: TestClient, tmp_path: Path,
+) -> None:
+    initial = client.get("/settings/research")
+
+    assert initial.status_code == 200
+    assert initial.json()["deep_report_enabled"] is False
+    assert initial.json()["equity_deep_research_enabled"] is False
+    assert initial.json()["monitor_auto_deep_report_enabled"] is False
+    assert initial.json()["effective_monitor_auto_deep_report_enabled"] is False
+    assert not (tmp_path / ".env").exists()
+
+    enabled = client.put(
+        "/settings/research",
+        json={"deep_report_enabled": True},
+    )
+
+    assert enabled.status_code == 200
+    body = enabled.json()
+    assert body["deep_report_enabled"] is True
+    assert body["equity_deep_research_enabled"] is True
+    assert body["enabled_profiles"] == ["equity_deep_research"]
+    assert body["available_profiles"] == ["equity_deep_research"]
+    assert body["monitor_auto_deep_report_enabled"] is False
+    assert body["effective_monitor_auto_deep_report_enabled"] is False
+    assert api_server.os.environ["VIBE_TRADING_DEEP_REPORT_ENABLED"] == "1"
+
+    auto_enabled = client.put(
+        "/settings/research",
+        json={"monitor_auto_deep_report_enabled": True},
+    )
+    assert auto_enabled.status_code == 200
+    auto_body = auto_enabled.json()
+    assert auto_body["deep_report_enabled"] is True
+    assert auto_body["monitor_auto_deep_report_enabled"] is True
+    assert auto_body["effective_monitor_auto_deep_report_enabled"] is True
+    assert api_server.os.environ["VIBE_TRADING_MONITOR_AUTO_DEEP_REPORT_ENABLED"] == "1"
+
+    disabled = client.put(
+        "/settings/research",
+        json={"deep_report_enabled": False},
+    )
+    assert disabled.status_code == 200
+    disabled_body = disabled.json()
+    assert disabled_body["deep_report_enabled"] is False
+    assert disabled_body["monitor_auto_deep_report_enabled"] is False
+    assert disabled_body["effective_monitor_auto_deep_report_enabled"] is False
+
+    env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "VIBE_TRADING_DEEP_REPORT_ENABLED=0" in env_text
+    assert "VIBE_TRADING_DEEP_REPORT_PROFILES=equity_deep_research" in env_text
+    assert "VIBE_TRADING_MONITOR_AUTO_DEEP_REPORT_ENABLED=0" in env_text
+
+
+def test_research_settings_default_to_disabled_when_unconfigured(monkeypatch) -> None:
+    monkeypatch.delenv("VIBE_TRADING_DEEP_REPORT_ENABLED", raising=False)
+    monkeypatch.delenv("VIBE_TRADING_DEEP_REPORT_PROFILES", raising=False)
+    monkeypatch.delenv("VIBE_TRADING_MONITOR_AUTO_DEEP_REPORT_ENABLED", raising=False)
+
+    body = api_server._build_research_settings_response({})
+
+    assert body.deep_report_enabled is False
+    assert body.equity_deep_research_enabled is False
+    assert body.monitor_auto_deep_report_enabled is False
+    assert body.effective_monitor_auto_deep_report_enabled is False
 
 
 def test_settings_response_never_exposes_configured_secret_hints(

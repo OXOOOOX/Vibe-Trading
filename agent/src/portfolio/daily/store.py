@@ -135,6 +135,7 @@ class DailyRunStore:
         filename: str,
         payload: bytes,
         symbol: str | None = None,
+        security_name: str | None = None,
         media_type: str = "application/pdf",
         revision: int = 1,
     ) -> dict[str, Any]:
@@ -151,6 +152,7 @@ class DailyRunStore:
             "artifact_id": artifact_id,
             "kind": kind,
             "symbol": symbol,
+            "security_name": security_name,
             "filename": safe_name,
             "media_type": media_type,
             "size_bytes": len(payload),

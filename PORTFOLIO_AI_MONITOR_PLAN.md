@@ -1196,6 +1196,7 @@ GET    /portfolio/monitors/{profile_id}/fundamental-scorecards/{scorecard_id}
 PATCH  /portfolio/monitors/{profile_id}/plans/{version}
 POST   /portfolio/monitors/{profile_id}/plans/{version}/activate
 POST   /portfolio/monitors/{profile_id}/reanalyze
+POST   /portfolio/monitors/{profile_id}/reopen
 POST   /portfolio/monitors/{profile_id}/pause
 POST   /portfolio/monitors/{profile_id}/resume
 POST   /portfolio/monitors/{profile_id}/close
@@ -1206,6 +1207,7 @@ POST   /portfolio/monitors/{profile_id}/close
 - 修改 draft 必须携带 `If-Match` 或 `expected_revision`；版本冲突返回 409。
 - `close` 是软关闭，保留 plan、event、delivery 和 audit；首期不提供物理删除。
 - 重复选择已有 active/paused profile 时创建新 draft version，不创建第二个 profile；closed profile 必须显式 reopen。
+- `reopen` 只接受 closed profile：先恢复到 drafting，再用当前已校核数据重新过门禁并生成待审核版本；它不能强制把 single-source/stale/offline 数据视为可用，也不会自动激活计划或启动全局 runtime。
 - 统一错误契约覆盖 400、404、409、422、429 和 503，并返回稳定 `error_code` 与 `blocked_reasons`。
 
 批量创建草案：
@@ -1524,24 +1526,24 @@ database_size_and_growth
 
 - [ ] 实现监控卡片。
 - [ ] 实现投递幂等和重试。
-- [ ] 实现 durable outbox、claim lease、DeliveryReceipt 与 `delivery_uncertain`。
+- [x] 实现 durable outbox、claim lease、DeliveryReceipt 与 `delivery_uncertain`；未知结果进入人工对账，不盲目重发。
 - [ ] 实现确认收到、暂停一天、重新分析、查看计划和关闭监控。
 - [ ] 实现数据异常卡片。
-- [ ] 保存 remote message ID 和确认状态。
+- [x] 保存飞书真实 remote message ID、provider request ID、accepted_at 和确认状态。
 
 验收：模拟网络失败、服务重启、重复事件以及“远端已接受、本地未提交”的崩溃窗口；已知成功的 delivery 不重复。若 M0 证实远端支持幂等或查询，对同一 event 实现有效 exactly-once；否则未知结果进入 `delivery_uncertain` 且不盲目重发。按钮只修改目标 profile/event。
 
 ### M6：Portfolio 页面
 
 - [ ] 增加持仓选择和批量创建草案。
-- [ ] 增加 AI 监控中心。
+- [x] 增加 AI 监控中心。
 - [ ] 监控中心默认使用摘要条/折叠面板，详情进入抽屉，避免与晨会大面板叠加过载。
-- [ ] 增加计划抽屉和显式启用确认。
+- [x] 增加计划抽屉和显式启用确认；修改后的计划通过原子 `save-and-activate` 启用。
 - [ ] 增加基本面评分卡页签、跨期变化和原文证据查看。
 - [ ] 批量草案支持逐只审核；“全部启用”只有在每只都通过校验且用户显式二次确认时出现。
-- [ ] 重新分析展示新旧计划 diff。
-- [ ] 增加监控状态标签和快捷控制。
-- [ ] 增加事件时间线和数据健康展示。
+- [x] 重新分析展示新旧计划结构化 diff。
+- [x] 增加监控状态标签和快捷控制。
+- [x] 增加事件时间线和数据健康展示。
 - [ ] 完成桌面与移动端布局。
 
 验收：用户可以在 `/portfolio` 完成“选择 -> 生成计划 -> 修改 -> 启用 -> 查看事件 -> 暂停/恢复/关闭”完整闭环。
@@ -1550,13 +1552,13 @@ database_size_and_growth
 
 - [ ] 实现停机观测缺口说明。
 - [ ] 实现行情与新闻补偿规则。
-- [ ] 实现健康接口和运行指标。
+- [x] 实现健康接口和分桶运行指标。
 - [ ] 完成 M0 允许上限内的并发调度压测和 SQLite contention 测试。
 - [ ] 完成至少 3 个连续真实交易日的 shadow soak，覆盖午休、隔夜和服务重启。
 - [ ] 对 point-in-time 文档语料执行 shadow replay；若灰度期恰有新披露，再核对真实 document lag、去重和评分链路。
 - [ ] 注入 leader 失效、event/outbox 提交边界、远端接受后本地未提交和 callback 重放故障。
 - [ ] 注入重复文档、修订稿、错误页码、推断不一致和 scorecard job 中断故障。
-- [ ] 功能开关灰度启用。
+- [x] 功能开关支持安全启动 shadow；deliver 继续受 readiness 与 soak 硬门禁约束。
 
 验收：本地事件和已知成功投递不重复，未知远端结果正确进入 `delivery_uncertain`；休市不评估价格规则，数据故障不产生交易型提醒，M0 允许数量的标的运行期间不存在无界任务、Session 或数据库增长。
 
@@ -1737,3 +1739,321 @@ scorecard 引用不存在的页码/原文时被 evidence verifier 拒绝
 - 持久化 Planner/scorecard job、新闻/文档水位、租约、回调 nonce、审计和保留清理已实现，长期运行不存在无界增长。
 - 完成后端测试、前端测试、生产构建、浏览器交互验证和真实飞书链路验证。
 - 全程保持研究与提醒边界，不实现任何真实订单写入能力。
+
+## 26. 当前实施状态（2026-07-14）
+
+本次已完成一个默认关闭、可运行和可回滚的行情监控纵向版本，尚未宣称整份 Definition of Done 已满足。
+
+已完成：
+
+- [x] 独立 Monitoring SQLite、WAL、busy timeout、schema version、Profile/Plan/Rule/Observation/Event/DeliveryOutbox/DraftBatch/DeliveryTarget/RuntimeLease 表及关键唯一索引。
+- [x] 持仓内标的批量草案、严格规则白名单与数据门禁；无 verified/raw/provenance 行情时返回 blocked，不产生可启用精确规则。
+- [x] 证据策略 Planner：使用已校核现价和可用日线区间生成待审核阈值，冻结 evidence manifest 与输入/输出 hash。当前 `model_id=evidence-policy-v3`、新草案 `schema_version=3`；存量激活计划仍可能是 v1/v2，且当前策略生成器不冒充已接入 LLM。
+- [x] 草案编辑、revision 冲突、显式启用、暂停、恢复、关闭、重新分析；重新分析产生新版本且不停止或替换原 active plan。
+- [x] 已关闭 profile 支持“重新检测并打开”：重新校验当前行情，数据通过时生成待审核新版本，仍被门禁阻断时保持 drafting 并返回最新原因。
+- [x] 待审核计划可显式选择每 1 分钟或每 5 分钟的服务器检查频次，并独立选择规则的 1m/5m 闭合 K 线粒度；检查频次不得慢于任何已启用规则粒度。
+- [x] Portfolio 监控卡片每 5 秒同步真实运行状态；每次后端行情检查更新 `last_quote_check_at` 后触发短暂心跳动画，同时展示本轮正常/受阻和预计下次检查时间。运行时关闭、休市或暂停时不伪造心跳。
+- [x] 草案创建、重新分析和已关闭 profile 的重新检测会真正执行一次 `force=True + read_only=True` 的 1m/5m/1D 行情刷新，再进入 Planner；`force_fresh` 不再只是未消费的请求字段。drafting profile 可直接“重新获取数据”，无需先关闭再打开。
+- [x] “查看计划”会先立即打开带加载反馈的独立抽屉，再异步读取详情；主动刷新与重新检测在线程池执行，不再阻塞同进程的计划查看和只读状态接口。已关闭计划不再暴露无效的“确认并启用”，而是在当前抽屉先重新检测数据源，通过门禁并生成新草案后再由用户确认启用。
+- [x] 监控标的卡片直接展示当前生效计划的服务器检查频次、K 线粒度、规则阈值、版本、数据截止时间和飞书目标状态。计划已激活但全局运行时关闭时，UI 明确显示“当前未实际监控”，并隐藏失真的历史 `next_quote_run_at`；运行时正常但排程逾期时改为“检查排队中 / 已延迟”，不再把过去时间称为“下次预计”。
+- [x] 行情白名单评估（当前开放 1m/5m）、首次观测基线、不同闭合 bar 连续确认、数据缺口/午休重置、冷却、hysteresis rearm、episode 去重。
+- [x] Event 与 outbox 在同一 SQLite 事务创建；投递未知进入 `delivery_uncertain` 且不盲目重发。
+- [x] MarketRefreshService `read_only` 模式，监控刷新不改写 PortfolioState。
+- [x] 默认关闭的单 leader runtime、lease、频率档位、活跃标的上限、健康与管理员 start/stop API。
+- [x] 复用现有 Feishu ChannelManager 主动发送研究提醒；启用前强制存在 active 飞书目标。
+- [x] Portfolio 页面持仓选择、监控中心、目标绑定、草案抽屉、规则修改、二次确认、快捷状态控制和事件时间线。
+- [x] 后端单元/API 测试、前端交互测试、生产构建、1280px 与 390px 浏览器验证。
+
+仍保持关闭或待后续里程碑完成：
+
+- [ ] 将严格 JSON 的 LLM Monitor Planner 接到现有分析报告与 SessionDispatcher，并完成 schema repair/reconcile；在此之前 UI 只展示可追溯的 evidence-policy 草案。
+- [ ] 新闻首次基线、高水位、文章指纹、确定性预筛与 AI 语义复核。
+- [ ] 基本面文档契约、point-in-time scorecard、证据页码复核与跨期变化检测。
+- [ ] 权威交易日历快照、停牌/临时休市模型和真正的多标的上游 batch；当前运行时通过当前交易日 verified quote fail closed，不把旧缓存用于触发。
+- [ ] 飞书交互卡按钮、remote message id/远端查询能力和真实链路故障注入；当前为主动 Markdown 消息。
+- [ ] 持仓删除/数量变化主动 reconcile、rule/plan 分层到期事件、自动 resume、prune/备份与长期容量治理。
+- [ ] M0 实测、3 个交易日 shadow soak、真实飞书验收与分级灰度。因此生产环境继续保持 `VIBE_TRADING_MONITORING_ENABLED=0`。
+
+## 27. 后续工作计划（当前纵向版本之后）
+
+本节是从第 26 节当前实现出发的执行顺序，不替换第 21 节的完整里程碑。后续工作的第一目标不是继续增加触发类型，而是先证明现有行情监控链路能够安全灰度、被观测并可随时关停。
+
+### 27.1 不变的产品与安全边界
+
+后续所有阶段继续满足以下约束：
+
+- 系统只做研究监控和消息提醒，不具备任何真实下单能力。
+- 监控读取行情、新闻、报告和持仓快照，但不能改写 PortfolioState 或 Daily Run 输入。
+- AI 只能生成待审核草案，不能自行激活、替换或放宽 active plan。
+- stale、partial、冲突或来源不可追溯的数据不能产生可执行价格触发。
+- 本地事件必须去重；远端投递结果未知时进入 `delivery_uncertain`，不盲目重发。
+- 全局开关是最终 kill switch；关闭后停止新调度，但保留计划、事件、投递和审计历史。
+
+### 27.2 W1：安全灰度与可观测性（下一开发批次，P0）
+
+#### 工作范围
+
+- 增加有效运行状态 `off / shadow / deliver`：`VIBE_TRADING_MONITORING_ENABLED=0` 表示 off；启用总开关后由 `VIBE_TRADING_MONITORING_MODE=shadow|deliver` 决定是否允许外发，默认使用 shadow。
+- shadow 模式执行真实调度、取数、规则评估和事件去重，但抑制飞书外发；持久化 `would_deliver`、目标、抑制原因、规则版本、数据时间和数据质量。
+- 健康接口和监控中心增加 leader/lease、最近成功取数、quote/bar freshness、schedule/bar lag、批次耗时、数据拦截原因、事件去重、outbox、`delivery_uncertain` 和数据库增长指标。
+- 增加可重复的行情回放与故障注入工具，覆盖阈值震荡、重复 bar、午休、跨日、服务重启、数据缺失、数据延迟、SQLite 锁竞争和飞书结果未知。
+- 验证双实例 leader 竞争、租约接管和 missed tick 合并；调度过载时降级，不无限积压任务。
+- 接入权威交易日历快照及停牌/临时休市边界；能力未知时 fail-closed。
+- 补充数据库备份、prune watermark、保留周期和容量告警，避免长期运行无界增长。
+
+#### W1 验收门禁
+
+| 必须保持的属性 | 机制与验证 |
+| --- | --- |
+| 监控不修改持仓 | 运行前后比较 PortfolioState 与 Daily Run 输入的规范化 hash |
+| 陈旧或不完整数据不触发 | 注入 stale/partial/conflict 数据并确认只有 blocked observation |
+| 重启和重复 bar 不制造重复事件 | 使用相同 bar、相同 episode 和进程重启回放，重复 confirmed event 必须为 0 |
+| 多实例不重复调度 | 双实例竞争和 lease 接管测试中，同一任务只能有一个有效 claim |
+| 未确认计划不能执行 | API、数据库状态机和前端三层覆盖 draft/validated/active 边界 |
+| shadow 永不外发 | 使用会命中的规则运行端到端测试，允许产生 would-deliver 记录但飞书调用次数必须为 0 |
+| 不确定投递不盲目重试 | 注入远端已接收但本地无回执的窗口，状态必须停在 delivery_uncertain |
+| 可以立即止损 | 关闭总开关后不再创建新调度任务，已有审计数据仍可只读查询 |
+
+自动化门禁通过后，按 1、3、再到 M0 实测安全上限运行至少 3 个连续完整交易日的 shadow soak。soak 只能发现常见运行缺陷，不能代替状态机、唯一键、事务和故障测试提供的硬约束。P95 schedule/bar lag 等数值门槛必须根据 M0 真实测量冻结，不预先凭经验承诺。
+
+### 27.3 W2：真实 LLM Monitor Planner（P1）
+
+#### 工作范围
+
+- 从最新有效持仓分析报告、报告引用、持仓快照和已验证行情构造冻结 evidence manifest。
+- 通过 Planner 专用只读入口接入现有分析报告和 SessionDispatcher，Planner 任务异步持久化，支持重启 reconcile、取消和单标的重试。
+- AI 只输出严格 JSON；实施 JSON Schema、枚举、数值范围、指标白名单、市场能力和数据新鲜度校验。
+- 只允许一次有限 schema repair；仍不合法则将该标的标记为 failed/blocked，不生成可激活规则。
+- 保存 model、prompt、schema、evidence、输入 hash 和输出 hash，支持新旧计划 diff。
+- 重新分析只创建新草案，不暂停、不替换原 active plan；必须由用户再次确认才能切换版本。
+- 对单批次标的数、AI 调用次数、token、成本、超时和并发设置硬上限。
+
+#### W2 验收门禁
+
+- 幻觉指标、自由文本表达式、越权动作和无证据精确阈值均不能通过校验。
+- 输入变化后旧任务不能静默使用新持仓或新报告；结果必须引用创建任务时冻结的输入。
+- 单标的失败不影响同批次其他标的形成稳定结果。
+- AI 超时或不可用时，已有确定性行情规则继续运行。
+- 任何重新分析结果在用户确认前都不改变 active plan。
+
+### 27.4 W3：飞书真实交付闭环（P1）
+
+#### 工作范围
+
+- 保存飞书返回的 remote message id、远端响应和本地 DeliveryReceipt；先验证远端是否支持幂等键或消息查询，再决定可声明的投递语义。
+- 实现监控交互卡及白名单操作：确认收到、暂停一天、重新分析、查看计划、关闭监控。
+- callback 校验 owner、operator、delivery target、profile revision、event 状态和一次性 nonce，防止越权与重放。
+- 增加单标的、单 profile 和单用户每日提醒上限；相同 episode 使用升级/抑制策略，避免消息轰炸。
+- 飞书卡片不可用时降级为 Markdown 文本，但不丢失本地事件和投递审计。
+
+#### W3 验收门禁
+
+- 先只绑定测试飞书目标，使用可控事件验证成功、确定失败、超时、远端已接受但本地未提交和服务重启。
+- 已知成功的 delivery 不重复发送；确定失败只执行有上限的受控重试；未知结果不自动重发。
+- 所有卡片操作只修改目标 profile/event，并写入审计事件。
+- 通过后仅向一个自愿 profile 开放 deliver，观察完整交易时段后再逐级扩展。
+
+### 27.5 W4：新闻慢车道（P2）
+
+- 新闻调度与分钟行情热路径分离，采用独立队列、频率、预算和降级策略。
+- 建立首次基线、本地高水位、有限重叠窗口、URL/文章 ID/内容 hash 指纹和 `upsert_and_diff`。
+- 先做来源白名单、股票关联、时间规范化、关键词确定性预筛和相似事件聚类，再进入 AI 语义复核。
+- AI 判断新闻是否为新信息、是否影响当前 thesis、影响方向、重要性和证据；提醒必须附原始来源与发布时间。
+- 优先支持业绩预告/财报、重大合同、监管处罚、停复牌、增减持、回购、高管变动和行业政策等高确定性事件。
+- 无法证明抓取完整性时标记 `news_gap_possible`；首次启用只建立 baseline，不批量发送历史新闻。
+
+验收要求：同一事件的转载和 URL 变体只形成一个候选事件；低相关、旧闻或无明确标的关系的内容不提醒；AI 失败不阻塞行情监控。
+
+### 27.6 W5：基本面与组合级监控（P3）
+
+- 建立披露文档稳定 ID、真实 `published_at`、财务期间、revision/supersedes、完整正文与页码/章节锚点契约。
+- 使用服务器版本化的固定维度 rubric 生成 point-in-time scorecard；模型只能评估证据和 materiality，不能改写评分标准。
+- 首次文档只建立 baseline；后续可比期间才检测方向变化、evidence_disappeared 和 restatement_changed_conclusion。
+- 建立人工复核评测集，冻结逐维度 agreement、引用准确率、人工 adjudication alignment 和 uncertain 比例门槛。
+- 在单标的链路稳定后增加组合层风险：仓位集中、行业暴露、多个持仓受同一事件影响和组合回撤异常。
+- 基本面 material change 只生成研究事件和待确认新草案，不自动调整阈值或持仓。
+
+### 27.7 依赖顺序与发布原则
+
+```text
+W1 安全灰度与可观测性
+  -> W2 LLM Planner
+  -> W3 测试飞书与单 profile deliver
+  -> W4 新闻慢车道
+  -> W5 基本面与组合监控
+```
+
+- W1 是所有真实投递的前置门禁；未通过前生产环境保持总开关关闭，开发验证只使用 shadow。
+- W2 和 W3 可以在 W1 后并行开发，但真实 deliver 必须等 W1 门禁和 shadow soak 通过。
+- W4 复用 W2 的 evidence/schema/AI 预算边界，以及 W3 的投递审计能力，因此不应提前绕开这些基础设施。
+- W5 的文档证据契约和人工校准成本最高，只有在行情与新闻链路稳定后才进入生产灰度。
+- 每个阶段均采用默认关闭、显式启用、有限白名单、容量上限、可回滚和保留审计的发布方式。
+
+### 27.8 下一次实施的明确交付物
+
+下一次代码实施只进入 W1，交付以下内容后再开始 LLM Planner：
+
+1. `off / shadow / deliver` 有效运行状态及数据库迁移。
+2. shadow 事件、would-deliver 结果和抑制原因持久化。
+3. 后端健康指标及 Portfolio 监控中心的运行健康展示。
+4. 行情回放、双实例、重启、重复 bar、数据异常和投递不确定故障测试。
+5. 权威交易日历的 fail-closed 接入方案与能力测试。
+6. 数据库备份、保留清理和容量指标。
+7. M0 测量报告模板与 3 个交易日 shadow soak 操作清单。
+
+## 28. W1 工程实施状态（2026-07-14）
+
+W1 的代码与自动化验证入口已经实现，但真实交易日 soak 尚未发生，因此 W1 当前状态是“工程完成、运营验收待执行”，不能视为已经通过生产灰度门禁。
+
+已完成：
+
+- [x] `off / shadow / deliver` 有效运行状态；总开关为最终 kill switch，管理员 start 不能绕过；模式非法时 fail-safe 到 shadow。
+- [x] Monitoring SQLite 从 W1 初始 v2 持续迁移到当前 schema v6；delivery 持久化 `delivery_mode`、`would_deliver`、`suppressed_at`、`suppression_reason` 和真实回执，迁移前自动备份且未来版本 fail-closed。
+- [x] shadow 模式真实取数、评估和创建 confirmed event，但 outbox 直接落为 `shadow_suppressed`，不会调用飞书外发；历史 pending 在 shadow/off 下也被抑制。
+- [x] 运行 tick、duration、schedule lag、bar lag、blocked profile、事件数、shadow 抑制数、重复观察/事件计数和数据库增长指标。
+- [x] 复用 `ChinaMarketCalendar` 的权威/持久化快照和 fail-closed 行为；显式区分盘前、上午、午休、下午和收盘。
+- [x] 分钟 bar freshness 门禁；超过允许延迟的 verified bar 也不能用于触发。
+- [x] 可复用 `replay_quotes`，支持重复输入和中途重开 MonitoringStore，验证持久化去重与恢复。
+- [x] 在线 SQLite backup、观察/运行指标保留清理、旧备份清理、WAL checkpoint、数据库上限与利用率指标。
+- [x] 管理员维护 API：`POST /admin/portfolio/monitoring/maintenance`。
+- [x] Portfolio 监控中心显示有效模式、影子提示、调度 P95、日历状态、影子命中、数据阻断、存储与维护错误。
+- [x] 影子事件时间线明确显示“影子命中 · 未发送”。
+- [x] 新增 `PORTFOLIO_AI_MONITOR_W1_RUNBOOK.md`，包含分级运行、每日记录、硬门禁、故障演练和回滚步骤。
+
+仍待真实环境完成：
+
+- [ ] 用真实交易时段完成 1 标的 S1 和 3 标的 S2 容量基准。
+- [ ] 根据 M0 测量冻结 duration、schedule lag、bar lag、数据可用率和数据库增长门槛。
+- [ ] 按实测安全上限完成至少 3 个连续完整交易日的 S3 shadow soak。
+- [ ] 使用独立观测手段确认 shadow 期间飞书实际外发为 0，PortfolioState/Daily Run hash 未变化。
+- [ ] 在真实数据中复核日历不可用、行情延迟、午休恢复、进程重启和双实例 lease 接管记录。
+
+在以上运营验收完成前，生产环境继续保持：
+
+```env
+VIBE_TRADING_MONITORING_ENABLED=0
+VIBE_TRADING_MONITORING_MODE=shadow
+```
+
+## 29. 飞书验证码绑定与持仓雷达入口（2026-07-14）
+
+本轮将“手工填写 open_id/chat_id”替换为可验证的真实聊天绑定，并明确持仓表中的监控入口：
+
+- [x] 持仓行不再使用语义模糊的复选框，改为雷达按钮；未选中为中性灰，点亮后使用青色高亮并暴露 `aria-pressed` 状态。
+- [x] 雷达开关按证券标识持久化到浏览器；刷新页面或重新进入 Portfolio 后保持用户上次的开/关选择，只有用户再次切换才改变，并自动清理已不在持仓中的标的。
+- [x] “监控标的”卡片同时显示持仓名称、6 位证券代码与市场标识，不再只显示完整证券编码。
+- [x] 支持表头雷达一键选择/取消全部持仓；生成草案仍是独立的显式动作，点亮雷达不会直接激活监控。
+- [x] Portfolio 监控中心生成 10 分钟有效的一次性验证码，不再要求用户查找飞书内部 ID。
+- [x] 私聊发送 `绑定监控 <验证码>`，或在群聊发送 `@机器人 绑定监控 <验证码>`，即可把当前私聊/群聊绑定为提醒目标。
+- [x] 验证码只保存 SHA-256 hash、原文只在创建响应显示一次；验证码一次性消费，并通过 SQLite 事务将 claim 与 delivery target 绑定原子提交。
+
+- [x] 未进入通用 Agent allowlist 的用户也可凭验证码完成这一次目标绑定；验证码不授予其他会话或 Agent 操作权限。
+- [x] 前端自动轮询并提供“立即检查”，成功后自动选中目标；过期或已使用验证码不能再次绑定。
+
+边界保持不变：绑定成功只建立提醒地址，不会自动启用 runtime、激活任何 profile 或发送历史事件。生产环境仍需完成 W1 shadow soak 和 W3 真实投递验收后，才允许进入 `deliver`。
+
+## 30. 页面运行开关与分市场诚实状态（2026-07-15）
+
+- [x] Portfolio 监控中心增加“启动影子监控 / 停止监控服务”按钮，用户不再需要修改代码或手工编辑环境变量。
+- [x] 开关通过受保护的管理 API 持久化 `VIBE_TRADING_MONITORING_ENABLED` 和 `VIBE_TRADING_MONITORING_MODE` 到 `agent/.env`，同时立即更新当前进程并启动/停止 runtime；重启后仍保持上次选择。
+- [x] 页面入口只负责安全的 `shadow` 启动，不暴露一键 `deliver`；W1 真实飞书门禁保持不变。
+- [x] 停止服务只停止后续调度并关闭总开关，不删除 profile、plan、event、delivery 或审计历史。
+- [x] 当前 scheduler 仅支持沪深京交易日历；US/HK/未知市场的 active plan 会保留，但 runtime 不取数、不计算 schedule lag，也不把它们显示成“监控中”。
+- [x] 监控卡片对未支持市场明确显示“该市场调度待接入”，避免把 A 股时段错误套用到 AAPL 等美股。
+
+当前本地开发环境可由页面直接启动 shadow；生产 `deliver` 仍必须等待 W1 shadow soak、真实交易时段容量测量和飞书链路验收通过。
+
+## 31. 监测价格、检查倒计时与目标区间（2026-07-15）
+
+- [x] 监控列表接口为每个 profile 返回最近一条已落库 quote observation，包括监测价格、闭合 K 线时间、粒度、质量状态和来源；不使用持仓页现价冒充监控运行时价格。
+- [x] 标的卡片展示“上次监测价格”和数据时间；尚未取得合格 observation 时显示明确空状态。
+- [x] 增加按秒变化的圆形检查倒计时，基于 `next_quote_run_at` 和计划检查频次计算；服务关闭、休市、备用实例或未支持市场时不伪造倒计时。
+- [x] 圆环表示“距离下一次服务器检查”，不是对行情何时命中规则的预测；价格条件触发时间不可预知。
+- [x] 从生效计划中选择距离最近的价格阈值或区间边界，与上次监测价组成横向目标拉杆；上行距离使用红色，下行距离使用绿色，并显示百分比。
+- [x] 横向拉杆增加“最新价”浮动标记；趋势只比较最近两次相同 K 线粒度、不同闭合时间的监测价，上涨显示红色右上箭头、下跌显示绿色右下箭头，样本不足时显示中性箭头。
+- [x] 价格条使用“动态左右眼”：始终选择现价下方最近目标和上方最近目标，现价突破第一目标后自动把第一目标放到左侧、第二目标放到右侧；下行时对称处理。
+- [x] runtime 从当日最早一根 verified 分钟 K 线记录今日开盘价；左右目标、现价统一显示相对今日开盘价的涨跌百分比，开盘基准左侧使用绿色、右侧使用红色。
+- [x] 当某一侧已没有下一目标时，不外推或伪造阈值，直接以现价作为该侧边界并明确标注“现价边界”。
+
+## 32. 多级目标语义与突破 Boost（2026-07-15）
+
+- [x] 新监控草案由两条规则扩展为四级价格阶梯：`L1 加仓点`、`L2 止损点`、`L1 止盈点`、`L2 止盈点`；全部仍须用户审核，且只提醒、不执行交易。
+- [x] 价格规则增加 `target_intent` 与 `target_level`，支持买入点、加仓点、止损点、止盈点、观察点和突破点；计划抽屉允许用户修改目标类型。
+- [x] 监控卡片在左右目标旁显示层级和语义，不再只显示“向上/向下”技术方向。
+- [x] 以今日开盘价为参考：现价跨过上方目标时启用红色 Boost，跨过下方目标时启用绿色 Boost；卡片光晕、价格轴扫光和状态文案同步变化，并遵守系统“减少动态效果”设置。
+- [x] Boost 卡片增加方向性粒子流：上破时红色粒子由下向上加速，下破时绿色粒子由上向下坠落；粒子不拦截点击，并在“减少动态效果”模式下完全隐藏。
+- [x] 多级目标选择为确定性规则：上行目标按价格升序、下行目标按价格降序编号；页面只展示包围现价的两个最近目标，保证第一目标与下一目标在突破后同时可见。
+
+## 33. 当日区间越界留痕（2026-07-15）
+
+- [x] 行情监控观测持久化 `session_high` 与 `session_low`；历史观测缺失时，从同交易日 verified 分钟 K 线只读补齐，避免为了展示改写旧观测记录。
+- [x] 价格轴的显示范围同时覆盖动态左右目标与当日高低点；因此盘中曾跌破或涨破外围目标、随后现价返回区间时，越界轨迹不会消失。
+- [x] 当日低点和高点使用中性黑色竖线及价格标签，目标点继续使用红/绿色；黑暗模式使用高对比中性色，保证竖线可见。
+- [x] 现价、开盘价、左右目标和当日高低点共用同一个价格坐标域，禁止为了填满横轴而分别缩放，确保位置关系可直接比较。
+
+## 34. AI 推荐点位可解释性（2026-07-15）
+
+- [x] 每条 AI 价格目标保存结构化 `calculation_basis`：方法、方法名称、公式、计算摘要、原始推荐值以及带日期的参考点；计划校验器限制字段长度、数量和数值范围。
+- [x] 近 20 个交易日数据充足时，L1 止盈与 L2 止损分别使用“震荡区间上/下沿 + 日波动缓冲”，明确标注区间起止日期、极值日期、极值与缓冲价，并说明最终取值规则。
+- [x] L1 加仓点明确使用“现价与止损防线中点”；L2 止盈点明确使用“第一目标相对现价等距延展”。日线不足时如实标注“已校核现价上下 5% 观察带”，不伪称斐波那契或支撑阻力。
+- [x] “计划与审核”抽屉在每个价格规则下直接展示“AI 推荐点位依据”和公式；若用户手动修改阈值，同时显示当前值与 AI 原始推荐值，避免依据与编辑结果混淆。
+- [x] 外部监控概览的加仓、止盈、止损等目标标签支持鼠标悬停和键盘聚焦，通过浮层展示同一份计算依据；浮层使用 Portal，避免被卡片裁切。
+
+## 35. 可靠提醒闭环与后续路线图（2026-07-15）
+
+### 35.1 审查结论与优先级
+
+行情监测、量价观察、目标区间和点位解释已经具备较完整的用户界面；下一阶段停止继续堆叠同类动画或价格规则，实施顺序固定为：
+
+```text
+P0 可靠提醒闭环
+  -> P1 报告驱动 AI Planner、飞书交互与新闻慢车道
+  -> P2 基本面、组合风险、历史仿真和多用户能力
+```
+
+当前默认仍是本地单用户、A 股、只提醒不交易。真实 `deliver` 必须通过 W1/W3 门禁；页面只能安全启动 `shadow`，不能用普通开关绕过生产验收。
+
+### 35.2 P0：可靠提醒闭环
+
+- [x] 原子“保存并启用”：客户端提交完整 plan 与 `expected_revision`，服务端在同一事务中校验、保存和激活；保留旧 activate 接口兼容，但前端有脏草案时不得调用。
+- [x] 草案安全：空数字不再转换成 0；前后目标、L1/L2、频次和有效期提供行内校验；关闭含未保存修改的抽屉前确认。
+- [x] 版本可见：每个 profile 只保留一份有效 `pending_review`，旧草案进入 `superseded`；页面同时展示运行版、待审核版、历史版及结构化 diff。
+- [x] 页面连接状态：连续两次状态同步失败后显示断联与最后同步时间，暂停倒计时/心跳/Boost；恢复后明确显示已重连。
+- [x] 计划入口语义收敛：标的卡片只保留“计划与审核”，AI 重新分析在抽屉内生成新的待审核草案，手动修改仅作用于待审核版；运行版保持只读并持续生效。
+- [x] 计划详情轮询安全：5 秒列表轮询只返回 profile 摘要时保留详情接口已加载的计划版本，滚动或等待不会再把抽屉降级为“无可用计划”。
+- [x] 跨交易日盘前衔接：A 股交易日 09:00 按飞书目标生成一次可幂等审计的盘前提示，明确 09:35 开始首轮闭合行情检查且不承诺一定产生信号；页面盘前心跳同步展示首轮时间。
+- [x] 全局停止服务需要二次确认并列出受影响的 active profile；策略生成文案按真实 `model_id` 展示，旧 schema 显示待重新分析升级。
+- [x] 运行指标按市场会话与 decision 分桶；休市、午休和无到期任务不进入 open-session schedule lag；每个 due profile 必须持久化为 `evaluated` 或带 reason code 的 `blocked`。
+- [x] Leader lease 增加续租、fencing 与任务 claim；失去租约的旧实例不能提交 observation、event 或 delivery。
+- [x] 启动时回收超时 `delivering` 为 `delivery_uncertain`；deliver 正常关停保留 pending outbox，shadow/off 才允许带原因抑制。
+- [x] schema 迁移前自动备份，失败保持原库可启动；恢复后必须通过 integrity check 和 event/delivery/audit 数量比对。
+- [x] 激活时拒绝过期或异常有效期；规则/计划到期生成审计事件和续期草案，数据源持续失明/恢复形成独立 health episode。
+- [x] `DeliveryReceipt` 贯通 Feishu adapter、channel manager、monitor callback 与 outbox，持久化真实 `remote_message_id`；未知结果不自动重发。
+- [x] 增加 deliver readiness、单 profile 白名单、测试私聊目标、每日上限与测试消息；未通过 soak 的环境不能切换到 deliver。
+- [x] 提供不可变 soak 报告工具；单次快照不能证明完整交易日时明确返回 `insufficient_evidence`。
+- [ ] 按顺序完成 S1 一标的、S2 三标的、连续三日 S3 shadow、单私聊 deliver 和三 profile deliver 的真实运营验收。
+
+### 35.3 P1：产品核心能力
+
+- [ ] 报告驱动 AI Planner：冻结分析报告、持仓、行情与 evidence manifest，使用严格 JSON、一次有限 repair 和确定性校验，只生成待审核草案。
+- [ ] 持久化 PlannerJob：提供真实进度、刷新恢复、取消、重启续跑和单标的重试；启用前展示阈值、频次、依据和风险 diff。
+- [ ] 飞书监控卡：确认收到、暂停一天、重新分析、查看计划、关闭监控；使用一次性 nonce、操作者/版本校验和不可变审计。
+- [ ] 新闻慢车道：baseline、高水位、重叠窗口、fingerprint、转载聚类、确定性预筛、AI 语义复核、来源链接和发布时间证据。
+- [ ] 量价功能对 schema v3 计划独立完成 shadow/deliver 灰度；A 股闭环稳定后再接 US/HK 日历、时区、夏令时与盘前盘后策略。
+
+### 35.4 P2：稳定后扩展
+
+- [ ] 基本面 point-in-time 文档、revision/supersedes、跨期评分卡与页码/章节证据。
+- [ ] 行业集中度、组合回撤和同一事件影响多持仓的聚合提醒。
+- [ ] 启用前历史仿真，只展示预计提醒次数、最长间隔和数据缺口，不包装为收益回测。
+- [ ] 390/1024/1440 视口、完整键盘焦点管理和移动端监控选择器。
+- [ ] 多用户 owner、数据隔离、飞书目标归属、个人预算与静默时段；在此之前保持单用户边界。
+
+### 35.5 P0 硬门禁
+
+- error tick、重复 confirmed event、pending、uncertain 与 shadow 真实飞书外发必须全部为 0。
+- PortfolioState 和 Daily Run 规范化 hash 前后完全一致。
+- `P95(schedule lag + duration)` 不超过最短检查周期的 20%，P99 不超过 50%；duration 最大值低于 leader lease 的 50%。
+- verified/actionable 数据可用率不低于 95%，所有不可用结果都有稳定 reason code，超 freshness 上限的数据触发数为 0。
+- 数据库当前利用率低于 80%，按日增长外推 30 天后仍低于 50%；每日备份、prune、WAL checkpoint 与完整性检查成功。
+- 任一重复事件、双 leader、未解释 uncertain，或连续 15 分钟数据可用率低于 95%，立即停止扩级并退回 shadow。

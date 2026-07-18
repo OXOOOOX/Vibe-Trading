@@ -4,6 +4,7 @@ from src.session.service import (
     _CHANNEL_RESEARCH_TOOL_NAMES,
     _PORTFOLIO_ANALYSIS_TOOL_NAMES,
     _PORTFOLIO_DAILY_RUN_TOOL_NAMES,
+    _research_tool_names_for_session,
 )
 
 
@@ -63,3 +64,26 @@ def test_portfolio_daily_run_registry_cannot_refetch_or_mutate_state() -> None:
 
     assert allowed == {"load_skill"}
     assert not {"portfolio_state", "get_data_context", "write_file", "run_swarm"} & allowed
+
+
+def test_channel_policy_wins_after_daily_report_session_is_rebound_to_feishu() -> None:
+    allowed = set(
+        _research_tool_names_for_session(
+            {
+                "portfolio_daily_run": {
+                    "research_only": True,
+                    "run_id": "dpr_today",
+                    "symbol": "512680.SH",
+                },
+                "channel_policy": {
+                    "research_only": True,
+                    "allow_shell_tools": False,
+                    "allow_trading_tools": False,
+                },
+            }
+        )
+        or []
+    )
+
+    assert {"portfolio_state", "get_data_context", "web_search", "read_url"} <= allowed
+    assert not {"write_file", "run_swarm", "trading_place_order"} & allowed

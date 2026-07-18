@@ -33,6 +33,33 @@ def test_portfolio_review_get_returns_empty_state(tmp_path, monkeypatch) -> None
     assert payload["verified_market_cache"] == []
 
 
+def test_portfolio_review_excludes_historical_non_holding_cache(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    captured_symbols: list[list[str] | None] = []
+
+    def fake_cache(limit=50, *, symbols=None):
+        captured_symbols.append(symbols)
+        return (
+            "C:/market_cache.sqlite3",
+            [
+                {"symbol": "588870.SH", "path": "holding", "status": "verified"},
+                {"symbol": "000905.SH", "path": "historical", "status": "verified"},
+            ],
+        )
+
+    monkeypatch.setattr(api_server, "_load_verified_market_cache", fake_cache)
+    saved = client.post(
+        "/portfolio/holdings",
+        json={"raw_text": "科创50指 588870 2100 1.975"},
+    )
+
+    assert saved.status_code == 200
+    assert captured_symbols[-1] == ["588870.SH"]
+    assert [row["symbol"] for row in saved.json()["verified_market_cache"]] == [
+        "588870.SH"
+    ]
+
+
 def test_update_portfolio_holdings_parses_and_normalizes_symbols(tmp_path, monkeypatch) -> None:
     client = _client(tmp_path, monkeypatch)
 
@@ -203,6 +230,104 @@ def test_lookup_portfolio_security_returns_exact_network_match(tmp_path, monkeyp
         "market": "cn",
         "source": "eastmoney",
     }
+
+
+def test_lookup_portfolio_security_resolves_us_ticker(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    from src.tools import symbol_search_tool
+
+    monkeypatch.setattr(
+        symbol_search_tool,
+        "lookup_exact_security",
+        lambda code: ({"symbol": "AAPL.US", "name": "Apple Inc.", "market": "us", "source": "yahoo"}, "ok"),
+    )
+
+    response = client.get("/portfolio/security-lookup?code=AAPL")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "code": "AAPL",
+        "symbol": "AAPL.US",
+        "name": "Apple Inc.",
+        "market": "us",
+        "source": "yahoo",
+    }
+
+
+def test_lookup_portfolio_security_preserves_qualified_exchange(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    from src.tools import symbol_search_tool
+
+    monkeypatch.setattr(
+        symbol_search_tool,
+        "lookup_exact_security",
+        lambda code: (
+            {
+                "symbol": "000905.SH",
+                "name": "中证500",
+                "market": "cn",
+                "source": "eastmoney",
+            },
+            "ok",
+        ),
+    )
+
+    response = client.get("/portfolio/security-lookup?code=000905.SH")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "code": "000905",
+        "symbol": "000905.SH",
+        "name": "中证500",
+        "market": "cn",
+        "source": "eastmoney",
+    }
+
+
+def test_lookup_portfolio_security_accepts_qualified_us_symbol(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    from src.tools import symbol_search_tool
+
+    monkeypatch.setattr(
+        symbol_search_tool,
+        "lookup_exact_security",
+        lambda code: (
+            {
+                "symbol": "AAPL.US",
+                "name": "Apple Inc.",
+                "market": "us",
+                "source": "yahoo",
+            },
+            "ok",
+        ),
+    )
+
+    response = client.get("/portfolio/security-lookup?code=AAPL.US")
+
+    assert response.status_code == 200
+    assert response.json()["symbol"] == "AAPL.US"
+    assert response.json()["name"] == "Apple Inc."
+
+
+def test_record_portfolio_trade_accepts_us_equity(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+
+    response = client.post(
+        "/portfolio/trades",
+        json={
+            "code": "AAPL",
+            "symbol": "AAPL.US",
+            "name": "Apple Inc.",
+            "side": "buy",
+            "quantity": 2,
+            "price": 210.5,
+        },
+    )
+
+    assert response.status_code == 200
+    holding = response.json()["portfolio_state"]["holdings"][0]
+    assert holding["code"] == "AAPL"
+    assert holding["symbol"] == "AAPL.US"
 
 
 def test_edit_portfolio_holding_updates_quantity_cost_and_derived_values(tmp_path, monkeypatch) -> None:

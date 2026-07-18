@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -9,7 +10,13 @@ from src.portfolio.daily.reporting import (
     render_holding_markdown,
     render_master_markdown,
 )
-from src.portfolio.daily.service import DailyPortfolioRunService, _data_status
+from src.portfolio.daily.contracts import parse_holding_brief
+from src.portfolio.daily.service import (
+    DailyPortfolioRunService,
+    _compact_worker_context,
+    _data_status,
+    _symbol_decision_scopes,
+)
 from src.portfolio.daily.store import DailyRunStore
 from src.portfolio.mandate import default_mandate, save_mandate
 from src.portfolio.state import PortfolioState
@@ -115,6 +122,114 @@ def test_data_status_is_partial_when_only_some_domains_or_symbols_are_limited() 
     ) == "limited"
 
 
+def test_premarket_intraday_gap_does_not_mask_verified_daily_trend() -> None:
+    contexts = [
+        {
+            "decision_scopes": {
+                "588870.SH": {
+                    "daily_trend": {
+                        "status": "verified",
+                        "actionability": "price_actionable",
+                        "as_of": "2026-07-15 15:00",
+                    },
+                    "intraday": {
+                        "status": "not_started",
+                        "actionability": "analysis_only",
+                        "reason": "intraday_not_started",
+                    },
+                    "condition_order": {
+                        "status": "verified",
+                        "actionability": "price_actionable",
+                        "basis": "daily",
+                    },
+                }
+            }
+        }
+    ]
+
+    scopes = _symbol_decision_scopes(contexts, "588870.SH")
+
+    assert scopes["daily_trend"]["status"] == "verified"
+    assert scopes["intraday"]["status"] == "not_started"
+    assert scopes["condition_order"]["basis"] == "daily"
+
+
+def test_compact_worker_context_is_valid_json_without_mid_string_truncation() -> None:
+    huge_documents = [
+        {
+            "title": f"news-{index}",
+            "summary": "长摘要" * 3000,
+            "data": {"payload": "大字段" * 3000},
+        }
+        for index in range(20)
+    ]
+    contexts = [
+        {
+            "request_id": "ctx-1",
+            "status": "partial",
+            "symbols": ["588870.SH"],
+            "decision_scopes": {
+                "588870.SH": {
+                    "daily_trend": {"status": "verified", "actionability": "price_actionable"}
+                }
+            },
+            "market": {
+                "status": "live",
+                "series": [
+                    {
+                        "symbol": "588870.SH",
+                        "interval": "1D",
+                        "actionability": "price_actionable",
+                        "bars": [{"bar_time": f"2026-01-{index:02d}", "close": index} for index in range(1, 100)],
+                    }
+                ],
+                "quotes": [{"symbol": "588870.SH", "last_price": 1.93}],
+            },
+            "research": {
+                "news": {
+                    "status": "partial",
+                    "items": {"588870.SH": {"mode": "live", "documents": huge_documents}},
+                }
+            },
+        }
+    ]
+
+    payload = _compact_worker_context(contexts, "588870.SH")
+    encoded = json.dumps(payload, ensure_ascii=False)
+
+    assert json.loads(encoded)["symbol"] == "588870.SH"
+    assert len(encoded) <= 28_000
+    assert encoded.endswith("}")
+
+
+def test_limited_brief_clears_incompatible_exact_condition_orders() -> None:
+    brief = parse_holding_brief(
+        json.dumps(
+            {
+                "summary": "盘中数据尚未校核。",
+                "action": "add",
+                "confidence": "medium",
+                "suggested_amount": 1000,
+                "reasons": ["日线可见"],
+                "risks": ["盘中数据缺失"],
+                "watch_points": ["等待开盘"],
+                "condition_order_status": "data_insufficient",
+                "condition_orders": [
+                    {"trigger": "1.90", "response": "加仓", "priority": "high"}
+                ],
+                "data_limited": True,
+            },
+            ensure_ascii=False,
+        ),
+        symbol="588870.SH",
+    )
+
+    assert brief["action"] == "observe"
+    assert brief["suggested_amount"] is None
+    assert brief["condition_order_status"] == "data_insufficient"
+    assert brief["condition_orders"] == []
+
+
 def portfolio() -> PortfolioState:
     return PortfolioState(
         holdings=[
@@ -174,6 +289,23 @@ def test_daily_run_is_idempotent_and_produces_master_plus_holding_pdfs(tmp_path:
     assert len([a for a in completed["artifacts"] if a["kind"] == "master_pdf"]) == 1
     assert len([a for a in completed["artifacts"] if a["kind"] == "holding_daily_pdf"]) == 2
     assert all(Path(item["path"]).exists() for item in completed["artifacts"])
+    master_pdf = next(a for a in completed["artifacts"] if a["kind"] == "master_pdf")
+    assert master_pdf["filename"] == "2026-07-13_组合晨会综合报告.pdf"
+    holding_pdfs = {
+        item["symbol"]: item
+        for item in completed["artifacts"]
+        if item["kind"] == "holding_daily_pdf"
+    }
+    assert holding_pdfs["600036.SH"]["filename"] == (
+        "2026-07-13_600036.SH_招商银行_个股晨报.pdf"
+    )
+    assert holding_pdfs["600036.SH"]["security_name"] == "招商银行"
+    assert holding_pdfs["688981.SH"]["filename"] == (
+        "2026-07-13_688981.SH_中芯国际_个股晨报.pdf"
+    )
+    assert "2026-07-13 招商银行（600036.SH）个股晨报" in Path(
+        holding_pdfs["600036.SH"]["path"]
+    ).read_bytes().decode("utf-8")
     artifact_manifest = service.store.read_json(completed["run_id"], "artifact_manifest.json")
     assert all("path" not in item and item.get("relative_path") for item in artifact_manifest["artifacts"])
     brief = service.store.read_json(completed["run_id"], "outputs/holdings/600036.SH/brief.json")
