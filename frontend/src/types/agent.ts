@@ -56,6 +56,31 @@ export interface AgentMessage {
   stage?: string;
   /** Shadow Account id if render_shadow_report fired in this turn (RunCompleteCard renders a "View Shadow Report" button). */
   shadowId?: string;
+  /** Persisted equity Deep Report attached to this answer. */
+  reportId?: string;
+  reportQualityStatus?: "passed" | "passed_with_gaps" | "failed_validation";
+  reportSymbol?: string;
+  reportSecurityName?: string;
+  reportDataAsOf?: string;
+  reportMissingModules?: string[];
+  /** True only when the persisted report manifest exposes an available PDF artifact. */
+  reportPdfAvailable?: boolean;
+  reportGenerationSource?: "manual" | "portfolio_monitor_autopilot" | string;
+  reportGenerationReason?: string;
+  reportRevision?: number;
+  reportParentId?: string;
+  reportRevisionMode?: "initial" | "full_refresh" | "section_revision" | "repair" | string;
+  reportDeliveryKind?: "report" | "diagnostic";
+  reportMarkdownAvailable?: boolean;
+  reportDiagnosticAvailable?: boolean;
+  reportDiffAvailable?: boolean;
+}
+
+export interface ReportPreviewTarget {
+  runId?: string;
+  reportId?: string;
+  title?: string;
+  artifactId?: "markdown" | "diagnostic" | "diff";
 }
 
 /** Tool call tracking entry */

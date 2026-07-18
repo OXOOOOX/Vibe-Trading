@@ -1,8 +1,9 @@
 import { useRef, type JSX } from "react";
+import { useTranslation } from "react-i18next";
 import { Loader2, CheckCircle2, XCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ProgressBar } from "@/components/chat/ProgressBar";
-import { localizeToolName } from "@/lib/tools";
+import { localizeToolName, localizeToolProgressMessage, localizeToolStage } from "@/lib/tools";
 import type { ToolCallEntry } from "@/types/agent";
 
 /* ---------- ETA tracking (per-tool) ---------- */
@@ -58,13 +59,12 @@ function ProgressRing({ current, total }: RingProps): JSX.Element {
 interface RowProps {
   entry: ToolCallEntry;
   stepIndex: number;
-  totalSteps: number;
-  isHeader?: boolean;
   connector?: "branch" | "end" | "none";
   eta: number | null;
 }
 
-function ToolRow({ entry, stepIndex, totalSteps, isHeader, connector = "none", eta }: RowProps): JSX.Element {
+function ToolRow({ entry, stepIndex, connector = "none", eta }: RowProps): JSX.Element {
+  const { t } = useTranslation();
   const progress = entry.progress;
   const hasDeterminate = !!(progress && typeof progress.current === "number" && typeof progress.total === "number" && progress.total > 0);
   const stage = progress?.stage || "";
@@ -79,32 +79,40 @@ function ToolRow({ entry, stepIndex, totalSteps, isHeader, connector = "none", e
         : <Loader2 className="h-3 w-3 animate-spin text-primary shrink-0" />;
 
   const localized = localizeToolName(entry.tool);
-  const stepLabel = isHeader
-    ? `${totalSteps} tools running`
-    : `Step ${stepIndex} · ${localized}`;
+  const sequenceLabel = t("thinking.toolSequence", { index: stepIndex });
+  const stageLabel = localizeToolStage(stage);
+  const messageLabel = localizeToolProgressMessage(message, entry.tool);
 
   return (
-    <div className="flex flex-col sm:flex-row sm:items-center gap-x-2 gap-y-0.5 text-xs min-w-0">
+    <div className="grid min-w-0 gap-y-1 text-xs">
       {/* Primary row */}
-      <div className="flex items-center gap-2 min-w-0 sm:flex-none">
+      <div className="flex min-w-0 items-center gap-2">
         {connector !== "none" && (
           <span className="text-border/60 shrink-0 w-3 text-center" aria-hidden="true">
             {connector === "branch" ? "├" : "└"}
           </span>
         )}
         {icon}
-        <span className="text-foreground truncate">{stepLabel}</span>
+        <span className="min-w-0 flex-1 truncate text-foreground">
+          <span className="font-medium">{sequenceLabel}</span>
+          <span className="text-muted-foreground"> · {localized}</span>
+        </span>
         {entry.elapsed_s != null && (
-          <span className="ml-auto sm:ml-0 tabular-nums text-[10px] text-muted-foreground/70 shrink-0">
+          <span className="shrink-0 tabular-nums text-[10px] text-muted-foreground/70">
             {entry.elapsed_s.toFixed(0)}s
           </span>
         )}
       </div>
-      {/* Secondary row: stage + progress bar (+ ETA) */}
+      {/* Phase progress always owns a separate row from the tool sequence. */}
       {(progress && (hasDeterminate || stage)) && (
-        <div className="flex items-center gap-2 min-w-0 sm:flex-1">
+        <div className="flex min-w-0 flex-wrap items-center gap-2 pl-5 sm:pl-7">
           {stage && (
-            <span className="text-foreground text-xs shrink-0 truncate max-w-[40%]">{stage}</span>
+            <span
+              className="max-w-full shrink-0 truncate rounded bg-muted/60 px-1.5 py-0.5 text-[10px] text-muted-foreground sm:max-w-[45%]"
+              title={stage}
+            >
+              {t("thinking.phaseLabel")}: {stageLabel}
+            </span>
           )}
           {hasDeterminate && (
             <ProgressBar
@@ -112,21 +120,24 @@ function ToolRow({ entry, stepIndex, totalSteps, isHeader, connector = "none", e
               total={progress!.total!}
               height="xs"
               showCount
-              ariaLabel={stage || localized}
-              className="text-muted-foreground"
+              ariaLabel={t("thinking.phaseProgress", { phase: stageLabel || localized })}
+              className="min-w-[8rem] basis-[10rem] flex-1 text-muted-foreground"
             />
           )}
           {eta != null && (
             <span className="text-[10px] text-muted-foreground/70 tabular-nums shrink-0">
-              ~{eta}s left
+              {t("thinking.remainingSeconds", { count: eta })}
             </span>
           )}
         </div>
       )}
-      {/* Tertiary row: message */}
-      {message && (
-        <div className="text-[10px] text-muted-foreground/60 truncate min-w-0 sm:basis-full">
-          {message}
+      {/* Detail is deliberately separate so it cannot compete with counts. */}
+      {messageLabel && (
+        <div
+          className="line-clamp-2 min-w-0 break-words pl-5 text-[11px] leading-4 text-muted-foreground/70 sm:pl-7"
+          title={messageLabel}
+        >
+          {messageLabel}
         </div>
       )}
     </div>
@@ -135,18 +146,17 @@ function ToolRow({ entry, stepIndex, totalSteps, isHeader, connector = "none", e
 
 /* ---------- Public component ---------- */
 interface Props {
-  /** Full toolCalls slice from the store. The component filters running ones internally. */
+  /** Full toolCalls slice for the active turn. Keep every call visible until the turn ends. */
   toolCalls: ToolCallEntry[];
 }
 
-const MAX_VISIBLE = 3;
-
 export function ToolProgressIndicator({ toolCalls }: Props): JSX.Element | null {
+  const { t } = useTranslation();
   // Per-tool ETA samples (mutable across renders, not state to avoid re-renders).
   const etaSamplesRef = useRef<Map<string, EtaSample>>(new Map());
 
   const running = toolCalls.filter((tc) => tc.status === "running");
-  if (running.length === 0) return null;
+  if (toolCalls.length === 0) return null;
 
   const totalSoFar = toolCalls.length;
 
@@ -157,22 +167,27 @@ export function ToolProgressIndicator({ toolCalls }: Props): JSX.Element | null 
     if (p.total <= 0) return null;
     const stage = p.stage || "";
     const samples = etaSamplesRef.current;
-    const prev = samples.get(tc.tool);
+    const prev = samples.get(tc.id);
+
+    // A stage transition legitimately resets current/total; start a fresh ETA sample.
+    if (!prev || prev.stage !== stage) {
+      samples.set(tc.id, { stage, current: p.current, suppressed: false });
+      return null;
+    }
 
     // Out-of-order: current decreased → suppress for the rest of the run.
-    if (prev && p.current < prev.current) {
-      samples.set(tc.tool, { stage, current: p.current, suppressed: true });
+    if (p.current < prev.current) {
+      samples.set(tc.id, { stage, current: p.current, suppressed: true });
       return null;
     }
-    if (prev?.suppressed && prev.stage === stage) {
+    if (prev.suppressed) {
       // Update tracking but keep suppressed.
-      samples.set(tc.tool, { stage, current: p.current, suppressed: true });
+      samples.set(tc.id, { stage, current: p.current, suppressed: true });
       return null;
     }
-    samples.set(tc.tool, { stage, current: p.current, suppressed: false });
+    samples.set(tc.id, { stage, current: p.current, suppressed: false });
 
     // Need a stable stage and enough samples to extrapolate.
-    if (!prev || prev.stage !== stage) return null;
     if (p.current < 3) return null;
     if (p.current < p.total * 0.1) return null;
     if (tc.elapsed_s == null || tc.elapsed_s <= 0) return null;
@@ -190,16 +205,13 @@ export function ToolProgressIndicator({ toolCalls }: Props): JSX.Element | null 
   const anyError = toolCalls.some((tc) => tc.status === "error");
   const aggregateIcon = anyError
     ? <XCircle className="h-3 w-3 text-danger shrink-0" />
-    : <Loader2 className="h-3 w-3 animate-spin text-primary shrink-0" />;
-
-  // Display rule: ≤3 running → show all; >3 → first 2 + "… +N more".
-  const showAll = running.length <= MAX_VISIBLE;
-  const rows = showAll ? running : running.slice(0, 2);
-  const overflow = showAll ? 0 : running.length - rows.length;
+    : running.length > 0
+      ? <Loader2 className="h-3 w-3 animate-spin text-primary shrink-0" />
+      : <CheckCircle2 className="h-3 w-3 text-success shrink-0" />;
 
   /* ---------- render ---------- */
-  if (running.length === 1) {
-    const only = running[0];
+  if (toolCalls.length === 1) {
+    const only = toolCalls[0];
     const eta = computeEta(only);
     return (
       <div
@@ -211,14 +223,13 @@ export function ToolProgressIndicator({ toolCalls }: Props): JSX.Element | null 
         <ToolRow
           entry={only}
           stepIndex={totalSoFar}
-          totalSteps={running.length}
           eta={eta}
         />
       </div>
     );
   }
 
-  // 2+ running — header + indented rows.
+  // Multiple calls in the active turn: header + persistent indented rows.
   return (
     <div
       role="status"
@@ -229,26 +240,23 @@ export function ToolProgressIndicator({ toolCalls }: Props): JSX.Element | null 
       {/* Header row */}
       <div className="flex items-center gap-2 text-xs text-muted-foreground">
         {aggregateIcon}
-        <span className="text-foreground">{running.length} tools running</span>
+        <span className="text-foreground">
+          {running.length > 0
+            ? t("thinking.toolsRunning", { count: running.length })
+            : t("thinking.toolCalls", { count: toolCalls.length })}
+        </span>
       </div>
       {/* Indented rows */}
       <div className="pl-4 space-y-1">
-        {rows.map((tc, i) => (
+        {toolCalls.map((tc, i) => (
           <ToolRow
             key={tc.id}
             entry={tc}
-            stepIndex={toolCalls.indexOf(tc) + 1}
-            totalSteps={running.length}
-            connector={i === rows.length - 1 && overflow === 0 ? "end" : "branch"}
+            stepIndex={i + 1}
+            connector={i === toolCalls.length - 1 ? "end" : "branch"}
             eta={computeEta(tc)}
           />
         ))}
-        {overflow > 0 && (
-          <div className="flex items-center gap-2 text-[10px] text-muted-foreground/60">
-            <span className="text-border/60 shrink-0 w-3 text-center" aria-hidden="true">└</span>
-            <span>… +{overflow} more</span>
-          </div>
-        )}
       </div>
     </div>
   );

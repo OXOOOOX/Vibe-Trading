@@ -1,11 +1,16 @@
-import { localizeToolName, TOOL_LABELS } from "../tools";
+import {
+  localizeToolName,
+  localizeToolProgressMessage,
+  localizeToolStage,
+  TOOL_LABELS,
+} from "../tools";
 
 describe("TOOL_LABELS", () => {
   it("maps known tool names to user-facing labels", () => {
-    expect(TOOL_LABELS["run_backtest"]).toBe("Run backtest");
-    expect(TOOL_LABELS["write_file"]).toBe("Generate code");
-    expect(TOOL_LABELS["bash"]).toBe("Run command");
-    expect(TOOL_LABELS["compact"]).toBe("Summarize conversation");
+    expect(TOOL_LABELS["run_backtest"]).toBe("运行策略回测");
+    expect(TOOL_LABELS["web_search"]).toBe("检索公开资料");
+    expect(TOOL_LABELS["report_workspace"]).toBe("整理报告章节");
+    expect(TOOL_LABELS["compact"]).toBe("整理对话上下文");
   });
 
   it("contains all trading connector tools", () => {
@@ -16,18 +21,27 @@ describe("TOOL_LABELS", () => {
 
 describe("localizeToolName", () => {
   it("returns label for known tools", () => {
-    expect(localizeToolName("run_backtest")).toBe("Run backtest");
+    expect(localizeToolName("run_backtest")).toBe("运行策略回测");
   });
 
   it("returns fallback for unknown tools when fallback provided", () => {
     expect(localizeToolName("unknown_tool", "My Fallback")).toBe("My Fallback");
   });
 
-  it("returns raw tool name for unknown tools with no fallback", () => {
-    expect(localizeToolName("some_new_tool")).toBe("some_new_tool");
+  it("does not expose raw names for unknown tools", () => {
+    expect(localizeToolName("some_new_tool")).toBe("执行研究步骤");
   });
 
   it("prefers TOOL_LABELS over fallback", () => {
-    expect(localizeToolName("bash", "ignored")).toBe("Run command");
+    expect(localizeToolName("bash", "ignored")).toBe("执行数据处理");
+  });
+});
+
+describe("user-facing progress language", () => {
+  it("translates internal stages and hides raw request URLs", () => {
+    expect(localizeToolStage("fetching")).toBe("获取资料");
+    expect(localizeToolStage("financial_data")).toBe("处理中");
+    expect(localizeToolProgressMessage("GET http://example.test/report", "read_url"))
+      .toBe("正在读取所需资料");
   });
 });

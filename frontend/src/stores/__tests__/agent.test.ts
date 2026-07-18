@@ -106,6 +106,14 @@ describe("tool calls", () => {
     expect(useAgentStore.getState().toolCalls[0].tool).toBe("run_backtest");
   });
 
+  it("addToolCall replays update the same invocation instead of duplicating it", () => {
+    useAgentStore.getState().addToolCall(makeToolCall({ id: "call-1", elapsed_s: 1 }));
+    useAgentStore.getState().addToolCall(makeToolCall({ id: "call-1", elapsed_s: 2 }));
+
+    expect(useAgentStore.getState().toolCalls).toHaveLength(1);
+    expect(useAgentStore.getState().toolCalls[0].elapsed_s).toBe(2);
+  });
+
   it("updateToolCall patches matching entry", () => {
     const tc = makeToolCall({ id: "tc-1", status: "running" });
     useAgentStore.getState().addToolCall(tc);

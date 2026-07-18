@@ -4,11 +4,13 @@ import { Settings } from "../Settings";
 const apiMock = vi.hoisted(() => ({
   getLLMSettings: vi.fn(),
   getDataSourceSettings: vi.fn(),
+  getResearchSettings: vi.fn(),
   getChannelStatus: vi.fn(),
   startChannels: vi.fn(),
   stopChannels: vi.fn(),
   updateLLMSettings: vi.fn(),
   updateDataSourceSettings: vi.fn(),
+  updateResearchSettings: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async () => {
@@ -64,6 +66,18 @@ function dataSourceSettings() {
   };
 }
 
+function researchSettings(enabled = true, auto = false) {
+  return {
+    deep_report_enabled: enabled,
+    equity_deep_research_enabled: enabled,
+    monitor_auto_deep_report_enabled: auto,
+    effective_monitor_auto_deep_report_enabled: enabled && auto,
+    enabled_profiles: ["equity_deep_research"],
+    available_profiles: ["equity_deep_research"],
+    env_path: "agent/.env",
+  };
+}
+
 function channelStatus(overrides = {}) {
   return {
     running: false,
@@ -102,9 +116,11 @@ describe("Settings IM channels panel", () => {
   beforeEach(() => {
     apiMock.getLLMSettings.mockResolvedValue(llmSettings());
     apiMock.getDataSourceSettings.mockResolvedValue(dataSourceSettings());
+    apiMock.getResearchSettings.mockResolvedValue(researchSettings());
     apiMock.getChannelStatus.mockResolvedValue(channelStatus());
     apiMock.startChannels.mockResolvedValue(channelStatus({ running: true }));
     apiMock.stopChannels.mockResolvedValue(channelStatus());
+    apiMock.updateResearchSettings.mockResolvedValue(researchSettings(false));
   });
 
   it("renders channel runtime status and refreshes it", async () => {
@@ -138,5 +154,39 @@ describe("Settings IM channels panel", () => {
     expect(screen.getByText("channel runtime unavailable")).toBeInTheDocument();
     expect(screen.getByText("Connection")).toBeInTheDocument();
     expect(screen.queryByText("Settings are unavailable")).not.toBeInTheDocument();
+  });
+
+  it("persists the Deep Report feature switch from the research settings card", async () => {
+    render(<Settings />);
+
+    const toggle = await screen.findByRole("switch", { name: "启用穿透式单股深度研究" });
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(apiMock.updateResearchSettings).toHaveBeenCalledWith({ deep_report_enabled: false });
+      expect(toggle).toHaveAttribute("aria-checked", "false");
+    });
+  });
+
+  it("persists explicit consent for autonomous monitoring to generate Deep Reports", async () => {
+    apiMock.updateResearchSettings.mockResolvedValueOnce(researchSettings(true, true));
+    render(<Settings />);
+
+    const toggle = await screen.findByRole("switch", {
+      name: "允许 AI 自主监控自动生成穿透式报告",
+    });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(apiMock.updateResearchSettings).toHaveBeenCalledWith({
+        monitor_auto_deep_report_enabled: true,
+      });
+      expect(toggle).toHaveAttribute("aria-checked", "true");
+    });
+    expect(screen.getByText("已授权")).toBeInTheDocument();
   });
 });

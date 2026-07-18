@@ -19,10 +19,6 @@ export const ThinkingTimeline = memo(function ThinkingTimeline({ messages, isLat
     return localizeToolName(tool);
   };
 
-  useEffect(() => {
-    if (!isLatest) setExpanded(false);
-  }, [isLatest]);
-
   const { steps, hasError, isRunning, totalMs, latestTool, latestThinking } = useMemo(() => {
     let totalMs = 0;
     let latestTool = "";
@@ -56,6 +52,13 @@ export const ThinkingTimeline = memo(function ThinkingTimeline({ messages, isLat
     };
   }, [messages]);
 
+  useEffect(() => {
+    if (isRunning) setExpanded(true);
+    else if (!isLatest) setExpanded(false);
+  }, [isLatest, isRunning]);
+
+  const visibleExpanded = isRunning || expanded;
+
   const stepCount = steps.length;
   const summaryText = isRunning
     ? `${t('thinking.running')} ${toolLabel(latestTool)}...`
@@ -65,10 +68,12 @@ export const ThinkingTimeline = memo(function ThinkingTimeline({ messages, isLat
     <div className="rounded-lg border border-border/40 bg-muted/5 overflow-hidden">
       {/* Summary bar */}
       <button
-        onClick={() => setExpanded(!expanded)}
+        onClick={() => { if (!isRunning) setExpanded(!expanded); }}
+        aria-expanded={visibleExpanded}
+        aria-disabled={isRunning}
         className="w-full flex items-center gap-2 px-3 py-2 text-xs hover:bg-muted/10 transition-colors"
       >
-        {expanded
+        {visibleExpanded
           ? <ChevronDown className="h-3 w-3 text-muted-foreground shrink-0" />
           : <ChevronRight className="h-3 w-3 text-muted-foreground shrink-0" />}
         {isRunning ? (
@@ -84,7 +89,7 @@ export const ThinkingTimeline = memo(function ThinkingTimeline({ messages, isLat
       </button>
 
       {/* Thinking preview when running but collapsed */}
-      {!expanded && isRunning && latestThinking && (
+      {!visibleExpanded && isRunning && latestThinking && (
         <div className="px-3 pb-2 -mt-1">
           <p className="text-[11px] text-muted-foreground/40 line-clamp-1 pl-5 italic">
             {latestThinking.slice(-100)}
@@ -93,7 +98,7 @@ export const ThinkingTimeline = memo(function ThinkingTimeline({ messages, isLat
       )}
 
       {/* Expanded step list */}
-      {expanded && steps.length > 0 && (
+      {visibleExpanded && steps.length > 0 && (
         <div className="border-t border-border/30 px-3 py-1.5 space-y-0.5">
           {steps.map((step, i) => (
             <div key={`${step.tool}-${i}`} className="flex items-center gap-2 py-1 text-xs">
@@ -131,7 +136,7 @@ export const ThinkingTimeline = memo(function ThinkingTimeline({ messages, isLat
       )}
 
       {/* Expanded: show thinking content if any (for Q&A without tools) */}
-      {expanded && steps.length === 0 && latestThinking && (
+      {visibleExpanded && steps.length === 0 && latestThinking && (
         <div className="border-t border-border/30 px-3 py-2">
           <p className="text-xs text-muted-foreground/50 leading-relaxed line-clamp-4">
             {latestThinking}

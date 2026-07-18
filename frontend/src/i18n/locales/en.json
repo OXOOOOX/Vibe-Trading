@@ -116,6 +116,133 @@
     "subtitle": "vibe trading with your professional financial agent team",
     "describePrompt": "Describe a trading strategy to get started.",
     "tryExample": "Try an example:",
+    "quickStart": {
+      "title": "Start with a common research flow",
+      "subtitle": "Open a Session around your real portfolio, one security, or a durable research task.",
+      "hoverHint": "Hover or focus for details",
+      "actions": {
+        "portfolioAnalysis": {
+          "title": "Portfolio health check",
+          "description": "Read real holdings and cash, then assess returns, concentration, and risk.",
+          "eyebrow": "Real holdings · Fresh quotes · Prioritized actions",
+          "detail1": "Use the portfolio ledger as truth and refresh decision-critical quotes first",
+          "detail2": "Break down P&L, position concentration, sector exposure, and style exposure",
+          "detail3": "Combine catalysts, news, and risk into a prioritized action list",
+          "footer": "Research only: it will not place orders or change holdings. Price-sensitive conclusions stop when the data is too weak.",
+          "cta": "Run the analysis",
+          "prompt": "Analyze my current real portfolio and cash. Use portfolio_state as the source of truth, refresh decision-critical market data first, then assess performance, concentration, sector and style exposure, catalysts, and risks. Give prioritized actions, but do not place orders or modify holdings."
+        },
+        "stockAnalysis": {
+          "title": "Quick stock analysis",
+          "description": "Add a company name or ticker to review trend, news, valuation, and risk.",
+          "eyebrow": "Identity check · Latest data · Scenario view",
+          "detail1": "Resolve the exact security first to avoid market or naming ambiguity",
+          "detail2": "Cover recent trend, news catalysts, fundamentals, and valuation context",
+          "detail3": "Show upside, base, and risk scenarios without widening to other holdings",
+          "footer": "This inserts a guided prompt into the composer so you can add the company name or ticker before sending.",
+          "cta": "Add a stock or ticker",
+          "prompt": "Analyze [company name or ticker]. First resolve the exact security and verify the latest available data, then cover price trend, news and catalysts, fundamentals, valuation, key risks, and scenarios. Do not widen this into my other holdings."
+        },
+        "deepReport": {
+          "title": "Equity deep research",
+          "description": "Create a standardized single-stock report with evidence and deterministic calculations.",
+          "eyebrow": "Listed company · Evidence chain · PDF report",
+          "detail1": "Read through all three financial statements and flag financial-quality checks",
+          "detail2": "Use deterministic calculations to test implied valuation and operating scenarios",
+          "detail3": "Preserve an Evidence → Fact → Claim chain and produce a reusable report",
+          "footer": "Best for reviewable listed-company research. Modules with insufficient evidence are explicitly downgraded.",
+          "cta": "Enter deep research mode"
+        },
+        "marketReview": {
+          "title": "Pre / post-market review",
+          "description": "Combine holdings, overnight markets, and news into the next-session watch list.",
+          "eyebrow": "Holdings-aware · Overnight markets · Event calendar",
+          "detail1": "Filter for changes directly relevant to current holdings and watch themes",
+          "detail2": "Summarize overnight US, macro, sector, and company-news impact",
+          "detail3": "Rank watch items, triggers, and risks to avoid in the next session",
+          "footer": "Uses Beijing time and the latest trading day by default, with timestamps and source limits called out.",
+          "cta": "Create this review",
+          "prompt": "Create a pre-market or post-market review for my real portfolio. Identify the latest trading day in Beijing time, refresh key quotes first, then combine overnight US markets, macro, sector, and company news. Include only changes directly relevant to my holdings, and rank next-session watch items, triggers, and key risks. Do not place orders."
+        },
+        "allocationPlan": {
+          "title": "Portfolio allocation plan",
+          "description": "Compare add, rebalance, and wait options under cash, horizon, and risk constraints.",
+          "eyebrow": "Cash constraint · Holding horizon · Plan comparison",
+          "detail1": "Read existing positions so suggestions reflect the real concentration profile",
+          "detail2": "Set constraints from available cash, holding horizon, and drawdown tolerance",
+          "detail3": "Compare staged deployment, one-time deployment, and keeping cash",
+          "footer": "Produces research scenarios, allocation ranges, and triggers; it does not execute trades.",
+          "cta": "Discuss allocation",
+          "prompt": "Build a portfolio allocation plan from my real holdings and cash. Read current positions first, then ask for or confirm deployable cash, holding horizon, and maximum acceptable drawdown. Compare staged deployment, one-time deployment, and keeping cash, with allocation ranges, triggers, and risks. Do not execute trades."
+        },
+        "researchGoal": {
+          "title": "Create a research goal",
+          "description": "Pin an open question as a multi-turn goal with criteria and an evidence ledger.",
+          "eyebrow": "Multi-turn progress · Criteria · Evidence ledger",
+          "detail1": "Turn an open question into concrete, reviewable completion criteria",
+          "detail2": "Keep every later turn on the same goal state and prioritize missing evidence",
+          "detail3": "Track contradictions, caveats, evidence counts, and the completion audit",
+          "footer": "Best for research that cannot be completed in one answer and needs to converge over time.",
+          "cta": "Enter research goal mode"
+        }
+      }
+    },
+    "exampleHints": {
+      "subtitle": "These presets run immediately; hover or focus first to review the method, output, and boundaries.",
+      "hoverHint": "Hover or focus for details",
+      "cta": "Run this example",
+      "categories": {
+        "multiMarketBacktest": {
+          "eyebrow": "Cross-market data · Strategy rules · Benchmark comparison",
+          "detail1": "Lock securities, date range, frequency, and rebalancing rules to keep the setup consistent",
+          "detail2": "Show return, drawdown, volatility, Sharpe, and differences versus the benchmark",
+          "detail3": "State data sources, transaction costs, slippage, and sample limitations",
+          "footer": "Backtests study historical scenarios; they do not guarantee future returns or connect to live order placement."
+        },
+        "researchAnalysis": {
+          "eyebrow": "Model assumptions · Metric breakdown · Sensitivity checks",
+          "detail1": "Expose factors, pricing formulas, and input parameters instead of hiding key assumptions",
+          "detail2": "Break down signal contribution, risk exposure, and sensitivity to parameter changes",
+          "detail3": "Separate model output, verifiable facts, and judgments that still need evidence",
+          "footer": "Best for model and derivatives scenarios; model output is not a guaranteed return."
+        },
+        "swarmTeams": {
+          "eyebrow": "Specialist roles · Parallel research · Unified review",
+          "detail1": "Assign research, risk, quant, and portfolio-manager roles to match the task",
+          "detail2": "Run independent steps in parallel while preserving dependencies between stages",
+          "detail3": "Use a synthesis role to reconcile disagreement, evidence gaps, and the final conclusion",
+          "footer": "Best for complex work that needs cross-checks; it usually takes longer and uses more model calls than normal chat."
+        },
+        "docWebResearch": {
+          "eyebrow": "Document parsing · Live sources · Evidence citations",
+          "detail1": "Extract evidence directly relevant to the question from uploaded files or live pages",
+          "detail2": "Record source, publication time, and data cutoff so old and new information are not mixed",
+          "detail3": "Separate facts, summaries, and inference while calling out evidence gaps",
+          "footer": "PDF examples require an upload first; web research prioritizes verifiable sources and states freshness limits."
+        },
+        "tradeJournal": {
+          "eyebrow": "Trade records · Statistical profile · Behavior diagnosis",
+          "detail1": "Normalize executions, holdings, and P&L from supported broker exports",
+          "detail2": "Calculate win rate, payoff ratio, holding period, time-of-day, and symbol distribution",
+          "detail3": "Use numeric evidence to diagnose disposition, overtrading, chasing, and anchoring",
+          "footer": "Upload a journal first; the diagnosis supports behavioral review and is not a complete investment decision."
+        },
+        "tradingConnectors": {
+          "eyebrow": "Profile checks · Account reads · Read-only market data",
+          "detail1": "Confirm the selected connector and its authentication, account, and data status",
+          "detail2": "Read account summaries, positions, cash, quotes, and bars only when requested",
+          "detail3": "Return concrete missing setup when a connection fails instead of silently returning empty data",
+          "footer": "These examples stay read-only and never create, modify, or cancel orders."
+        },
+        "shadowAccount": {
+          "eyebrow": "Rule extraction · Shadow backtest · Delta attribution",
+          "detail1": "Extract reviewable entry, exit, and sizing rules from the trading journal",
+          "detail2": "Compare the shadow strategy and actual trading over the same period",
+          "detail3": "Attribute the gap to rule violations, early exits, missed signals, and other causes",
+          "footer": "A shadow account is a research and review model, not a live account, and it never executes trades."
+        }
+      }
+    },
     "categories": {
       "multiMarketBacktest": "Multi-Market Backtest",
       "researchAnalysis": "Research & Analysis",
@@ -248,6 +375,16 @@
     "running": "running",
     "newMessages": "New messages",
     "newResearchGoal": "New Research Goal",
+    "researchGoalHint": {
+      "title": "What is a research goal?",
+      "eyebrow": "Session goal · Multi-turn progress · Evidence ledger",
+      "description": "Pins an open-ended question to the current session as a persistent goal. The app creates completion criteria and starts the first research turn immediately; later turns keep reading the same goal state instead of treating it as a one-off question.",
+      "capability1": "Tracks the objective, completion criteria, and evidence count in an expandable progress panel",
+      "capability2": "Prioritizes uncovered criteria while recording contradictions, caveats, and risk boundaries",
+      "capability3": "Supports continue, edit, and cancel; completion requires an audit against the evidence ledger",
+      "footerLabel": "Best for: ",
+      "footer": "Open-ended work that needs several evidence-gathering turns and a durable record of progress."
+    },
     "goal": "Goal",
     "criteria": "Criteria",
     "evidence": "Evidence",
@@ -263,6 +400,16 @@
     "exportChat": "Export chat",
     "stopGeneration": "Stop generation",
     "runSwarmTeam": "Run swarm team",
+    "swarmTeamHint": {
+      "title": "What is a swarm team?",
+      "eyebrow": "30 team presets · DAG workflow · Unified synthesis",
+      "description": "Selects the closest preset from the task intent, then assigns work to specialist roles by dependency. Independent tasks can run in parallel before a synthesis role produces the final, consistent result.",
+      "capability1": "Includes 30 teams for equities, macro, quant, risk, funds, derivatives, and more",
+      "capability2": "Each role uses preset tools and methods while the run card shows layers, tools, and progress",
+      "capability3": "Passes upstream findings into downstream review or synthesis instead of relying on one viewpoint",
+      "footerLabel": "Keep in mind: ",
+      "footer": "Best for complex work needing cross-checks; it usually takes longer and uses more model calls than normal chat."
+    },
     "uploadFile": "Upload file",
     "uploadPdf": "Upload PDF document",
     "uploading": "Uploading...",
@@ -490,7 +637,14 @@
     "processing": "Processing",
     "running": "Running",
     "done": "Done",
-    "steps": "{{count}} steps"
+    "steps": "{{count}} steps",
+    "toolSequence": "Tool {{index}}",
+    "toolsRunning": "{{count}} tools running",
+    "toolCalls": "{{count}} tool calls",
+    "phaseLabel": "Phase",
+    "phaseProgress": "{{phase}} phase progress",
+    "remainingSeconds": "~{{count}}s left",
+    "moreTools": "… +{{count}} more"
   },
   "runnerStatus": {
     "connectorRuntime": "Connector runtime",

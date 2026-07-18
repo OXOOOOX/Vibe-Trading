@@ -189,6 +189,12 @@ export default function PortfolioDailyRunPanel(props: Props) {
     () => getAgentAllocationSuggestion(props.holdings, props.mandate?.assignments || {}),
     [props.holdings, props.mandate?.assignments],
   );
+  const holdingNames = useMemo(() => new Map(
+    props.holdings.map((holding) => [
+      symbolOf(holding),
+      String(holding.name || "").trim(),
+    ]),
+  ), [props.holdings]);
 
   useEffect(() => {
     setDraft(props.mandate);
@@ -446,29 +452,38 @@ export default function PortfolioDailyRunPanel(props: Props) {
             <div className="mt-3 flex flex-wrap gap-2">
               {props.run.artifacts
                 .filter((item) => item.media_type === "application/pdf" && !item.expired && !item.superseded)
-                .map((item) => (
-                  <div key={item.artifact_id} className="inline-flex overflow-hidden rounded-md border bg-background">
-                    <a
-                      href={props.artifactUrl(props.run!.run_id, item.artifact_id)}
-                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium hover:bg-muted"
-                    >
-                      <Download className="h-3.5 w-3.5" />
-                      {item.kind === "master_pdf" ? "综合报告 PDF" : `${item.symbol || "个股"} PDF`}
-                    </a>
-                    {item.kind === "holding_daily_pdf" && item.symbol ? (
-                      <button
-                        type="button"
-                        aria-label={`重试 ${item.symbol} 个股日报`}
-                        title="只重试这只股票，并重算组合报告"
-                        onClick={() => void props.onRetryHolding(item.symbol!)}
-                        disabled={props.starting}
-                        className="inline-flex items-center border-l px-2 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+                .map((item) => {
+                  const symbol = String(item.symbol || "").toUpperCase();
+                  const securityName = String(item.security_name || holdingNames.get(symbol) || "").trim();
+                  const label = item.kind === "master_pdf"
+                    ? `${props.run!.market_date} 组合晨会综合报告 PDF`
+                    : `${securityName || "个股"}（${symbol || "代码未知"}）· ${props.run!.market_date} PDF`;
+                  return (
+                    <div key={item.artifact_id} className="inline-flex overflow-hidden rounded-md border bg-background">
+                      <a
+                        href={props.artifactUrl(props.run!.run_id, item.artifact_id)}
+                        download={item.filename}
+                        title={item.filename}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium hover:bg-muted"
                       >
-                        <RotateCcw className="h-3.5 w-3.5" />
-                      </button>
-                    ) : null}
-                  </div>
-                ))}
+                        <Download className="h-3.5 w-3.5" />
+                        {label}
+                      </a>
+                      {item.kind === "holding_daily_pdf" && item.symbol ? (
+                        <button
+                          type="button"
+                          aria-label={`重试 ${item.symbol} 个股日报`}
+                          title="只重试这只股票，并重算组合报告"
+                          onClick={() => void props.onRetryHolding(item.symbol!)}
+                          disabled={props.starting}
+                          className="inline-flex items-center border-l px-2 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+                        >
+                          <RotateCcw className="h-3.5 w-3.5" />
+                        </button>
+                      ) : null}
+                    </div>
+                  );
+                })}
             </div>
           ) : null}
         </div>
@@ -646,8 +661,16 @@ export default function PortfolioDailyRunPanel(props: Props) {
                       <div className={`text-sm font-semibold ${offensive ? "text-red-500" : "text-blue-500"}`}>
                         {offensive ? "进攻型" : "防守型"}
                       </div>
-                      <div className="truncate text-[11px] text-muted-foreground">
-                        {holdings.length} 只 · {money(total)}
+                      <div className="mt-0.5 flex min-w-0 flex-wrap items-baseline gap-x-1.5">
+                        <span className="text-[11px] text-muted-foreground">{holdings.length} 只</span>
+                        <span
+                          data-testid="holding-zone-total"
+                          className={`text-base font-bold leading-none tabular-nums ${
+                            offensive ? "text-red-500" : "text-blue-500"
+                          }`}
+                        >
+                          {money(total)}
+                        </span>
                       </div>
                     </div>
                   </div>

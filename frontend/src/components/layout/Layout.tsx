@@ -1,12 +1,14 @@
 import { useTranslation } from "react-i18next";
 import { useEffect, useState } from "react";
 import { Link, Outlet, useLocation, useSearchParams } from "react-router-dom";
-import { Activity, BarChart3, Bot, BriefcaseBusiness, Database, FileText, Languages, Moon, Sun, Plus, Trash2, Pencil, MessageSquare, ChevronsLeft, ChevronsRight, Settings, Layers, Loader2 } from "lucide-react";
+import { Activity, BarChart3, Bot, BriefcaseBusiness, Database, FileText, Languages, Moon, Sun, Plus, Trash2, Pencil, MessageSquare, ChevronsLeft, ChevronsRight, Settings, Layers, Loader2, Send } from "lucide-react";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { useDarkMode } from "@/hooks/useDarkMode";
 import { api, type SessionItem } from "@/lib/api";
 import { useAgentStore } from "@/stores/agent";
 import { ConnectionBanner } from "@/components/layout/ConnectionBanner";
+import { PortfolioMonitorEffectsProvider } from "@/components/portfolio/PortfolioMonitorEffectsProvider";
 
 // Bump on each release; one place keeps the footer in sync with package.json.
 const APP_VERSION = "v0.1.10";
@@ -66,6 +68,7 @@ export function Layout() {
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [renameTarget, setRenameTarget] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  const [feishuHandoffTarget, setFeishuHandoffTarget] = useState<string | null>(null);
 
   const deleteSession = async (sid: string) => {
     try {
@@ -84,8 +87,21 @@ export function Layout() {
     setRenameTarget(null);
   };
 
+  const continueOnFeishu = async (sid: string) => {
+    setFeishuHandoffTarget(sid);
+    try {
+      await api.continueSessionOnFeishu(sid);
+      toast.success(isChinese ? "已切换到飞书，可在对应对话继续聊" : "Switched to Feishu. Continue in the linked chat.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : (isChinese ? "切换到飞书失败" : "Could not switch to Feishu"));
+    } finally {
+      setFeishuHandoffTarget(null);
+    }
+  };
+
   return (
-    <div className="flex h-screen bg-background">
+    <PortfolioMonitorEffectsProvider>
+    <div className="flex h-full min-h-0 overflow-hidden bg-background">
       {/* Sidebar */}
       <aside className={cn(
         "flex w-12 shrink-0 flex-col border-r bg-card transition-all duration-200",
@@ -191,18 +207,26 @@ export function Layout() {
                       </Link>
                     )}
                     {!isRenaming && isDeleting ? (
-                      <div className="absolute right-0.5 flex items-center gap-0.5">
+                      <div className="absolute inset-y-0 right-0 z-10 flex items-center gap-0.5 bg-gradient-to-r from-transparent via-card/95 to-card pl-4 pr-1">
                         <button onClick={() => deleteSession(s.session_id)} className="p-1 text-danger hover:bg-danger/10 rounded text-[10px] font-medium">{t('layout.confirm')}</button>
                         <button onClick={() => setDeleteTarget(null)} className="p-1 text-muted-foreground hover:bg-muted rounded text-[10px]">{t('layout.cancel')}</button>
                       </div>
                     ) : !isRenaming ? (
-                      <div className="absolute right-1 opacity-0 group-hover:opacity-100 flex items-center gap-0.5 transition-opacity">
+                      <div className="absolute inset-y-0 right-0 z-10 flex items-center gap-0.5 bg-gradient-to-r from-transparent via-card/95 to-card pl-4 pr-1 opacity-0 transition-opacity group-hover:opacity-100">
                         <button
                           onClick={(e) => { e.preventDefault(); e.stopPropagation(); setRenameTarget(s.session_id); setRenameValue(s.title || ""); }}
                           className="p-1 text-muted-foreground hover:text-foreground rounded"
                           title={t('layout.rename')}
                         >
                           <Pencil className="h-3 w-3" />
+                        </button>
+                        <button
+                          onClick={(e) => { e.preventDefault(); e.stopPropagation(); void continueOnFeishu(s.session_id); }}
+                          disabled={feishuHandoffTarget === s.session_id}
+                          className="p-1 text-muted-foreground hover:text-foreground rounded disabled:opacity-40"
+                          title={isChinese ? "飞书继续聊" : "Continue in Feishu"}
+                        >
+                          {feishuHandoffTarget === s.session_id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Send className="h-3 w-3" />}
                         </button>
                         <button
                           onClick={(e) => { e.preventDefault(); e.stopPropagation(); setDeleteTarget(s.session_id); }}
@@ -280,12 +304,13 @@ export function Layout() {
       </aside>
 
       {/* Main */}
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         <ConnectionBanner status={sseStatus} retryAttempt={sseRetryAttempt} />
-        <main className="flex-1 overflow-auto">
+        <main className="min-h-0 flex-1 overflow-auto overscroll-contain">
           <Outlet />
         </main>
       </div>
     </div>
+    </PortfolioMonitorEffectsProvider>
   );
 }

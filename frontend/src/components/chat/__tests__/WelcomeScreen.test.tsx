@@ -5,8 +5,14 @@ import i18n from "@/i18n";
 
 describe("WelcomeScreen", () => {
   const onExample = vi.fn();
+  const onDraft = vi.fn();
+  const onModeSelect = vi.fn();
 
-  beforeEach(() => onExample.mockClear());
+  beforeEach(() => {
+    onExample.mockClear();
+    onDraft.mockClear();
+    onModeSelect.mockClear();
+  });
 
   it("renders the title", () => {
     render(<WelcomeScreen onExample={onExample} />);
@@ -21,16 +27,62 @@ describe("WelcomeScreen", () => {
   });
 
   it("renders example categories", () => {
-    render(<WelcomeScreen onExample={onExample} />);
+    const view = render(<WelcomeScreen onExample={onExample} />);
     expect(screen.getByText("Multi-Market Backtest")).toBeInTheDocument();
     expect(screen.getByText("Research & Analysis")).toBeInTheDocument();
     expect(screen.getByText("Swarm Teams")).toBeInTheDocument();
+    expect(view.container.querySelectorAll("[data-example-action]")).toHaveLength(17);
+  });
+
+  it("adds detailed hover and focus hints to the example actions", () => {
+    render(<WelcomeScreen onExample={onExample} />);
+
+    expect(screen.getByRole("button", { name: /Cross-Market Portfolio/ })).toHaveAttribute("aria-describedby");
+    expect(screen.getAllByText("Lock securities, date range, frequency, and rebalancing rules to keep the setup consistent")).toHaveLength(3);
+    expect(screen.getAllByText("Backtests study historical scenarios; they do not guarantee future returns or connect to live order placement.")).toHaveLength(3);
+  });
+
+  it("renders portfolio-focused quick actions with detailed hints", () => {
+    render(<WelcomeScreen onExample={onExample} onDraft={onDraft} onModeSelect={onModeSelect} />);
+
+    expect(screen.getByRole("button", { name: /Portfolio health check/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Quick stock analysis/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Equity deep research/ })).toBeInTheDocument();
+    expect(screen.getByText("Use the portfolio ledger as truth and refresh decision-critical quotes first")).toBeInTheDocument();
+  });
+
+  it("starts a portfolio analysis from its quick action", async () => {
+    render(<WelcomeScreen onExample={onExample} onDraft={onDraft} onModeSelect={onModeSelect} />);
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: /Portfolio health check/ }));
+
+    expect(onExample).toHaveBeenCalledWith(expect.stringContaining("portfolio_state"));
+  });
+
+  it("puts the stock analysis template into the composer", async () => {
+    render(<WelcomeScreen onExample={onExample} onDraft={onDraft} onModeSelect={onModeSelect} />);
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: /Quick stock analysis/ }));
+
+    expect(onDraft).toHaveBeenCalledWith(expect.stringContaining("[company name or ticker]"));
+    expect(onExample).not.toHaveBeenCalled();
+  });
+
+  it("opens the existing deep-report mode from the quick action", async () => {
+    render(<WelcomeScreen onExample={onExample} onDraft={onDraft} onModeSelect={onModeSelect} />);
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: /Equity deep research/ }));
+
+    expect(onModeSelect).toHaveBeenCalledWith("deepReport");
   });
 
   it("calls onExample with prompt when an example button is clicked", async () => {
     render(<WelcomeScreen onExample={onExample} />);
     const user = userEvent.setup();
-    await user.click(screen.getByText("Cross-Market Portfolio"));
+    await user.click(screen.getByRole("button", { name: /Cross-Market Portfolio/ }));
     expect(onExample).toHaveBeenCalledTimes(1);
     expect(onExample).toHaveBeenCalledWith(
       expect.stringContaining("risk-parity portfolio"),
@@ -49,7 +101,8 @@ describe("WelcomeScreen", () => {
 
     expect(screen.getByText("金融技能库")).toBeInTheDocument();
     expect(screen.getByText("多市场回测")).toBeInTheDocument();
-    expect(screen.getByText("投资委员会评审")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /投资委员会评审/ })).toBeInTheDocument();
+    expect(screen.getAllByText("按任务选择研究、风险、量化和投资经理等专业角色")).toHaveLength(2);
     expect(screen.getByText("描述一个交易策略即可开始。")).toBeInTheDocument();
 
     await i18n.changeLanguage("en");

@@ -1,6 +1,7 @@
 import i18n from "@/i18n";
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
+  BookOpen,
   Database,
   KeyRound,
   Loader2,
@@ -21,6 +22,7 @@ import {
   type DataSourceSettings,
   type LLMProviderOption,
   type LLMSettings,
+  type ResearchSettings,
 } from "@/lib/api";
 import { getApiAuthKey, setApiAuthKey } from "@/lib/apiAuth";
 
@@ -55,6 +57,7 @@ export function Settings() {
 
   const [settings, setSettings] = useState<LLMSettings | null>(null);
   const [dataSettings, setDataSettings] = useState<DataSourceSettings | null>(null);
+  const [researchSettings, setResearchSettings] = useState<ResearchSettings | null>(null);
   const [channelStatus, setChannelStatus] = useState<ChannelRuntimeStatus | null>(null);
   const [channelLoadError, setChannelLoadError] = useState<string | null>(null);
   const [form, setForm] = useState<LLMFormState | null>(null);
@@ -66,6 +69,7 @@ export function Settings() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [dataSaving, setDataSaving] = useState(false);
+  const [researchSaving, setResearchSaving] = useState<"main" | "auto" | null>(null);
   const [channelRefreshing, setChannelRefreshing] = useState(false);
   const [channelAction, setChannelAction] = useState<"start" | "stop" | null>(null);
   const [settingsLoadError, setSettingsLoadError] = useState<string | null>(null);
@@ -75,6 +79,7 @@ export function Settings() {
     Promise.all([
       api.getLLMSettings(),
       api.getDataSourceSettings(),
+      api.getResearchSettings(),
       api.getChannelStatus()
         .then((status) => ({ status, error: null }))
         .catch((error: unknown) => ({
@@ -82,11 +87,12 @@ export function Settings() {
           error: error instanceof Error ? error.message : "Unknown error",
         })),
     ])
-      .then(([llmData, dataSourceData, channelResult]) => {
+      .then(([llmData, dataSourceData, researchData, channelResult]) => {
         if (!alive) return;
         setSettings(llmData);
         setForm(toForm(llmData));
         setDataSettings(dataSourceData);
+        setResearchSettings(researchData);
         setChannelStatus(channelResult.status);
         setChannelLoadError(channelResult.error);
         setSettingsLoadError(null);
@@ -220,6 +226,38 @@ export function Settings() {
     }
   };
 
+  const toggleDeepReport = async () => {
+    if (!researchSettings || researchSaving !== null) return;
+    const nextEnabled = !researchSettings.deep_report_enabled;
+    setResearchSaving("main");
+    try {
+      const updated = await api.updateResearchSettings({ deep_report_enabled: nextEnabled });
+      setResearchSettings(updated);
+      toast.success(nextEnabled ? "穿透式单股深度研究已启用" : "穿透式单股深度研究已关闭");
+    } catch (error) {
+      toast.error(`研究能力设置保存失败：${error instanceof Error ? error.message : "Unknown error"}`);
+    } finally {
+      setResearchSaving(null);
+    }
+  };
+
+  const toggleMonitorAutoDeepReport = async () => {
+    if (!researchSettings || researchSaving !== null || !researchSettings.deep_report_enabled) return;
+    const nextEnabled = !researchSettings.monitor_auto_deep_report_enabled;
+    setResearchSaving("auto");
+    try {
+      const updated = await api.updateResearchSettings({
+        monitor_auto_deep_report_enabled: nextEnabled,
+      });
+      setResearchSettings(updated);
+      toast.success(nextEnabled ? "AI 自主监控自动生成已启用" : "AI 自主监控自动生成已关闭");
+    } catch (error) {
+      toast.error(`自动研究设置保存失败：${error instanceof Error ? error.message : "Unknown error"}`);
+    } finally {
+      setResearchSaving(null);
+    }
+  };
+
   const localApiAccessSection = (
     <form onSubmit={submitLocalApiKey} className="rounded-lg border bg-card p-5 shadow-sm">
       <div className="mb-4 space-y-1">
@@ -253,7 +291,7 @@ export function Settings() {
     </form>
   );
 
-  if (loading || !form || !settings || !dataSettings) {
+  if (loading || !form || !settings || !dataSettings || !researchSettings) {
     return (
       <div className="mx-auto max-w-5xl space-y-6 p-6">
         <div className="space-y-2">
@@ -303,6 +341,84 @@ export function Settings() {
       </div>
 
       {localApiAccessSection}
+
+      <section className="rounded-lg border bg-card p-5 shadow-sm">
+        <div className="flex flex-col gap-5 md:flex-row md:items-center md:justify-between">
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <BookOpen className="h-4 w-4 text-primary" />
+              <h2 className="text-base font-semibold">研究能力</h2>
+              <span className={`rounded-full px-2 py-0.5 text-xs ${researchSettings.equity_deep_research_enabled ? "bg-success/10 text-success" : "bg-muted text-muted-foreground"}`}>
+                {researchSettings.equity_deep_research_enabled ? "已启用" : "已关闭"}
+              </span>
+            </div>
+            <div>
+              <div className="text-sm font-medium">穿透式单股深度研究</div>
+              <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
+                控制聊天页是否允许新建 equity_deep_research 报告。关闭后，已有报告仍可查看和下载，日报与回测流程不受影响。
+              </p>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              设置写入 <span className="font-mono text-foreground/80">{researchSettings.env_path}</span>，对之后的新请求立即生效，无需重启服务。
+            </p>
+          </div>
+
+          <div className="flex shrink-0 items-center gap-3 self-start md:self-center">
+            <span className="text-sm font-medium text-muted-foreground">
+              {researchSettings.deep_report_enabled ? "开启" : "关闭"}
+            </span>
+            <button
+              type="button"
+              role="switch"
+              aria-label="启用穿透式单股深度研究"
+              aria-checked={researchSettings.deep_report_enabled}
+              disabled={researchSaving !== null}
+              onClick={toggleDeepReport}
+              className={`relative inline-flex h-7 w-12 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60 ${researchSettings.deep_report_enabled ? "bg-primary" : "bg-muted-foreground/30"}`}
+            >
+              <span className={`inline-flex h-5 w-5 items-center justify-center rounded-full bg-background shadow-sm transition-transform ${researchSettings.deep_report_enabled ? "translate-x-6" : "translate-x-1"}`}>
+                {researchSaving === "main" ? <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" /> : null}
+              </span>
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-5 flex flex-col gap-4 border-t pt-4 md:flex-row md:items-center md:justify-between">
+          <div className="space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm font-medium">AI 自主监控自动生成穿透式报告</span>
+              <span className={`rounded-full px-2 py-0.5 text-xs ${researchSettings.effective_monitor_auto_deep_report_enabled ? "bg-violet-500/10 text-violet-700 dark:text-violet-300" : "bg-muted text-muted-foreground"}`}>
+                {researchSettings.effective_monitor_auto_deep_report_enabled ? "已授权" : "未授权"}
+              </span>
+            </div>
+            <p className="max-w-3xl text-sm text-muted-foreground">
+              当自主监控发现原报告缺失、过期或证据不足时，允许它自动排队生成完整穿透式报告。同一股票每天最多创建一次，并优先复用当天已有报告。
+            </p>
+            {!researchSettings.deep_report_enabled ? (
+              <p className="text-xs text-amber-700 dark:text-amber-300">请先开启上方的穿透式单股深度研究总开关。</p>
+            ) : null}
+          </div>
+
+          <div className="flex shrink-0 items-center gap-3 self-start md:self-center">
+            <span className="text-sm font-medium text-muted-foreground">
+              {researchSettings.monitor_auto_deep_report_enabled ? "允许" : "禁止"}
+            </span>
+            <button
+              type="button"
+              role="switch"
+              aria-label="允许 AI 自主监控自动生成穿透式报告"
+              aria-checked={researchSettings.monitor_auto_deep_report_enabled}
+              disabled={researchSaving !== null || !researchSettings.deep_report_enabled}
+              onClick={toggleMonitorAutoDeepReport}
+              className={`relative inline-flex h-7 w-12 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 ${researchSettings.monitor_auto_deep_report_enabled ? "bg-violet-600" : "bg-muted-foreground/30"}`}
+            >
+              <span className={`inline-flex h-5 w-5 items-center justify-center rounded-full bg-background shadow-sm transition-transform ${researchSettings.monitor_auto_deep_report_enabled ? "translate-x-6" : "translate-x-1"}`}>
+                {researchSaving === "auto" ? <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" /> : null}
+              </span>
+            </button>
+          </div>
+        </div>
+      </section>
 
       <section className="rounded-lg border bg-card p-5 shadow-sm">
         <div className="mb-5 flex flex-col gap-4 md:flex-row md:items-start md:justify-between">

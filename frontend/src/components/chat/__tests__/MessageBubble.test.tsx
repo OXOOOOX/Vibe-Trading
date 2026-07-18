@@ -75,6 +75,219 @@ describe("MessageBubble", () => {
       expect(screen.getByTestId("markdown")).toHaveTextContent("有什么需要重点验证？");
     });
 
+    it("uses persisted artifacts and can continue the same deep-report session", async () => {
+      vi.spyOn(api, "deepReportArtifactUrl").mockReturnValue(
+        "/api/reports/report_0123456789abcdef/artifacts/pdf",
+      );
+      vi.spyOn(api, "followUpDeepReport").mockResolvedValue({
+        message_id: "msg-next",
+        attempt_id: "attempt-next",
+        parent_report_id: "report_0123456789abcdef",
+      });
+      render(<MessageBubble msg={makeMsg({
+        type: "answer",
+        content: "# 江波龙（301308.SZ）穿透式深度研究",
+        reportId: "report_0123456789abcdef",
+        reportQualityStatus: "passed_with_gaps",
+        reportSymbol: "301308.SZ",
+        reportDataAsOf: "2026-07-16",
+        reportMissingModules: ["terminal_scenarios"],
+        reportPdfAvailable: true,
+        reportGenerationSource: "portfolio_monitor_autopilot",
+        reportGenerationReason: "原报告过期",
+      })} />);
+
+      expect(screen.getByText("穿透式深度研究")).toBeInTheDocument();
+      expect(screen.getByText("已完成，部分结论保留")).toBeInTheDocument();
+      expect(screen.getByText(/数据更新至/)).toBeInTheDocument();
+      expect(screen.getByText("仍需补充的研究内容（1）")).toBeInTheDocument();
+      expect(screen.queryByText("passed_with_gaps")).not.toBeInTheDocument();
+      expect(screen.getByText("AI 自主监控生成")).toBeInTheDocument();
+      expect(screen.getByText("自动触发原因：原报告过期")).toBeInTheDocument();
+      expect(screen.getByTitle("下载已校验的穿透式深度研究 PDF")).toHaveAttribute(
+        "href", "/api/reports/report_0123456789abcdef/artifacts/pdf",
+      );
+      expect(api.deepReportArtifactUrl).toHaveBeenCalledWith(
+        "report_0123456789abcdef", "pdf",
+      );
+      await userEvent.setup().click(screen.getByRole("button", { name: "继续研究" }));
+      expect(api.followUpDeepReport).toHaveBeenCalledWith(
+        "report_0123456789abcdef",
+        expect.stringContaining("证据缺口"),
+      );
+    });
+
+    it("hands a new-data revision back to the Agent streaming UI", async () => {
+      const onDeepReportTaskStarted = vi.fn();
+      vi.spyOn(api, "refreshDeepReport").mockResolvedValue({
+        message_id: "msg-refresh",
+        attempt_id: "attempt-refresh",
+        parent_report_id: "report_0123456789abcdef",
+        revision_mode: "full_refresh",
+      });
+      render(<MessageBubble
+        msg={makeMsg({
+          type: "answer",
+          reportId: "report_0123456789abcdef",
+          reportQualityStatus: "failed_validation",
+        })}
+        onDeepReportTaskStarted={onDeepReportTaskStarted}
+      />);
+
+      await userEvent.setup().click(screen.getByRole("button", { name: "用新数据更新" }));
+
+      expect(onDeepReportTaskStarted).toHaveBeenCalledWith({
+        action: "refresh",
+        reportId: "report_0123456789abcdef",
+        parentReportId: "report_0123456789abcdef",
+        attemptId: "attempt-refresh",
+        messageId: "msg-refresh",
+      });
+    });
+
+    it("creates an immutable repair revision for a failed validation report", async () => {
+      const onDeepReportTaskStarted = vi.fn();
+      vi.spyOn(api, "repairDeepReport").mockResolvedValue({
+        message_id: "msg-repair",
+        attempt_id: "attempt-repair",
+        parent_report_id: "report_failed",
+        revision_mode: "repair",
+      });
+      render(<MessageBubble
+        msg={makeMsg({
+          type: "answer",
+          reportId: "report_failed",
+          reportQualityStatus: "failed_validation",
+        })}
+        onDeepReportTaskStarted={onDeepReportTaskStarted}
+      />);
+
+      await userEvent.setup().click(screen.getByRole("button", { name: "修复报告" }));
+
+      expect(api.repairDeepReport).toHaveBeenCalledWith(
+        "report_failed",
+        expect.stringContaining("复用现有"),
+      );
+      expect(onDeepReportTaskStarted).toHaveBeenCalledWith({
+        action: "repair",
+        reportId: "report_failed",
+        parentReportId: "report_failed",
+        attemptId: "attempt-repair",
+        messageId: "msg-repair",
+      });
+    });
+
+    it("disables report actions while another Agent task is streaming", () => {
+      render(<MessageBubble
+        msg={makeMsg({ type: "answer", reportId: "report_busy" })}
+        deepReportBusy
+      />);
+
+      expect(screen.getByRole("button", { name: "继续研究" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "用新数据更新" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "重写此章节" })).toBeDisabled();
+    });
+
+    it("turns the run report path into a right-side preview action", async () => {
+      const onPreviewReport = vi.fn();
+      const content = [
+        "### 报告路径",
+        "```",
+        "agent/runs/20260717_003433_20_ea12c7/泰晶科技_603738_深度研究报告_20260717.md",
+        "```",
+      ].join("\n");
+      render(<MessageBubble
+        msg={makeMsg({
+          content,
+          runId: "20260717_003433_20_ea12c7",
+          reportId: "report_e271467d36274f31",
+          reportSecurityName: "泰晶科技",
+        })}
+        onPreviewReport={onPreviewReport}
+      />);
+
+      await userEvent.setup().click(screen.getByRole("button", {
+        name: "在右侧预览报告 泰晶科技_603738_深度研究报告_20260717.md",
+      }));
+
+      expect(onPreviewReport).toHaveBeenCalledWith({
+        runId: "20260717_003433_20_ea12c7",
+        reportId: "report_e271467d36274f31",
+        artifactId: "markdown",
+        title: "泰晶科技穿透式深度研究",
+      });
+    });
+
+    it("does not offer report preview for an ordinary run answer", () => {
+      render(<MessageBubble
+        msg={makeMsg({ content: "普通分析结果", runId: "plain_run" })}
+        onPreviewReport={vi.fn()}
+      />);
+
+      expect(screen.queryByText("预览完整报告")).not.toBeInTheDocument();
+    });
+
+    it("explains deep-report actions and can archive the report to Obsidian", async () => {
+      vi.spyOn(api, "archiveDeepReport").mockResolvedValue({
+        status: "ok",
+        path: "QQQ/Invest/report.md",
+        bytes_written: 128,
+      });
+      render(<MessageBubble msg={makeMsg({
+        type: "answer",
+        content: "# 已校验的深度研究",
+        reportId: "report_0123456789abcdef",
+        reportQualityStatus: "passed",
+        reportPdfAvailable: true,
+      })} />);
+
+      const sectionPicker = screen.getByLabelText("选择要重写的报告章节");
+      expect(sectionPicker).toHaveValue("counter_thesis");
+      expect(sectionPicker).toHaveAccessibleDescription(
+        "选择“重写此章节”要作用的目标模块；当前选中“反方、风险与催化剂”。只选择，不会立即开始。",
+      );
+      expect(screen.getByRole("button", { name: "继续研究" })).toHaveAccessibleDescription(
+        /不整份重跑/,
+      );
+      expect(screen.getByRole("button", { name: "用新数据更新" })).toHaveAccessibleDescription(
+        /最新可验证数据/,
+      );
+      expect(screen.getByRole("button", { name: "重写此章节" })).toHaveAccessibleDescription(
+        /仅重写左侧选中的章节/,
+      );
+
+      await userEvent.setup().click(screen.getByRole("button", { name: "保存到 Obsidian" }));
+      expect(api.archiveDeepReport).toHaveBeenCalledWith("report_0123456789abcdef");
+    });
+
+    it("presents failed deep-report validation as diagnostics and hides PDF download", () => {
+      const artifactUrl = vi.spyOn(api, "deepReportArtifactUrl");
+      render(<MessageBubble msg={makeMsg({
+        type: "answer",
+        content: "报告校验诊断",
+        reportId: "report_failed",
+        reportQualityStatus: "failed_validation",
+        reportSymbol: "603738.SH",
+        reportDataAsOf: "2026-07-17",
+        reportMissingModules: ["executive_summary", "financial_quality", "terminal_scenarios"],
+        reportPdfAvailable: false,
+      })} />);
+
+      expect(screen.getByText("尚未形成正式报告")).toBeInTheDocument();
+      expect(screen.getByRole("alert")).toHaveTextContent("单独修改章节无法解决");
+      expect(screen.getByText("暂不提供 PDF")).toBeInTheDocument();
+      const missingModules = screen.getByLabelText("仍需补充的研究内容");
+      expect(missingModules).toHaveTextContent("核心结论");
+      expect(missingModules).toHaveTextContent("三张报表与财务质量");
+      expect(missingModules).toHaveTextContent("长期经营情景");
+      expect(screen.queryByTitle("下载已校验的穿透式深度研究 PDF")).not.toBeInTheDocument();
+      expect(screen.queryByTitle("Generate PDF")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "保存到 Obsidian" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "修复报告" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "用新数据更新" })).toBeInTheDocument();
+      expect(artifactUrl).not.toHaveBeenCalledWith("report_failed", "pdf");
+    });
+
     it("generates a PDF from the answer", async () => {
       const pdf = new Blob(["pdf"], { type: "application/pdf" });
       vi.spyOn(api, "generatePdf").mockResolvedValue(pdf);

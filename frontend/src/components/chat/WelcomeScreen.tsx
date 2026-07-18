@@ -1,5 +1,23 @@
 import { useTranslation } from "react-i18next";
-﻿import { Bot, TrendingUp, Globe, Sparkles, Users, UserCircle2, NotebookPen, Landmark } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+import {
+  Activity,
+  ArrowUpRight,
+  BookOpen,
+  Bot,
+  CheckCircle2,
+  Globe,
+  Landmark,
+  NotebookPen,
+  PieChart,
+  Search,
+  Sparkles,
+  Target,
+  TrendingUp,
+  UserCircle2,
+  Users,
+} from "lucide-react";
+import { useId } from "react";
 
 interface Example {
   title: string;
@@ -12,6 +30,229 @@ interface Category {
   icon: React.ReactNode;
   color: string;
   examples: Example[];
+}
+
+export type WelcomeMode = "deepReport" | "researchGoal";
+
+type QuickActionBehavior =
+  | { kind: "prompt"; promptKey: string }
+  | { kind: "draft"; promptKey: string }
+  | { kind: "mode"; mode: WelcomeMode };
+
+interface QuickAction {
+  key: string;
+  icon: LucideIcon;
+  tone: string;
+  iconTone: string;
+  behavior: QuickActionBehavior;
+}
+
+const QUICK_ACTIONS: QuickAction[] = [
+  {
+    key: "portfolioAnalysis",
+    icon: PieChart,
+    tone: "border-orange-500/30 hover:border-orange-500/60 hover:bg-orange-500/[0.04]",
+    iconTone: "bg-orange-500/10 text-orange-600 dark:text-orange-300",
+    behavior: { kind: "prompt", promptKey: "welcome.quickStart.actions.portfolioAnalysis.prompt" },
+  },
+  {
+    key: "stockAnalysis",
+    icon: Search,
+    tone: "border-blue-500/30 hover:border-blue-500/60 hover:bg-blue-500/[0.04]",
+    iconTone: "bg-blue-500/10 text-blue-600 dark:text-blue-300",
+    behavior: { kind: "draft", promptKey: "welcome.quickStart.actions.stockAnalysis.prompt" },
+  },
+  {
+    key: "deepReport",
+    icon: BookOpen,
+    tone: "border-cyan-500/30 hover:border-cyan-500/60 hover:bg-cyan-500/[0.04]",
+    iconTone: "bg-cyan-500/10 text-cyan-600 dark:text-cyan-300",
+    behavior: { kind: "mode", mode: "deepReport" },
+  },
+  {
+    key: "marketReview",
+    icon: Activity,
+    tone: "border-emerald-500/30 hover:border-emerald-500/60 hover:bg-emerald-500/[0.04]",
+    iconTone: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-300",
+    behavior: { kind: "prompt", promptKey: "welcome.quickStart.actions.marketReview.prompt" },
+  },
+  {
+    key: "allocationPlan",
+    icon: TrendingUp,
+    tone: "border-violet-500/30 hover:border-violet-500/60 hover:bg-violet-500/[0.04]",
+    iconTone: "bg-violet-500/10 text-violet-600 dark:text-violet-300",
+    behavior: { kind: "prompt", promptKey: "welcome.quickStart.actions.allocationPlan.prompt" },
+  },
+  {
+    key: "researchGoal",
+    icon: Target,
+    tone: "border-amber-500/30 hover:border-amber-500/60 hover:bg-amber-500/[0.04]",
+    iconTone: "bg-amber-500/10 text-amber-600 dark:text-amber-300",
+    behavior: { kind: "mode", mode: "researchGoal" },
+  },
+];
+
+interface QuickActionCardProps {
+  actionKey: string;
+  icon: LucideIcon;
+  tone: string;
+  iconTone: string;
+  title: string;
+  description: string;
+  eyebrow: string;
+  details: string[];
+  footer: string;
+  cta: string;
+  onClick: () => void;
+}
+
+function QuickActionCard({
+  actionKey,
+  icon: Icon,
+  tone,
+  iconTone,
+  title,
+  description,
+  eyebrow,
+  details,
+  footer,
+  cta,
+  onClick,
+}: QuickActionCardProps) {
+  const hintId = useId();
+
+  return (
+    <div className="group relative z-0 min-w-0 hover:z-50 focus-within:z-50" data-quick-action={actionKey}>
+      <button
+        type="button"
+        onClick={onClick}
+        aria-describedby={hintId}
+        className={`flex h-full w-full items-start gap-3 rounded-2xl border bg-card/40 px-4 py-3.5 text-left shadow-sm transition duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 ${tone}`}
+      >
+        <span className={`mt-0.5 rounded-xl p-2 ${iconTone}`}>
+          <Icon className="h-4 w-4" />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="flex items-center justify-between gap-2">
+            <span className="text-sm font-semibold text-foreground">{title}</span>
+            <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-hover:-translate-y-0.5 group-hover:translate-x-0.5" />
+          </span>
+          <span className="mt-1 block text-xs leading-5 text-muted-foreground">{description}</span>
+          <span className="mt-2 block text-[11px] font-medium text-foreground/70">{cta}</span>
+        </span>
+      </button>
+
+      <div
+        id={hintId}
+        role="tooltip"
+        className="pointer-events-none invisible absolute left-1/2 top-[calc(100%+0.6rem)] z-[70] w-[min(22rem,calc(100vw-3rem))] -translate-x-1/2 translate-y-1 rounded-2xl border border-border/80 bg-background p-4 text-foreground opacity-0 shadow-2xl ring-1 ring-black/10 transition duration-150 group-hover:visible group-hover:translate-y-0 group-hover:opacity-100 group-focus-within:visible group-focus-within:translate-y-0 group-focus-within:opacity-100"
+      >
+        <span aria-hidden="true" className="absolute -top-1.5 left-1/2 h-3 w-3 -translate-x-1/2 rotate-45 border-l border-t border-border/80 bg-background" />
+        <div className="flex items-center gap-2">
+          <span className={`rounded-lg p-1.5 ${iconTone}`}>
+            <Icon className="h-4 w-4" />
+          </span>
+          <div>
+            <div className="text-sm font-semibold">{title}</div>
+            <div className="mt-0.5 text-[11px] font-medium text-muted-foreground">{eyebrow}</div>
+          </div>
+        </div>
+        <ul className="mt-3 space-y-2">
+          {details.map((detail) => (
+            <li key={detail} className="flex gap-2 text-xs leading-5">
+              <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+              <span>{detail}</span>
+            </li>
+          ))}
+        </ul>
+        <div className="mt-3 rounded-xl border bg-muted/70 px-3 py-2 text-[11px] leading-5 text-muted-foreground">
+          {footer}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+interface ExampleActionCardProps {
+  exampleKey: string;
+  icon: React.ReactNode;
+  tone: string;
+  accentClass: string;
+  title: string;
+  description: string;
+  eyebrow: string;
+  details: string[];
+  footer: string;
+  cta: string;
+  onClick: () => void;
+}
+
+function ExampleActionCard({
+  exampleKey,
+  icon,
+  tone,
+  accentClass,
+  title,
+  description,
+  eyebrow,
+  details,
+  footer,
+  cta,
+  onClick,
+}: ExampleActionCardProps) {
+  const hintId = useId();
+
+  return (
+    <div className="group relative z-0 min-w-0 hover:z-50 focus-within:z-50" data-example-action={exampleKey}>
+      <button
+        type="button"
+        onClick={onClick}
+        aria-describedby={hintId}
+        className={`flex w-full items-start gap-3 rounded-2xl border bg-card/30 px-3.5 py-3 text-left shadow-sm transition duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 ${tone}`}
+      >
+        <span className={`mt-0.5 rounded-xl bg-muted/70 p-2 ${accentClass}`}>
+          {icon}
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="flex items-start justify-between gap-2">
+            <span className="text-sm font-semibold leading-snug text-foreground">{title}</span>
+            <ArrowUpRight className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-hover:-translate-y-0.5 group-hover:translate-x-0.5" />
+          </span>
+          <span className="mt-1 block text-xs leading-5 text-muted-foreground">{description}</span>
+          <span className="mt-2 block text-[11px] font-medium text-foreground/70">{cta}</span>
+        </span>
+      </button>
+
+      <div
+        id={hintId}
+        role="tooltip"
+        className="pointer-events-none invisible absolute left-1/2 top-[calc(100%+0.6rem)] z-[70] w-[min(22rem,calc(100vw-3rem))] -translate-x-1/2 translate-y-1 rounded-2xl border border-border/80 bg-background p-4 text-foreground opacity-0 shadow-2xl ring-1 ring-black/10 transition duration-150 group-hover:visible group-hover:translate-y-0 group-hover:opacity-100 group-focus-within:visible group-focus-within:translate-y-0 group-focus-within:opacity-100"
+      >
+        <span aria-hidden="true" className="absolute -top-1.5 left-1/2 h-3 w-3 -translate-x-1/2 rotate-45 border-l border-t border-border/80 bg-background" />
+        <div className="flex items-center gap-2">
+          <span className={`rounded-lg bg-muted/70 p-1.5 ${accentClass}`}>
+            {icon}
+          </span>
+          <div>
+            <div className="text-sm font-semibold">{title}</div>
+            <div className="mt-0.5 text-[11px] font-medium text-muted-foreground">{eyebrow}</div>
+          </div>
+        </div>
+        <p className="mt-3 text-xs leading-5 text-muted-foreground">{description}</p>
+        <ul className="mt-3 space-y-2">
+          {details.map((detail) => (
+            <li key={detail} className="flex gap-2 text-xs leading-5">
+              <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+              <span>{detail}</span>
+            </li>
+          ))}
+        </ul>
+        <div className="mt-3 rounded-xl border bg-muted/70 px-3 py-2 text-[11px] leading-5 text-muted-foreground">
+          {footer}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 const CATEGORIES: Category[] = [
@@ -219,10 +460,26 @@ const CAPABILITY_KEYS: Record<string, string> = {
 
 interface Props {
   onExample: (s: string) => void;
+  onDraft?: (s: string) => void;
+  onModeSelect?: (mode: WelcomeMode) => void;
 }
 
-export function WelcomeScreen({ onExample }: Props) {
+export function WelcomeScreen({ onExample, onDraft, onModeSelect }: Props) {
   const { t } = useTranslation();
+
+  const runQuickAction = (behavior: QuickActionBehavior) => {
+    if (behavior.kind === "mode") {
+      onModeSelect?.(behavior.mode);
+      return;
+    }
+    const prompt = t(behavior.promptKey);
+    if (behavior.kind === "draft") {
+      onDraft?.(prompt);
+      return;
+    }
+    onExample(prompt);
+  };
+
   return (
     <div className="flex flex-col items-center justify-center min-h-[60vh] space-y-8 text-center">
       {/* Header */}
@@ -241,6 +498,48 @@ export function WelcomeScreen({ onExample }: Props) {
         </div>
       </div>
 
+      {/* High-frequency research entry points */}
+      <section className="w-full max-w-3xl space-y-3 text-left" aria-labelledby="quick-start-title">
+        <div className="flex items-end justify-between gap-4 px-1">
+          <div>
+            <h3 id="quick-start-title" className="text-sm font-semibold text-foreground">
+              {t("welcome.quickStart.title")}
+            </h3>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              {t("welcome.quickStart.subtitle")}
+            </p>
+          </div>
+          <span className="hidden shrink-0 text-[11px] text-muted-foreground sm:inline">
+            {t("welcome.quickStart.hoverHint")}
+          </span>
+        </div>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          {QUICK_ACTIONS.map((action) => {
+            const keyBase = `welcome.quickStart.actions.${action.key}`;
+            return (
+              <QuickActionCard
+                key={action.key}
+                actionKey={action.key}
+                icon={action.icon}
+                tone={action.tone}
+                iconTone={action.iconTone}
+                title={t(`${keyBase}.title`)}
+                description={t(`${keyBase}.description`)}
+                eyebrow={t(`${keyBase}.eyebrow`)}
+                details={[
+                  t(`${keyBase}.detail1`),
+                  t(`${keyBase}.detail2`),
+                  t(`${keyBase}.detail3`),
+                ]}
+                footer={t(`${keyBase}.footer`)}
+                cta={t(`${keyBase}.cta`)}
+                onClick={() => runQuickAction(action.behavior)}
+              />
+            );
+          })}
+        </div>
+      </section>
+
       {/* Capability chips */}
       <div className="flex flex-wrap justify-center gap-2 max-w-lg">
         {CAPABILITY_CHIPS.map((chip) => (
@@ -254,35 +553,61 @@ export function WelcomeScreen({ onExample }: Props) {
       </div>
 
       {/* Example categories grid */}
-      <div className="w-full max-w-2xl text-left space-y-4">
-        <p className="text-xs text-muted-foreground px-1">{t('welcome.tryExample')}</p>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          {CATEGORIES.map((cat) => (
-            <div key={cat.label} className="space-y-2">
-              <div className={`flex items-center gap-1.5 text-xs font-medium px-1 ${cat.color.split(" ").filter(c => c.startsWith("text-")).join(" ")}`}>
-                {cat.icon}
-                <span>{t(`welcome.categories.${CATEGORY_KEYS[cat.label]}`)}</span>
-              </div>
-              <div className="space-y-1.5">
-                {cat.examples.map((ex) => (
-                  <button
-                    key={ex.title}
-                    onClick={() => onExample(ex.prompt)}
-                    className={`block w-full text-left px-3 py-2.5 rounded-xl border transition-colors ${cat.color}`}
-                  >
-                    <span className="text-sm font-medium text-foreground leading-snug">
-                      {t(`welcome.examples.${EXAMPLE_KEYS[ex.title]}`)}
-                    </span>
-                    <span className="block text-xs text-muted-foreground mt-0.5 leading-snug">
-                      {t(`welcome.examples.${EXAMPLE_KEYS[ex.title]}Desc`)}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            </div>
-          ))}
+      <section className="w-full max-w-3xl space-y-4 text-left" aria-labelledby="example-actions-title">
+        <div className="flex items-end justify-between gap-4 px-1">
+          <div>
+            <h3 id="example-actions-title" className="text-sm font-semibold text-foreground">
+              {t("welcome.tryExample")}
+            </h3>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              {t("welcome.exampleHints.subtitle")}
+            </p>
+          </div>
+          <span className="hidden shrink-0 text-[11px] text-muted-foreground sm:inline">
+            {t("welcome.exampleHints.hoverHint")}
+          </span>
         </div>
-      </div>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          {CATEGORIES.map((cat) => {
+            const categoryKey = CATEGORY_KEYS[cat.label];
+            const accentClass = cat.color.split(" ").filter((className) => className.startsWith("text-")).join(" ");
+            const hintBase = `welcome.exampleHints.categories.${categoryKey}`;
+            return (
+              <div key={cat.label} className="space-y-2.5">
+                <div className={`flex items-center gap-1.5 px-1 text-xs font-medium ${accentClass}`}>
+                  {cat.icon}
+                  <span>{t(`welcome.categories.${categoryKey}`)}</span>
+                </div>
+                <div className="space-y-2">
+                  {cat.examples.map((ex) => {
+                    const exampleKey = EXAMPLE_KEYS[ex.title];
+                    return (
+                      <ExampleActionCard
+                        key={ex.title}
+                        exampleKey={exampleKey}
+                        icon={cat.icon}
+                        tone={cat.color}
+                        accentClass={accentClass}
+                        title={t(`welcome.examples.${exampleKey}`)}
+                        description={t(`welcome.examples.${exampleKey}Desc`)}
+                        eyebrow={t(`${hintBase}.eyebrow`)}
+                        details={[
+                          t(`${hintBase}.detail1`),
+                          t(`${hintBase}.detail2`),
+                          t(`${hintBase}.detail3`),
+                        ]}
+                        footer={t(`${hintBase}.footer`)}
+                        cta={t("welcome.exampleHints.cta")}
+                        onClick={() => onExample(ex.prompt)}
+                      />
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </section>
     </div>
   );
 }

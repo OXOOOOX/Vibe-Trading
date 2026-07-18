@@ -13,8 +13,10 @@ import {
   ChevronUp,
   ChevronsUpDown,
   Database,
+  Info,
   Loader2,
   Pencil,
+  Radar,
   RefreshCw,
   Save,
   Trash2,
@@ -36,12 +38,24 @@ import {
 import { cn } from "@/lib/utils";
 import MarketCacheKlineDialog from "@/components/portfolio/MarketCacheKlineDialog";
 import PortfolioDailyRunPanel from "@/components/portfolio/PortfolioDailyRunPanel";
+import PortfolioMonitorPanel from "@/components/portfolio/PortfolioMonitorPanel";
 
 const ACTIVE_REFRESH_KEY = "vibe-trading:portfolio-market-refresh:v1";
 const ANALYSIS_RUNS_STORAGE_KEY = "vibe-trading:portfolio-analysis-runs:v1";
+const MONITOR_SELECTION_STORAGE_KEY = "vibe-trading:portfolio-monitor-selection:v1";
 const TERMINAL_REFRESH_STATUSES = new Set(["completed", "partial", "failed", "interrupted"]);
 const ACTIVE_ANALYSIS_STATUSES = new Set(["queued", "running"]);
 const ACTIVE_DAILY_RUN_STATUSES = new Set(["queued", "running", "cancelling"]);
+const US_TICKER_PATTERN = /^[A-Z][A-Z0-9]{0,9}(?:\.[A-Z])?(?:\.US)?$/;
+
+function isCompleteSecurityCode(value: string): boolean {
+  const code = value.trim().toUpperCase();
+  return /^\d{6}$/.test(code) || US_TICKER_PATTERN.test(code);
+}
+
+function sanitizeSecurityCode(value: string): string {
+  return value.toUpperCase().replace(/[^A-Z0-9.]/g, "").slice(0, 16);
+}
 
 const HOLDING_SORT_COLUMNS = [
   { key: "name", label: "名称" },
@@ -166,6 +180,62 @@ function holdingSymbol(row: PortfolioHolding): string {
   return String(row.symbol || row.code || "").trim();
 }
 
+function securityDisplayName(
+  symbol: string,
+  holdingNames: ReadonlyMap<string, string>,
+  explicitName?: unknown,
+): string {
+  const normalizedSymbol = symbol.trim().toUpperCase();
+  const code = normalizedSymbol.split(".")[0];
+  const name = String(
+    explicitName
+    || holdingNames.get(normalizedSymbol)
+    || holdingNames.get(code)
+    || "",
+  ).trim();
+  return name ? `${name}（${code || normalizedSymbol}）` : normalizedSymbol || "-";
+}
+
+type StoredMonitorSelection = {
+  selection: Set<string>;
+  hasPersistedValue: boolean;
+};
+
+function loadMonitorSelection(): StoredMonitorSelection {
+  if (typeof window === "undefined") {
+    return { selection: new Set(), hasPersistedValue: false };
+  }
+  try {
+    const raw = window.localStorage.getItem(MONITOR_SELECTION_STORAGE_KEY);
+    if (raw === null) return { selection: new Set(), hasPersistedValue: false };
+    const stored = JSON.parse(raw) as { version?: unknown; symbols?: unknown };
+    if (stored.version !== 1 || !Array.isArray(stored.symbols)) {
+      return { selection: new Set(), hasPersistedValue: true };
+    }
+    return {
+      selection: new Set(stored.symbols
+        .filter((symbol): symbol is string => typeof symbol === "string")
+        .map((symbol) => symbol.trim())
+        .filter(Boolean)),
+      hasPersistedValue: true,
+    };
+  } catch {
+    return { selection: new Set(), hasPersistedValue: true };
+  }
+}
+
+function persistMonitorSelection(selection: Set<string>): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(MONITOR_SELECTION_STORAGE_KEY, JSON.stringify({
+      version: 1,
+      symbols: Array.from(selection).sort(),
+    }));
+  } catch {
+    // A blocked or full localStorage must not make the portfolio page unusable.
+  }
+}
+
 function matchesHolding(row: PortfolioHolding, query: string): boolean {
   const needle = query.trim().toLowerCase();
   if (!needle) return false;
@@ -256,6 +326,7 @@ function isActiveAnalysis(run: PortfolioAnalysisSession | undefined): boolean {
 
 export function Portfolio() {
   const navigate = useNavigate();
+  const [initialMonitorSelection] = useState<StoredMonitorSelection>(loadMonitorSelection);
   const [review, setReview] = useState<PortfolioReview | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -278,7 +349,44 @@ export function Portfolio() {
   const [savingMandate, setSavingMandate] = useState(false);
   const [savingCash, setSavingCash] = useState(false);
   const [startingDailyRun, setStartingDailyRun] = useState(false);
+  const [monitorSelection, setMonitorSelection] = useState<Set<string>>(
+    () => initialMonitorSelection.selection,
+  );
+  const [monitorSelectionRevision, setMonitorSelectionRevision] = useState(0);
+  const [monitorSelectionHydrationPending, setMonitorSelectionHydrationPending] = useState(
+    () => !initialMonitorSelection.hasPersistedValue,
+  );
   const completedRefreshRef = useRef<string | null>(null);
+  const holdingNameByIdentifier = useMemo(() => {
+    const names = new Map<string, string>();
+    for (const holding of review?.portfolio_state.holdings || []) {
+      const name = String(holding.name || "").trim();
+      const symbol = holdingSymbol(holding).toUpperCase();
+      const code = holdingCode(holding).toUpperCase();
+      if (!name) continue;
+      if (symbol) names.set(symbol, name);
+      if (code) names.set(code, name);
+    }
+    return names;
+  }, [monitorSelectionHydrationPending, review?.portfolio_state.holdings]);
+
+  useEffect(() => {
+    if (monitorSelectionHydrationPending) return;
+    persistMonitorSelection(monitorSelection);
+  }, [monitorSelection, monitorSelectionHydrationPending]);
+
+  useEffect(() => {
+    const holdings = review?.portfolio_state.holdings;
+    if (!holdings) return;
+    const validSymbols = new Set(holdings.map(holdingSymbol).filter(Boolean));
+    setMonitorSelection((current) => {
+      const next = new Set(Array.from(current).filter((symbol) => validSymbols.has(symbol)));
+      if (next.size === current.size && Array.from(next).every((symbol) => current.has(symbol))) {
+        return current;
+      }
+      return next;
+    });
+  }, [review?.portfolio_state.holdings]);
 
   const loadReview = useCallback(async (mode: "initial" | "refresh" = "refresh") => {
     if (mode === "initial") setLoading(true);
@@ -352,8 +460,8 @@ export function Portfolio() {
   }, [dailyRun?.run_id, dailyRun?.status]);
 
   useEffect(() => {
-    const code = tradeForm.code.trim();
-    if (!/^\d{6}$/.test(code)) {
+    const code = tradeForm.code.trim().toUpperCase();
+    if (!isCompleteSecurityCode(code)) {
       setTradeLookup({ status: "idle" });
       setTradeForm((current) => (
         current.symbol || current.name ? { ...current, symbol: "", name: "" } : current
@@ -364,30 +472,33 @@ export function Portfolio() {
     const controller = new AbortController();
     let cancelled = false;
     setTradeLookup({ status: "loading", code });
-    void api.lookupPortfolioSecurity(code, controller.signal)
-      .then((security) => {
-        if (cancelled) return;
-        setTradeForm((current) => (
-          current.code.trim() === code
-            ? { ...current, code: security.code, symbol: security.symbol, name: security.name }
-            : current
-        ));
-        setTradeSuggestionsOpen(false);
-        setTradeLookup({ status: "resolved", code, message: `${security.name} · ${security.symbol}` });
-      })
-      .catch((error) => {
-        if (cancelled || (error instanceof Error && error.name === "AbortError")) return;
-        setTradeForm((current) => (
-          current.code.trim() === code ? { ...current, symbol: "", name: "" } : current
-        ));
-        setTradeLookup({
-          status: "error",
-          code,
-          message: error instanceof Error ? error.message : "未找到该证券，请检查代码。",
+    const timer = window.setTimeout(() => {
+      void api.lookupPortfolioSecurity(code, controller.signal)
+        .then((security) => {
+          if (cancelled) return;
+          setTradeForm((current) => (
+            current.code.trim().toUpperCase() === code
+              ? { ...current, code: security.code, symbol: security.symbol, name: security.name }
+              : current
+          ));
+          setTradeSuggestionsOpen(false);
+          setTradeLookup({ status: "resolved", code, message: `${security.name} · ${security.symbol}` });
+        })
+        .catch((error) => {
+          if (cancelled || (error instanceof Error && error.name === "AbortError")) return;
+          setTradeForm((current) => (
+            current.code.trim().toUpperCase() === code ? { ...current, symbol: "", name: "" } : current
+          ));
+          setTradeLookup({
+            status: "error",
+            code,
+            message: error instanceof Error ? error.message : "未找到该证券，请检查代码。",
+          });
         });
-      });
+    }, 300);
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
       controller.abort();
     };
   }, [tradeForm.code]);
@@ -427,8 +538,17 @@ export function Portfolio() {
           if (completedRefreshRef.current !== next.run_id) {
             completedRefreshRef.current = next.run_id;
             await loadReview("refresh");
-            if (next.status === "completed") toast.success("持仓行情与分层缓存已刷新完成。");
-            else if (next.status === "partial") toast.warning("行情刷新已完成，但有部分数据源失败。");
+            const singleSymbol = next.profile === "symbol_detail" && next.symbols.length === 1
+              ? next.symbols[0]
+              : null;
+            const singleSymbolDisplay = singleSymbol
+              ? securityDisplayName(singleSymbol, holdingNameByIdentifier)
+              : null;
+            if (next.status === "completed") {
+              toast.success(singleSymbolDisplay ? `${singleSymbolDisplay} 行情缓存已刷新完成。` : "持仓行情与分层缓存已刷新完成。");
+            } else if (next.status === "partial") {
+              toast.warning(singleSymbolDisplay ? `${singleSymbolDisplay} 刷新完成，但有部分数据源失败。` : "行情刷新已完成，但有部分数据源失败。");
+            }
             else toast.error(next.error || "行情刷新未完成。");
           }
           return;
@@ -443,7 +563,7 @@ export function Portfolio() {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [loadReview, refreshRun]);
+  }, [holdingNameByIdentifier, loadReview, refreshRun]);
 
   useEffect(() => {
     try {
@@ -501,22 +621,34 @@ export function Portfolio() {
     };
   }, [activeAnalysisSignature]);
 
-  const refreshMarketData = async () => {
+  const startMarketRefresh = async (symbol?: string) => {
     const count = review?.portfolio_state.holdings.length || 0;
     if (count === 0) {
       toast.error("请先保存持仓，再刷新行情。");
       return;
     }
     try {
-      const payload = await api.startMarketCacheRefresh({ profile: "portfolio_default" });
+      const payload = await api.startMarketCacheRefresh(
+        symbol
+          ? { symbols: [symbol], profile: "symbol_detail" }
+          : { profile: "portfolio_default" },
+      );
       setRefreshRun(payload.run);
       completedRefreshRef.current = null;
       localStorage.setItem(ACTIVE_REFRESH_KEY, payload.run_id);
-      toast.success(payload.deduplicated ? "已恢复正在进行的行情刷新。" : `已开始刷新 ${count} 个持仓标的。`);
+      toast.success(
+        payload.deduplicated
+          ? "已恢复正在进行的行情刷新。"
+          : symbol
+            ? `已开始刷新 ${securityDisplayName(symbol, holdingNameByIdentifier)}。`
+            : `已开始刷新 ${count} 个持仓标的。`,
+      );
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "刷新行情失败");
     }
   };
+
+  const refreshMarketData = () => void startMarketRefresh();
 
   const saveMorningMeetingMandate = async (nextMandate: PortfolioMandate) => {
     setSavingMandate(true);
@@ -549,7 +681,7 @@ export function Portfolio() {
   const updateMorningMeetingAssignment = async (symbol: string, sleeveId: string) => {
     try {
       const saved = await api.updatePortfolioAssignment(symbol, sleeveId);
-      toast.success(`${symbol} 分区已锁定。`);
+      toast.success(`${securityDisplayName(symbol, holdingNameByIdentifier)} 分区已锁定。`);
       return saved;
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "更新持仓分区失败");
@@ -596,7 +728,7 @@ export function Portfolio() {
     try {
       const run = await api.retryPortfolioDailyRun(dailyRun.run_id, symbol);
       setDailyRun(run);
-      toast.success(`${symbol} 已进入单股重试；组合结论和综合 PDF 会同步生成新 revision。`);
+      toast.success(`${securityDisplayName(symbol, holdingNameByIdentifier)} 已进入单股重试；组合结论和综合 PDF 会同步生成新 revision。`);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "重试个股日报失败");
     } finally {
@@ -647,6 +779,11 @@ export function Portfolio() {
   };
 
   const refreshingMarket = Boolean(refreshRun && !TERMINAL_REFRESH_STATUSES.has(refreshRun.status));
+  const refreshingSymbol = refreshingMarket
+    && refreshRun?.profile === "symbol_detail"
+    && refreshRun.symbols.length === 1
+    ? refreshRun.symbols[0]
+    : null;
   const portfolioAnalysisKey = analysisTargetKey("portfolio");
   const portfolioAnalysisRun = analysisRuns[portfolioAnalysisKey];
   const marketAnalysisKey = analysisTargetKey("market");
@@ -655,7 +792,7 @@ export function Portfolio() {
 
   const summary = useMemo(() => {
     const holdings = review?.portfolio_state.holdings || [];
-    const caches = review?.verified_market_cache || [];
+    const caches = cacheRowsForHoldings(review?.verified_market_cache || [], holdings);
     const totalMarketValue = holdings.reduce((sum, row) => {
       const value = typeof row.market_value === "number" ? row.market_value : 0;
       return sum + value;
@@ -715,9 +852,9 @@ export function Portfolio() {
 
   const saveTrade = async (event: FormEvent) => {
     event.preventDefault();
-    const code = tradeForm.code.trim();
-    if (!/^\d{6}$/.test(code)) {
-      toast.error("请输入完整的 6 位证券代码。");
+    const code = tradeForm.code.trim().toUpperCase();
+    if (!isCompleteSecurityCode(code)) {
+      toast.error("请输入完整的 6 位 A 股代码或美股 ticker。");
       return;
     }
     if (tradeLookup.status === "loading") {
@@ -766,7 +903,7 @@ export function Portfolio() {
     try {
       const payload = await api.editPortfolioHolding(symbol, { quantity, cost_price: costPrice });
       setReview(payload);
-      toast.success(`${symbol} 的持有股数和成本已更新。`);
+      toast.success(`${securityDisplayName(symbol, holdingNameByIdentifier)} 的持有股数和成本已更新。`);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "更新持仓失败");
       throw error;
@@ -779,8 +916,11 @@ export function Portfolio() {
       toast.error("该交易记录缺少标识，无法删除。");
       return;
     }
-    const symbol = String(trade.symbol || trade.code || "该证券");
-    if (!window.confirm(`确认删除 ${symbol} 的这条交易记录？\n\n只删除记录，不会撤销它已经造成的持仓变化。`)) return;
+    const symbol = String(trade.symbol || trade.code || "");
+    const displayName = symbol
+      ? securityDisplayName(symbol, holdingNameByIdentifier, trade.name)
+      : "该证券";
+    if (!window.confirm(`确认删除 ${displayName} 的这条交易记录？\n\n只删除记录，不会撤销它已经造成的持仓变化。`)) return;
 
     setDeletingTradeId(tradeId);
     try {
@@ -795,7 +935,7 @@ export function Portfolio() {
   };
 
   return (
-    <div className="min-h-screen p-6 lg:p-8">
+    <div className="min-h-full p-6 lg:p-8">
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-6">
         <section className="flex flex-col gap-4 border-b pb-6 lg:flex-row lg:items-end lg:justify-between">
           <div className="space-y-3">
@@ -852,7 +992,7 @@ export function Portfolio() {
           </div>
         </section>
 
-        {refreshRun ? <RefreshProgress run={refreshRun} /> : null}
+        {refreshRun ? <RefreshProgress run={refreshRun} holdingNames={holdingNameByIdentifier} /> : null}
 
         <PortfolioDailyRunPanel
           mandate={mandate}
@@ -872,6 +1012,17 @@ export function Portfolio() {
           onRetryHolding={retryMorningMeetingHolding}
           onCancel={cancelMorningMeeting}
           artifactUrl={api.portfolioDailyRunArtifactUrl}
+        />
+
+        <PortfolioMonitorPanel
+          holdings={review?.portfolio_state.holdings || []}
+          selectedSymbols={monitorSelection}
+          selectionRevision={monitorSelectionRevision}
+          selectionHydrationPending={monitorSelectionHydrationPending}
+          onHydrateSelection={(symbols) => {
+            setMonitorSelection(new Set(symbols));
+            setMonitorSelectionHydrationPending(false);
+          }}
         />
 
         {loading ? (
@@ -929,14 +1080,14 @@ export function Portfolio() {
                     <div className={`relative ${tradeSuggestionsOpen && tradeSuggestions.length > 0 ? "z-30" : ""}`}>
                       <input
                         className="relative z-30 w-full rounded-md border bg-background px-3 py-2 pr-9 text-sm"
-                        placeholder="代码，如 588870 或 588"
-                        aria-label="6位证券代码"
-                        inputMode="numeric"
-                        maxLength={6}
+                        placeholder="代码，如 588870 或 AAPL"
+                        aria-label="证券代码或美股 ticker"
+                        inputMode="text"
+                        maxLength={16}
                         value={tradeForm.code}
                         onFocus={() => setTradeSuggestionsOpen(true)}
                         onChange={(e) => {
-                          const code = e.target.value.replace(/\D/g, "").slice(0, 6);
+                          const code = sanitizeSecurityCode(e.target.value);
                           setTradeForm((s) => ({ ...s, code, symbol: "", name: "" }));
                           setTradeSuggestionsOpen(true);
                         }}
@@ -1035,18 +1186,50 @@ export function Portfolio() {
 
             <HoldingsTable
               review={review}
+              selectedSymbols={monitorSelection}
+              onToggleSelection={(symbol, selected) => {
+                setMonitorSelectionHydrationPending(false);
+                setMonitorSelectionRevision((current) => current + 1);
+                setMonitorSelection((current) => {
+                  const next = new Set(current);
+                  if (selected) next.add(symbol);
+                  else next.delete(symbol);
+                  return next;
+                });
+              }}
+              onToggleAll={(symbols, selected) => {
+                setMonitorSelectionHydrationPending(false);
+                setMonitorSelectionRevision((current) => current + 1);
+                setMonitorSelection((current) => {
+                  const next = new Set(current);
+                  symbols.forEach((symbol) => selected ? next.add(symbol) : next.delete(symbol));
+                  return next;
+                });
+              }}
               analysisRuns={analysisRuns}
               startingAnalysisKey={startingAnalysisKey}
               onStart={(holding) => void startAnalysis("holding", holding)}
               onOpen={openAnalysis}
               onUpdate={updateHolding}
             />
-            <TradesTable review={review} deletingTradeId={deletingTradeId} onDelete={(trade) => void removeTrade(trade)} />
+            <TradesTable
+              review={review}
+              holdingNames={holdingNameByIdentifier}
+              deletingTradeId={deletingTradeId}
+              onDelete={(trade) => void removeTrade(trade)}
+            />
             <CacheTable
               review={review}
               expandedCachePath={expandedCachePath}
               onToggle={(path) => setExpandedCachePath((current) => (current === path ? null : path))}
               onOpenChart={setChartCacheGroup}
+              onOpenMarketDetails={(group) => navigate(
+                `/data-center?symbol=${encodeURIComponent(group.symbol)}`
+                + (group.name ? `&name=${encodeURIComponent(group.name)}` : ""),
+              )}
+              onRefreshSymbol={(symbol) => void startMarketRefresh(symbol)}
+              refreshingSymbol={refreshingSymbol}
+              refreshDisabled={refreshingMarket}
             />
           </>
         ) : null}
@@ -1096,7 +1279,13 @@ function refreshStatusLabel(status: string): string {
   return labels[status] || status;
 }
 
-function RefreshProgress({ run }: { run: MarketCacheRun }) {
+function RefreshProgress({
+  run,
+  holdingNames,
+}: {
+  run: MarketCacheRun;
+  holdingNames: ReadonlyMap<string, string>;
+}) {
   const active = !TERMINAL_REFRESH_STATUSES.has(run.status);
   return (
     <section className="border-b pb-5" aria-live="polite">
@@ -1108,7 +1297,9 @@ function RefreshProgress({ run }: { run: MarketCacheRun }) {
             <StatusPill status={run.status} />
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
-            {run.current_symbol ? `正在处理 ${run.current_symbol}` : `任务 ${run.run_id.slice(0, 8)}`}
+            {run.current_symbol
+              ? `正在处理 ${securityDisplayName(run.current_symbol, holdingNames)}`
+              : `任务 ${run.run_id.slice(0, 8)}`}
             {run.current_source ? ` · 来源 ${run.current_source}` : ""}
           </p>
         </div>
@@ -1138,7 +1329,7 @@ function RefreshProgress({ run }: { run: MarketCacheRun }) {
           <tbody>
             {run.items.map((item) => (
               <tr key={`${item.symbol}-${item.interval}-${item.adjustment}`} className="border-t">
-                <td className="px-3 py-2 font-mono">{item.symbol}</td>
+                <td className="px-3 py-2 font-medium">{securityDisplayName(item.symbol, holdingNames)}</td>
                 <td className="px-3 py-2 font-mono">{item.interval}</td>
                 <td className="px-3 py-2 font-mono">{item.adjustment}</td>
                 <td className="px-3 py-2"><StatusPill status={item.status} /></td>
@@ -1155,6 +1346,9 @@ function RefreshProgress({ run }: { run: MarketCacheRun }) {
 
 function HoldingsTable({
   review,
+  selectedSymbols,
+  onToggleSelection,
+  onToggleAll,
   analysisRuns,
   startingAnalysisKey,
   onStart,
@@ -1162,6 +1356,9 @@ function HoldingsTable({
   onUpdate,
 }: {
   review: PortfolioReview | null;
+  selectedSymbols: Set<string>;
+  onToggleSelection: (symbol: string, selected: boolean) => void;
+  onToggleAll: (symbols: string[], selected: boolean) => void;
   analysisRuns: Record<string, PortfolioAnalysisSession>;
   startingAnalysisKey: string | null;
   onStart: (holding: PortfolioHolding) => void;
@@ -1181,6 +1378,8 @@ function HoldingsTable({
       .sort((left, right) => compareHoldingRows(left.row, right.row, sort) || left.index - right.index)
       .map(({ row }) => row);
   }, [holdings, sort]);
+  const selectableSymbols = useMemo(() => holdings.map(holdingSymbol).filter(Boolean), [holdings]);
+  const allSelected = selectableSymbols.length > 0 && selectableSymbols.every((symbol) => selectedSymbols.has(symbol));
 
   const toggleSort = (key: HoldingSortKey) => {
     setSort((current) => {
@@ -1223,7 +1422,7 @@ function HoldingsTable({
   };
 
   return (
-    <section className="grid gap-2">
+    <section id="portfolio-holdings" className="grid scroll-mt-6 gap-2">
       <h2 className="text-sm font-semibold">持仓矩阵</h2>
       <div className="overflow-auto rounded-md border">
         <table aria-label="持仓矩阵" className="w-full min-w-[1090px] text-left text-xs">
@@ -1235,6 +1434,10 @@ function HoldingsTable({
                   column={column}
                   sort={sort}
                   onSort={toggleSort}
+                  selectAll={column.key === "name" ? {
+                    checked: allSelected,
+                    onChange: (selected) => onToggleAll(selectableSymbols, selected),
+                  } : undefined}
                 />
               ))}
               <th scope="col" className="px-3 py-2 font-medium">Agent 分析 / 操作</th>
@@ -1249,7 +1452,28 @@ function HoldingsTable({
                 const isEditing = editingSymbol === symbol;
                 return (
                 <tr key={`${row.symbol || row.code || index}`} className={cn("border-t", isEditing && "bg-muted/20")}>
-                  <td className="px-3 py-2 font-medium">{fmtText(row.name)}</td>
+                  <td className="px-3 py-2 font-medium">
+                    <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      aria-label={`${selectedSymbols.has(symbol) ? "取消选择" : "选择"} ${symbol || fmtText(row.name)} 用于 AI 监控`}
+                      aria-pressed={selectedSymbols.has(symbol)}
+                      disabled={!symbol}
+                      title={selectedSymbols.has(symbol) ? "已加入 AI 监控选择" : "加入 AI 监控选择"}
+                      onClick={() => onToggleSelection(symbol, !selectedSymbols.has(symbol))}
+                      data-monitor-selected={selectedSymbols.has(symbol) ? "true" : "false"}
+                      className={cn(
+                        "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full border transition-all disabled:cursor-not-allowed disabled:opacity-40",
+                        selectedSymbols.has(symbol)
+                          ? "border-cyan-500/60 bg-cyan-500/15 text-cyan-600 shadow-sm shadow-cyan-500/30 dark:text-cyan-300"
+                          : "border-muted-foreground/25 text-muted-foreground hover:border-cyan-500/40 hover:bg-cyan-500/5 hover:text-cyan-600",
+                      )}
+                    >
+                      <Radar aria-hidden="true" className="h-4 w-4" />
+                    </button>
+                    <span>{fmtText(row.name)}</span>
+                    </div>
+                  </td>
                   <td className="px-3 py-2 font-mono">{fmtText(row.symbol || row.code)}</td>
                   <td className="px-3 py-2 text-right font-mono">
                     {isEditing ? (
@@ -1350,10 +1574,12 @@ function SortableHoldingHeader({
   column,
   sort,
   onSort,
+  selectAll,
 }: {
   column: (typeof HOLDING_SORT_COLUMNS)[number];
   sort: HoldingSort | null;
   onSort: (key: HoldingSortKey) => void;
+  selectAll?: { checked: boolean; onChange: (selected: boolean) => void };
 }) {
   const isActive = sort?.key === column.key;
   const direction = isActive ? sort.direction : null;
@@ -1366,19 +1592,38 @@ function SortableHoldingHeader({
       aria-sort={direction === "asc" ? "ascending" : direction === "desc" ? "descending" : "none"}
       className={cn("px-3 py-2 font-medium", alignRight && "text-right")}
     >
-      <button
-        type="button"
-        className={cn(
-          "inline-flex w-full items-center gap-1.5 rounded-sm transition hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40",
-          alignRight ? "justify-end" : "justify-start",
-        )}
-        aria-label={`按${column.label}${nextDirection}排序`}
-        title={`按${column.label}${nextDirection}排序`}
-        onClick={() => onSort(column.key)}
-      >
-        <span>{column.label}</span>
-        <SortIcon aria-hidden="true" className={cn("h-3 w-3", isActive ? "text-foreground" : "opacity-55")} />
-      </button>
+      <div className={cn("flex items-center gap-2", alignRight && "justify-end")}>
+        {selectAll ? (
+          <button
+            type="button"
+            aria-label={selectAll.checked ? "取消选择全部持仓用于 AI 监控" : "选择全部持仓用于 AI 监控"}
+            aria-pressed={selectAll.checked}
+            title={selectAll.checked ? "取消全部监控选择" : "选择全部持仓用于 AI 监控"}
+            onClick={() => selectAll.onChange(!selectAll.checked)}
+            className={cn(
+              "inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full border transition",
+              selectAll.checked
+                ? "border-cyan-500/60 bg-cyan-500/15 text-cyan-600 dark:text-cyan-300"
+                : "border-muted-foreground/25 text-muted-foreground hover:border-cyan-500/40 hover:text-cyan-600",
+            )}
+          >
+            <Radar aria-hidden="true" className="h-3.5 w-3.5" />
+          </button>
+        ) : null}
+        <button
+          type="button"
+          className={cn(
+            "inline-flex min-w-0 flex-1 items-center gap-1.5 rounded-sm transition hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40",
+            alignRight ? "justify-end" : "justify-start",
+          )}
+          aria-label={`按${column.label}${nextDirection}排序`}
+          title={`按${column.label}${nextDirection}排序`}
+          onClick={() => onSort(column.key)}
+        >
+          <span>{column.label}</span>
+          <SortIcon aria-hidden="true" className={cn("h-3 w-3", isActive ? "text-foreground" : "opacity-55")} />
+        </button>
+      </div>
     </th>
   );
 }
@@ -1452,10 +1697,12 @@ function PortfolioAnalysisButton({
 
 function TradesTable({
   review,
+  holdingNames,
   deletingTradeId,
   onDelete,
 }: {
   review: PortfolioReview | null;
+  holdingNames: ReadonlyMap<string, string>;
   deletingTradeId: string | null;
   onDelete: (trade: PortfolioTrade) => void;
 }) {
@@ -1481,9 +1728,12 @@ function TradesTable({
             {trades.length === 0 ? (
               <EmptyRow colSpan={8} text="暂无最近交易记录。" />
             ) : (
-              trades.map((row, index) => (
+              trades.map((row, index) => {
+                const symbol = String(row.symbol || row.code || "");
+                const displayName = securityDisplayName(symbol, holdingNames, row.name);
+                return (
                 <tr key={`${row.recorded_at || row.trade_date || "trade"}-${row.symbol || row.code || index}-${index}`} className="border-t">
-                  <td className="px-3 py-2 font-mono">{fmtText(row.symbol || row.code)}</td>
+                  <td className="px-3 py-2 font-medium">{displayName}</td>
                   <td className="px-3 py-2">{tradeSideLabel(row.side)}</td>
                   <td className="px-3 py-2 text-right font-mono">{fmtNumber(row.quantity, 0)}</td>
                   <td className="px-3 py-2 text-right font-mono">{fmtNumber(row.price)}</td>
@@ -1493,7 +1743,7 @@ function TradesTable({
                   <td className="px-3 py-2 text-right">
                     <button
                       type="button"
-                      aria-label={`删除交易 ${fmtText(row.symbol || row.code)} ${fmtText(row.trade_date)}`}
+                      aria-label={`删除交易 ${displayName} ${fmtText(row.trade_date)}`}
                       disabled={!row.trade_id || deletingTradeId === row.trade_id}
                       onClick={() => onDelete(row)}
                       className="inline-flex items-center rounded-md border px-2 py-1.5 text-destructive hover:bg-destructive/10 disabled:opacity-50"
@@ -1504,7 +1754,8 @@ function TradesTable({
                     </button>
                   </td>
                 </tr>
-              ))
+                );
+              })
             )}
           </tbody>
         </table>
@@ -1518,22 +1769,34 @@ function CacheTable({
   expandedCachePath,
   onToggle,
   onOpenChart,
+  onOpenMarketDetails,
+  onRefreshSymbol,
+  refreshingSymbol,
+  refreshDisabled,
 }: {
   review: PortfolioReview | null;
   expandedCachePath: string | null;
   onToggle: (path: string) => void;
   onOpenChart: (group: CacheGroup) => void;
+  onOpenMarketDetails: (group: CacheGroup) => void;
+  onRefreshSymbol: (symbol: string) => void;
+  refreshingSymbol: string | null;
+  refreshDisabled: boolean;
 }) {
   const caches = review?.verified_market_cache || [];
   const holdings = review?.portfolio_state.holdings || [];
   const groups = useMemo(() => groupCacheRows(caches, holdings), [caches, holdings]);
+  const [groupExpansionOverrides, setGroupExpansionOverrides] = useState<Record<string, boolean>>({});
   return (
     <section className="grid gap-2">
       <div className="flex items-center justify-between gap-3">
-        <h2 className="flex items-center gap-2 text-sm font-semibold">
-          <Database className="h-4 w-4" />
-          校核行情缓存
-        </h2>
+        <div>
+          <h2 className="flex items-center gap-2 text-sm font-semibold">
+            <Database className="h-4 w-4" />
+            校核行情缓存
+          </h2>
+          <p className="mt-1 text-xs text-muted-foreground">仅显示当前持仓；其他历史缓存仍保留在数据中心。</p>
+        </div>
         <span className="truncate text-xs text-muted-foreground">{review?.market_cache_db || review?.verified_cache_dir}</span>
       </div>
       <div className="overflow-auto rounded-md border">
@@ -1558,32 +1821,79 @@ function CacheTable({
             {groups.length === 0 ? (
               <EmptyRow colSpan={12} text="暂无校核行情缓存。" />
             ) : (
-              groups.map((group) => (
-                <Fragment key={group.symbol}>
+              groups.map((group) => {
+                const groupVerified = group.status === "verified";
+                const groupExpanded = !groupVerified || groupExpansionOverrides[group.symbol] === true;
+                const groupLabel = `${group.name ? `${group.name} ` : ""}${group.symbol}`;
+                return <Fragment key={group.symbol}>
                   <tr className={cn("border-t-2 bg-muted/40", group.status === "unresolved_conflict" && "bg-destructive/10")} data-cache-group={group.symbol}>
                     <td colSpan={12} className="px-3 py-2.5">
                       <div className="flex flex-wrap items-center justify-between gap-3">
                         <div className="flex min-w-0 flex-wrap items-center gap-2.5">
+                          {groupVerified ? (
+                            <button
+                              type="button"
+                              onClick={() => setGroupExpansionOverrides((current) => ({
+                                ...current,
+                                [group.symbol]: !groupExpanded,
+                              }))}
+                              className="inline-flex h-7 w-7 items-center justify-center rounded border bg-background text-muted-foreground hover:text-foreground"
+                              aria-label={`${groupLabel} ${groupExpanded ? "收起" : "展开"}校核行情`}
+                              aria-expanded={groupExpanded}
+                              title={groupExpanded ? "收起该标的" : "展开该标的"}
+                            >
+                              <ChevronDown className={cn("h-4 w-4 transition-transform", !groupExpanded && "-rotate-90")} />
+                            </button>
+                          ) : <span className="inline-block h-7 w-7" aria-hidden="true" />}
                           <span className="font-mono text-sm font-semibold">{group.symbol}</span>
                           {group.name ? <span className="truncate text-xs text-muted-foreground">{group.name}</span> : null}
                           <StatusPill status={group.status} />
                           <span className="text-[11px] text-muted-foreground">
                             {group.rows.length} 个缓存 · {group.intervals.join(" / ")}
+                            {!groupExpanded && group.status === "verified" ? " · 全部校核通过，已折叠" : ""}
                           </span>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => onOpenChart(group)}
-                          className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2.5 py-1.5 text-xs font-medium hover:bg-muted"
-                          aria-label={`查看 ${group.symbol} K线`}
-                          title={`查看 ${group.symbol} 已缓存K线`}
-                        >
-                          <ChartCandlestick className="h-3.5 w-3.5" />
-                          查看K线
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => onRefreshSymbol(group.symbol)}
+                            disabled={refreshDisabled}
+                            className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2.5 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-50"
+                            aria-label={refreshingSymbol === group.symbol
+                              ? `${groupLabel} 行情刷新中`
+                              : `刷新 ${groupLabel} 行情`}
+                            title={`只刷新 ${groupLabel}`}
+                          >
+                            {refreshingSymbol === group.symbol
+                              ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              : <RefreshCw className="h-3.5 w-3.5" />}
+                            {refreshingSymbol === group.symbol ? "刷新中" : "刷新行情"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onOpenChart(group)}
+                            className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2.5 py-1.5 text-xs font-medium hover:bg-muted"
+                            aria-label={`查看 ${group.symbol} K线`}
+                            title={`查看 ${group.symbol} 已缓存K线`}
+                          >
+                            <ChartCandlestick className="h-3.5 w-3.5" />
+                            查看K线
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onOpenMarketDetails(group)}
+                            className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2.5 py-1.5 text-xs font-medium hover:bg-muted"
+                            aria-label={`${group.name ? `${group.name} ` : ""}${group.symbol} 行情详情`}
+                            title={`查看 ${group.name ? `${group.name} ` : ""}${group.symbol} 的行情详情`}
+                          >
+                            <Info className="h-3.5 w-3.5" />
+                            行情详情
+                          </button>
+                        </div>
                       </div>
                     </td>
                   </tr>
+                  {groupExpanded ? <>
                   {group.rows.map((row) => {
                     const expanded = expandedCachePath === row.path;
                     return (
@@ -1625,8 +1935,9 @@ function CacheTable({
                       </Fragment>
                     );
                   })}
-                </Fragment>
-              ))
+                  </> : null}
+                </Fragment>;
+              })
             )}
           </tbody>
         </table>
@@ -1658,6 +1969,7 @@ function groupCacheRows(caches: VerifiedMarketCacheRow[], holdings: PortfolioHol
   const grouped = new Map<string, VerifiedMarketCacheRow[]>();
   for (const row of caches) {
     const symbol = String(row.symbol || row.file_name || "未知证券").toUpperCase();
+    if (!holdingOrder.has(symbol)) continue;
     const rows = grouped.get(symbol) || [];
     rows.push(row);
     grouped.set(symbol, rows);
@@ -1675,6 +1987,7 @@ function groupCacheRows(caches: VerifiedMarketCacheRow[], holdings: PortfolioHol
         return (adjustmentOrder.get(leftAdjustment) ?? 99) - (adjustmentOrder.get(rightAdjustment) ?? 99);
       });
       const statuses = new Set(rows.map((row) => row.status || "unknown"));
+      const allVerified = rows.every((row) => row.status === "verified");
       const status = statuses.has("unresolved_conflict")
         ? "unresolved_conflict"
         : statuses.has("basis_mismatch")
@@ -1689,7 +2002,9 @@ function groupCacheRows(caches: VerifiedMarketCacheRow[], holdings: PortfolioHol
                   ? "stale"
                   : statuses.has("single_source")
                     ? "single_source"
-                    : "verified";
+                    : allVerified
+                      ? "verified"
+                      : String(rows[0]?.status || "unknown");
       return {
         symbol,
         name: holdingNames.get(symbol),
@@ -1703,6 +2018,16 @@ function groupCacheRows(caches: VerifiedMarketCacheRow[], holdings: PortfolioHol
       const rightOrder = holdingOrder.get(right.symbol) ?? Number.MAX_SAFE_INTEGER;
       return leftOrder - rightOrder || left.symbol.localeCompare(right.symbol);
     });
+}
+
+function cacheRowsForHoldings(
+  caches: VerifiedMarketCacheRow[],
+  holdings: PortfolioHolding[],
+): VerifiedMarketCacheRow[] {
+  const holdingSymbols = new Set(
+    holdings.map((holding) => holdingSymbol(holding).toUpperCase()).filter(Boolean),
+  );
+  return caches.filter((row) => holdingSymbols.has(String(row.symbol || "").toUpperCase()));
 }
 
 function CacheDetails({ row }: { row: VerifiedMarketCacheRow }) {

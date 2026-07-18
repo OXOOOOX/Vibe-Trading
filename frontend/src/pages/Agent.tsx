@@ -1,22 +1,29 @@
 ﻿import { useTranslation } from 'react-i18next';
 import { useEffect, useRef, useState, useMemo, useCallback, type FormEvent } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Send, Loader2, ArrowDown, Square, Download, Plus, Paperclip, X, Users, Target, ChevronDown, Pencil, Check, Play, OctagonX, Activity, Ban, CheckCircle2, Landmark } from "lucide-react";
+import { Send, Loader2, ArrowDown, Square, Download, Plus, Paperclip, X, Users, Target, ChevronDown, Pencil, Check, Play, OctagonX, Activity, Ban, CheckCircle2, Landmark, BookOpen } from "lucide-react";
 import { toast } from "sonner";
 import { useAgentStore } from "@/stores/agent";
 import { useSSE } from "@/hooks/useSSE";
-import { ApiError, AUTH_REQUIRED_MESSAGE, api, isAuthRequiredError, type GoalSnapshot, type MandateProposal, type MandateCommitted, type LiveAction, type LiveHalted, type LiveStatus } from "@/lib/api";
+import { ApiError, AUTH_REQUIRED_MESSAGE, api, isAuthRequiredError, type EquityResolutionOption, type GoalSnapshot, type MandateProposal, type MandateCommitted, type LiveAction, type LiveHalted, type LiveStatus } from "@/lib/api";
 import { isReportWorthyRun } from "@/lib/runReports";
-import type { AgentMessage, ToolCallEntry } from "@/types/agent";
+import { initialSessionTitle } from "@/lib/sessionTitle";
+import type { AgentMessage, ReportPreviewTarget, ToolCallEntry } from "@/types/agent";
 import { AgentAvatar } from "@/components/chat/AgentAvatar";
-import { WelcomeScreen } from "@/components/chat/WelcomeScreen";
+import { WelcomeScreen, type WelcomeMode } from "@/components/chat/WelcomeScreen";
 import { MessageBubble } from "@/components/chat/MessageBubble";
+import type { DeepReportTaskStarted } from "@/components/chat/MessageBubble";
 import { ThinkingTimeline } from "@/components/chat/ThinkingTimeline";
 import { ConversationTimeline } from "@/components/chat/ConversationTimeline";
 import { ToolProgressIndicator } from "@/components/chat/ToolProgressIndicator";
+import { DeepReportEquityPicker } from "@/components/chat/DeepReportEquityPicker";
+import { DeepReportMenuItem } from "@/components/chat/DeepReportMenuItem";
+import { ReportPreviewPanel } from "@/components/chat/ReportPreviewPanel";
+import { ResearchGoalMenuItem, SwarmTeamMenuItem } from "@/components/chat/ResearchModeMenuItem";
 import { MandateProposalCard } from "@/components/chat/MandateProposalCard";
 import { RunnerStatus } from "@/components/chat/RunnerStatus";
 import { SwarmStatusCard } from "@/components/chat/SwarmStatusCard";
+import { SessionUsagePanel } from "@/components/chat/SessionUsagePanel";
 import {
   applySwarmEvent,
   buildSwarmStatusFromStarted,
@@ -46,6 +53,19 @@ function groupMessages(msgs: AgentMessage[]): MsgGroup[] {
 
 const act = () => useAgentStore.getState();
 
+function runningToolCallId(
+  toolName: string,
+  eventCallId: unknown,
+  preference: "first" | "last" = "last",
+): string | undefined {
+  const callId = typeof eventCallId === "string" ? eventCallId.trim() : "";
+  if (callId) return callId;
+  const matches = act().toolCalls.filter(
+    (toolCall) => toolCall.tool === toolName && toolCall.status === "running",
+  );
+  return preference === "first" ? matches[0]?.id : matches[matches.length - 1]?.id;
+}
+
 // i18n hook for Agent component 鈥?used inside the component below
 // (declared at module scope for helper usage is fine since t() reads from i18n singleton)
 
@@ -55,6 +75,28 @@ const CONNECTOR_CHECK_PROMPT =
   "List my trading connector profiles, show which one is selected, then check that selected connector. If it is not ready, tell me exactly what setup step is missing. Do not place or modify orders.";
 const CONNECTOR_PORTFOLIO_PROMPT =
   "Use the selected trading connector profile to summarize my account, positions, concentration, cash, and portfolio risk. Do not place or modify orders.";
+const ACTIVE_DEEP_REPORT_PHASES = new Set([
+  "queued",
+  "resolving",
+  "financial_data",
+  "financial_standardization",
+  "industry_evidence",
+  "deterministic_calculation",
+  "chapter_writing",
+  "compiling",
+  "review",
+  "repairing",
+  "auditing",
+  "pdf",
+]);
+
+function deepReportTaskStartedMessage(action: DeepReportTaskStarted["action"]): string {
+  if (action === "refresh") return "正在使用最新可验证数据重新研究";
+  if (action === "revise") return "正在重写指定报告章节";
+  if (action === "repair") return "正在复用现有证据修复失败报告";
+  if (action === "archive") return "正在保存报告到 Obsidian";
+  return "正在继续研究并补充证据";
+}
 
 /* ---------- Connector runtime channel ----------
  * Mandate proposals and live-action chips render as standalone timeline items,
@@ -73,6 +115,19 @@ interface LiveActionItem {
   action: LiveAction;
 }
 type LiveItem = ProposalItem | LiveActionItem;
+
+interface DeepReportSelection extends EquityResolutionOption {
+  request: string;
+}
+
+function hasAvailableReportArtifact(value: unknown, artifactId: string): boolean {
+  if (!Array.isArray(value)) return false;
+  return value.some((artifact) => {
+    if (!artifact || typeof artifact !== "object") return false;
+    const item = artifact as Record<string, unknown>;
+    return String(item.artifact_id || "") === artifactId && item.available === true;
+  });
+}
 
 function normalizeBrokerScope(broker: string | null | undefined): string | null {
   const normalized = broker?.trim().toLowerCase();
@@ -222,11 +277,12 @@ export function Agent() {
   const prevSseStatusRef = useRef<string>("disconnected");
   const genRef = useRef(0);
   const pendingGoalSessionRef = useRef<string | null>(null);
+  const legacyToolCallSequenceRef = useRef(0);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const lastEventRef = useRef(0);
   const sseTimeoutMsRef = useRef(90_000);
 
-  /* tool_progress coalescing 鈥?keep latest payload per-tool, flush once per rAF. */
+  /* tool_progress coalescing — keep latest payload per invocation, flush once per rAF. */
   const pendingProgressRef = useRef<Map<string, NonNullable<ToolCallEntry["progress"]>>>(new Map());
   const progressRafRef = useRef(0);
 
@@ -241,6 +297,17 @@ export function Agent() {
   const [goalSnapshot, setGoalSnapshot] = useState<GoalSnapshot | null>(null);
   const [goalEditActive, setGoalEditActive] = useState(false);
   const [goalEditValue, setGoalEditValue] = useState("");
+  const [deepReportMode, setDeepReportMode] = useState(false);
+  const [deepReportResolution, setDeepReportResolution] = useState<DeepReportSelection | null>(null);
+  const [deepReportCandidates, setDeepReportCandidates] = useState<EquityResolutionOption[]>([]);
+  const [deepReportProgress, setDeepReportProgress] = useState<{
+    reportId?: string;
+    phase: string;
+    message: string;
+    qualityStatus?: string;
+  } | null>(null);
+  const [reportPreviewTarget, setReportPreviewTarget] = useState<ReportPreviewTarget | null>(null);
+  const activeDeepReportAttemptRef = useRef<string | null>(null);
 
   /* Connector runtime channel state (SPEC Consent 搂1/搂4/搂5) */
   const [liveItems, setLiveItems] = useState<LiveItem[]>([]);
@@ -256,6 +323,8 @@ export function Agent() {
    * items (audit M2: always-available global halt 鈥?SPEC Consent 搂4). */
   const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
   const [reasoningActive, setReasoningActive] = useState(false);
+  const [usageRefreshSignal, setUsageRefreshSignal] = useState(0);
+  const [usageForceRefreshSignal, setUsageForceRefreshSignal] = useState(0);
   /* The status endpoint is not wired on every backend; a 404/501 hides the panel
    * and removes status from the kill-switch visibility condition. */
   const [liveStatusUnavailable, setLiveStatusUnavailable] = useState(false);
@@ -270,6 +339,11 @@ export function Agent() {
   const { connect, disconnect, onStatusChange } = useSSE();
 
   const urlSessionId = searchParams.get("session");
+
+  useEffect(() => {
+    setReportPreviewTarget(null);
+    activeDeepReportAttemptRef.current = null;
+  }, [urlSessionId]);
 
   /* Smart scroll 鈥?only auto-scroll when near bottom */
   const isNearBottom = useCallback(() => {
@@ -355,13 +429,48 @@ export function Agent() {
         const meta = m.metadata as Record<string, unknown> | undefined;
         const runId = meta?.run_id as string | undefined;
         const metrics = meta?.metrics as Record<string, number> | undefined;
+        const reportId = meta?.report_id as string | undefined;
+        const reportQualityStatus = meta?.report_quality_status as AgentMessage["reportQualityStatus"];
+        const reportSymbol = meta?.report_symbol as string | undefined;
+        const reportSecurityName = meta?.report_security_name as string | undefined;
+        const reportDataAsOf = meta?.report_data_as_of as string | undefined;
+        const reportMissingModules = meta?.report_missing_modules as string[] | undefined;
+        const reportPdfAvailable = hasAvailableReportArtifact(meta?.report_artifacts, "pdf");
+        const reportMarkdownAvailable = hasAvailableReportArtifact(meta?.report_artifacts, "markdown");
+        const reportDiagnosticAvailable = hasAvailableReportArtifact(meta?.report_artifacts, "diagnostic");
+        const reportDiffAvailable = hasAvailableReportArtifact(meta?.report_artifacts, "diff");
+        const reportGenerationSource = meta?.report_generation_source as string | undefined;
+        const reportGenerationReason = meta?.report_generation_reason as string | undefined;
+        const reportRevision = typeof meta?.report_revision === "number" ? meta.report_revision : undefined;
+        const reportParentId = meta?.report_parent_id as string | undefined;
+        const reportRevisionMode = meta?.report_revision_mode as AgentMessage["reportRevisionMode"];
+        const reportDeliveryKind = meta?.report_delivery_kind as AgentMessage["reportDeliveryKind"];
+        const reportMessageMeta = {
+          runId,
+          reportId,
+          reportQualityStatus,
+          reportSymbol,
+          reportSecurityName,
+          reportDataAsOf,
+          reportMissingModules,
+          reportPdfAvailable,
+          reportMarkdownAvailable,
+          reportDiagnosticAvailable,
+          reportDiffAvailable,
+          reportGenerationSource,
+          reportGenerationReason,
+          reportRevision,
+          reportParentId,
+          reportRevisionMode,
+          reportDeliveryKind,
+        };
         const ts = new Date(m.created_at).getTime();
         if (m.role === "user") {
           agentMsgs.push({ id: m.message_id, sourceMessageId: m.message_id, type: "user", content: m.content, timestamp: ts });
         } else if (runId) {
           // Show text answer first (if non-empty), then chart card
           if (m.content && m.content !== "Strategy execution completed.") {
-            agentMsgs.push({ id: m.message_id + "_ans", sourceMessageId: m.message_id, type: "answer", content: m.content, timestamp: ts });
+            agentMsgs.push({ id: m.message_id + "_ans", sourceMessageId: m.message_id, type: "answer", content: m.content, timestamp: ts, ...reportMessageMeta });
           }
           if (metrics && Object.keys(metrics).length > 0) {
             agentMsgs.push({ id: m.message_id, sourceMessageId: m.message_id, type: "run_complete", content: "", runId, metrics, timestamp: ts + 1 });
@@ -396,7 +505,7 @@ export function Agent() {
             }
           }
         } else {
-          agentMsgs.push({ id: m.message_id, sourceMessageId: m.message_id, type: "answer", content: m.content, timestamp: ts });
+          agentMsgs.push({ id: m.message_id, sourceMessageId: m.message_id, type: "answer", content: m.content, timestamp: ts, ...reportMessageMeta });
         }
       }
       if (genRef.current !== gen) return;
@@ -420,16 +529,29 @@ export function Agent() {
     for (let i = 0; i < 3; i += 1) {
       try {
         const storedMessages = await api.getSessionMessages(sid);
-        const completed = storedMessages.some(
+        const completedMessage = storedMessages.find(
           (message) => message.role === "assistant" && message.linked_attempt_id === attemptId,
         );
-        if (completed) {
+        if (completedMessage) {
           if (act().sessionId !== sid) return true;
+          const meta = completedMessage.metadata as Record<string, unknown> | undefined;
+          const reportId = String(meta?.report_id || "");
+          if (reportId) {
+            const failedValidation = meta?.report_quality_status === "failed_validation";
+            setReportPreviewTarget({
+              reportId,
+              artifactId: failedValidation ? "diagnostic" : "markdown",
+              title: `${String(meta?.report_security_name || meta?.report_symbol || "单股")}穿透式深度研究`,
+            });
+          }
           setReasoningActive(false);
           act().clearStreaming();
           act().setStatus("idle");
           useAgentStore.setState({ toolCalls: [] });
           await refreshSessionMessages(sid);
+          if (activeDeepReportAttemptRef.current === attemptId) {
+            activeDeepReportAttemptRef.current = null;
+          }
           return true;
         }
       } catch {
@@ -473,9 +595,16 @@ export function Agent() {
         touch();
         setReasoningActive(false);
         const toolName = String(d.tool || "");
+        const backendCallId = String(d.tool_call_id || "").trim();
+        const legacyCallId = [
+          String(d.attempt_id || "attempt"),
+          String(d.iter || "iteration"),
+          toolName || "tool",
+          String(++legacyToolCallSequenceRef.current),
+        ].join(":");
         // Only update toolCalls tracker (no message creation during streaming)
         act().addToolCall({
-          id: toolName, tool: toolName,
+          id: backendCallId || legacyCallId, tool: toolName,
           arguments: (d.arguments as Record<string, string>) ?? {},
           status: "running", timestamp: Date.now(),
         });
@@ -485,10 +614,12 @@ export function Agent() {
       tool_result: (d) => {
         touch();
         const toolName = String(d.tool || "");
-        // Drop any in-flight coalesced progress for this tool.
-        pendingProgressRef.current.delete(toolName);
+        const toolCallId = runningToolCallId(toolName, d.tool_call_id, "first");
+        if (!toolCallId) return;
+        // Drop any in-flight coalesced progress for this invocation.
+        pendingProgressRef.current.delete(toolCallId);
         // Only update tracker (no message creation during streaming)
-        act().updateToolCall(toolName, {
+        act().updateToolCall(toolCallId, {
           status: d.status === "ok" ? "ok" : "error",
           preview: String(d.preview || ""),
           elapsed_ms: Number(d.elapsed_ms || 0),
@@ -509,7 +640,9 @@ export function Agent() {
         if (act().status !== "streaming") act().setStatus("streaming");
         const toolName = String(d.tool || "");
         if (!toolName) return;
-        act().updateToolCall(toolName, {
+        const toolCallId = runningToolCallId(toolName, d.tool_call_id);
+        if (!toolCallId) return;
+        act().updateToolCall(toolCallId, {
           elapsed_s: Number(d.elapsed_s || 0),
         });
       },
@@ -518,27 +651,34 @@ export function Agent() {
         touch();
         const toolName = String(d.tool || "");
         if (!toolName) return;
+        const toolCallId = runningToolCallId(toolName, d.tool_call_id);
+        if (!toolCallId) return;
         const payload: NonNullable<ToolCallEntry["progress"]> = {};
         if (typeof d.stage === "string" && d.stage) payload.stage = d.stage;
         if (typeof d.message === "string" && d.message) payload.message = d.message;
         if (typeof d.current === "number") payload.current = d.current;
         if (typeof d.total === "number") payload.total = d.total;
-        // Coalesce: keep latest payload per tool, flush once per animation frame.
-        pendingProgressRef.current.set(toolName, payload);
+        // Coalesce: keep latest payload per invocation, flush once per animation frame.
+        pendingProgressRef.current.set(toolCallId, payload);
         if (progressRafRef.current) return;
         progressRafRef.current = requestAnimationFrame(() => {
           progressRafRef.current = 0;
           const pending = pendingProgressRef.current;
           if (pending.size === 0) return;
           const store = act();
-          for (const [tool, progress] of pending) {
-            store.updateToolCall(tool, { progress });
+          for (const [toolCallId, progress] of pending) {
+            store.updateToolCall(toolCallId, { progress });
           }
           pending.clear();
         });
       },
 
       compact: () => { touch(); },
+
+      "usage.updated": () => {
+        touch();
+        setUsageRefreshSignal((value) => value + 1);
+      },
 
       "attempt.created": () => {
         touch();
@@ -554,8 +694,63 @@ export function Agent() {
         if (act().status !== "streaming") act().setStatus("streaming");
       },
 
+      "report.started": (d) => {
+        const eventAttemptId = String(d.attempt_id || "");
+        if (activeDeepReportAttemptRef.current && eventAttemptId && activeDeepReportAttemptRef.current !== eventAttemptId) return;
+        touch();
+        setDeepReportProgress({
+          reportId: String(d.report_id || "") || undefined,
+          phase: String(d.phase || "financial_data"),
+          message: "正在采集财务、市场和产业证据",
+        });
+      },
+
+      "report.progress": (d) => {
+        const eventAttemptId = String(d.attempt_id || "");
+        if (activeDeepReportAttemptRef.current && eventAttemptId && activeDeepReportAttemptRef.current !== eventAttemptId) return;
+        touch();
+        setDeepReportProgress((current) => ({
+          reportId: String(d.report_id || current?.reportId || "") || undefined,
+          phase: String(d.phase || current?.phase || "research"),
+          message: String(d.message || current?.message || "正在生成穿透式深度研究"),
+        }));
+      },
+
+      "report.completed": (d) => {
+        const eventAttemptId = String(d.attempt_id || "");
+        if (activeDeepReportAttemptRef.current && eventAttemptId && activeDeepReportAttemptRef.current !== eventAttemptId) return;
+        touch();
+        const qualityStatus = String(d.quality_status || "passed_with_gaps");
+        const failedValidation = qualityStatus === "failed_validation";
+        setDeepReportProgress({
+          reportId: String(d.report_id || "") || undefined,
+          phase: failedValidation ? "failed_validation" : "completed",
+          message: failedValidation
+            ? "校验失败：仅生成诊断结果，未形成正式投资结论"
+            : qualityStatus === "passed"
+              ? "报告已完成并通过校验"
+              : "报告已完成，存在已标明的数据缺口",
+          qualityStatus,
+        });
+        const reportId = String(d.report_id || "");
+        if (reportId) {
+          setReportPreviewTarget({
+            reportId,
+            artifactId: failedValidation ? "diagnostic" : "markdown",
+            title: `${String(d.security_name || d.symbol || "单股")}穿透式深度研究`,
+          });
+        }
+        if (eventAttemptId && activeDeepReportAttemptRef.current === eventAttemptId) {
+          activeDeepReportAttemptRef.current = null;
+        }
+        if (qualityStatus === "failed_validation") toast.warning("报告尚未达到发布要求，可查看未发布原因");
+        else if (qualityStatus === "passed_with_gaps") toast.warning("报告已完成，部分结论因公开证据不足而保留");
+        else toast.success("穿透式深度研究已完成");
+      },
+
       "attempt.completed": async (d) => {
         touch();
+        setUsageForceRefreshSignal((value) => value + 1);
         setReasoningActive(false);
         const s = act();
         // Build ThinkingTimeline summary from accumulated toolCalls
@@ -575,8 +770,37 @@ export function Agent() {
         // Add final answer
         const runDir = String(d.run_dir || "");
         const runId = runDir ? runDir.split(/[/\\]/).pop() : undefined;
-        const summary = String(d.summary || "");
-        if (summary) s.addMessage({ id: "", type: "answer", content: summary, timestamp: Date.now() });
+        const isDeepReport = Boolean(d.report_id);
+        const summary = String(
+          isDeepReport
+            ? d.delivery_message || "穿透式深度研究已完成，请打开 Markdown 产物查看。"
+            : d.summary || "",
+        );
+        if (summary) s.addMessage({
+          id: "",
+          type: "answer",
+          content: summary,
+          timestamp: Date.now(),
+          runId,
+          reportId: String(d.report_id || "") || undefined,
+          reportQualityStatus: (String(d.report_quality_status || "") || undefined) as AgentMessage["reportQualityStatus"],
+          reportSymbol: String(d.report_symbol || "") || undefined,
+          reportSecurityName: String(d.report_security_name || "") || undefined,
+          reportDataAsOf: String(d.report_data_as_of || "") || undefined,
+          reportMissingModules: Array.isArray(d.report_missing_modules)
+            ? d.report_missing_modules.map(String)
+            : undefined,
+          reportPdfAvailable: hasAvailableReportArtifact(d.report_artifacts, "pdf"),
+          reportMarkdownAvailable: hasAvailableReportArtifact(d.report_artifacts, "markdown"),
+          reportDiagnosticAvailable: hasAvailableReportArtifact(d.report_artifacts, "diagnostic"),
+          reportDiffAvailable: hasAvailableReportArtifact(d.report_artifacts, "diff"),
+          reportGenerationSource: String(d.report_generation_source || "") || undefined,
+          reportGenerationReason: String(d.report_generation_reason || "") || undefined,
+          reportRevision: Number.isFinite(Number(d.report_revision)) ? Number(d.report_revision) : undefined,
+          reportParentId: String(d.report_parent_id || "") || undefined,
+          reportRevisionMode: (String(d.report_revision_mode || "") || undefined) as AgentMessage["reportRevisionMode"],
+          reportDeliveryKind: (String(d.report_delivery_kind || "") || undefined) as AgentMessage["reportDeliveryKind"],
+        });
 
         // Detect Shadow Account id if render_shadow_report fired successfully this turn
         const shadowCall = completedTools.find(
@@ -586,7 +810,7 @@ export function Agent() {
         const shadowId = shadowMatch?.[1];
 
         // Show RunCompleteCard when the turn produced backtest metrics or a shadow report
-        if (runId) {
+        if (runId && !isDeepReport) {
           let runMetrics: Record<string, number> | undefined;
           let runCurve: Array<{ time: string; equity: number }> | undefined;
           let showCard = false;
@@ -615,16 +839,25 @@ export function Agent() {
 
         // Reset
         s.setStatus("idle");
+        const completedAttemptId = String(d.attempt_id || "");
+        if (completedAttemptId && activeDeepReportAttemptRef.current === completedAttemptId) {
+          activeDeepReportAttemptRef.current = null;
+        }
         useAgentStore.setState({ toolCalls: [] });
         scrollToBottom();
       },
 
       "attempt.failed": (d) => {
         touch();
+        setUsageForceRefreshSignal((value) => value + 1);
         setReasoningActive(false);
         act().clearStreaming();
         act().addMessage({ id: "", type: "error", content: String(d.error || "Execution failed"), timestamp: Date.now() });
         act().setStatus("idle");
+        const failedAttemptId = String(d.attempt_id || "");
+        if (failedAttemptId && activeDeepReportAttemptRef.current === failedAttemptId) {
+          activeDeepReportAttemptRef.current = null;
+        }
         // Clear stale toolCalls so the next turn's running indicator doesn't
         // briefly show the previous turn's progress before fresh events land.
         useAgentStore.setState({ toolCalls: [] });
@@ -633,10 +866,12 @@ export function Agent() {
 
       "attempt.cancelled": () => {
         touch();
+        setUsageForceRefreshSignal((value) => value + 1);
         setReasoningActive(false);
         act().clearStreaming();
         act().addMessage({ id: "", type: "answer", content: "Execution cancelled.", timestamp: Date.now() });
         act().setStatus("idle");
+        activeDeepReportAttemptRef.current = null;
         useAgentStore.setState({ toolCalls: [] });
         scrollToBottom();
       },
@@ -867,7 +1102,7 @@ export function Agent() {
     return () => clearInterval(timer);
   }, [status]);
 
-  const runPrompt = async (prompt: string) => {
+  const runPrompt = async (prompt: string, confirmedDeepReport?: DeepReportSelection) => {
     if (!prompt.trim() || status === "streaming") return;
 
     if (goalComposerActive) {
@@ -894,7 +1129,50 @@ export function Agent() {
       return;
     }
 
+    const selectedDeepReportMode = deepReportMode;
+    const normalizedPrompt = prompt.trim();
+    const selectedResolution = confirmedDeepReport ?? deepReportResolution;
+    if (
+      selectedDeepReportMode
+      && (!selectedResolution || selectedResolution.request !== normalizedPrompt)
+    ) {
+      setDeepReportCandidates([]);
+      setDeepReportProgress({ phase: "resolving", message: "正在确认上市公司与股票代码" });
+      try {
+        const resolution = await api.resolveDeepReportEquity(normalizedPrompt);
+        const candidates = resolution.status === "resolved" && resolution.symbol && resolution.security_name
+          ? [{
+              symbol: resolution.symbol,
+              security_name: resolution.security_name,
+              market: resolution.market,
+              source: resolution.source,
+            }]
+          : resolution.options.slice(0, 5);
+        if (candidates.length > 0) {
+          setDeepReportCandidates(candidates);
+          const message = candidates.length === 1
+            ? `已找到 ${candidates[0].security_name}（${candidates[0].symbol}），请确认后开始研究`
+            : `已找到 ${candidates.length} 个候选，请选择正确的上市公司`;
+          setDeepReportProgress({ phase: "identity_candidates", message });
+          return;
+        }
+        const message = "没有找到匹配的上市公司。请换用公司全称、常用简称或股票代码重试。";
+        setDeepReportProgress({ phase: "identity_gap", message });
+        toast.error(message);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "证券识别失败";
+        setDeepReportProgress({ phase: "identity_gap", message });
+        toast.error(message);
+      }
+      return;
+    }
     let finalPrompt = prompt;
+    if (selectedDeepReportMode && selectedResolution) {
+      finalPrompt = (
+        `研究对象已由用户确认：${selectedResolution.security_name}（${selectedResolution.symbol}）。\n`
+        + `用户原始请求：${prompt}`
+      );
+    }
 
     // Swarm mode: let agent auto-select the right preset
     if (swarmPreset) {
@@ -907,6 +1185,9 @@ export function Agent() {
       setAttachment(null);
     }
     setInput("");
+    if (selectedDeepReportMode) {
+      setDeepReportProgress({ phase: "queued", message: "穿透式深度研究已进入队列" });
+    }
     act().addMessage({ id: "", type: "user", content: finalPrompt, timestamp: Date.now() });
     act().setStatus("streaming");
     forceScrollToBottom();
@@ -915,13 +1196,33 @@ export function Agent() {
     try {
       let sid = act().sessionId;
       if (!sid) {
-        const session = await api.createSession(prompt.slice(0, 50));
+        const session = await api.createSession(initialSessionTitle(
+          prompt,
+          selectedDeepReportMode && selectedResolution
+            ? {
+                securityName: selectedResolution.security_name,
+                symbol: selectedResolution.symbol,
+              }
+            : undefined,
+        ));
         sid = session.session_id;
         act().setSessionId(sid);
         setSearchParams({ session: sid }, { replace: true });
       }
       setupSSE(sid);
-      const sent = await api.sendMessage(sid, finalPrompt);
+      const sent = await api.sendMessage(
+        sid,
+        finalPrompt,
+        selectedDeepReportMode
+          ? { responseMode: "deep_report", reportProfile: "equity_deep_research" }
+          : { responseMode: "chat" },
+      );
+      if (selectedDeepReportMode) {
+        activeDeepReportAttemptRef.current = sent.attempt_id;
+        setDeepReportMode(false);
+        setDeepReportResolution(null);
+        setDeepReportCandidates([]);
+      }
       void syncCompletedAttempt(sid, sent.attempt_id);
     } catch (error) {
       act().setStatus("error");
@@ -929,6 +1230,35 @@ export function Agent() {
       toast.error(message);
       act().addMessage({ id: "", type: "error", content: message, timestamp: Date.now() });
     }
+  };
+
+  const handleWelcomeDraft = useCallback((draft: string) => {
+    setInput(draft);
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }, []);
+
+  const handleWelcomeModeSelect = useCallback((mode: WelcomeMode) => {
+    setShowUploadMenu(false);
+    setSwarmPreset(null);
+    setGoalComposerActive(mode === "researchGoal");
+    setDeepReportMode(mode === "deepReport");
+    setDeepReportProgress(null);
+    setDeepReportResolution(null);
+    setDeepReportCandidates([]);
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }, []);
+
+  const confirmDeepReportCandidate = (candidate: EquityResolutionOption) => {
+    const normalizedPrompt = input.trim();
+    if (!normalizedPrompt || status === "streaming") return;
+    const selection: DeepReportSelection = { request: normalizedPrompt, ...candidate };
+    setDeepReportResolution(selection);
+    setDeepReportCandidates([]);
+    setDeepReportProgress({
+      phase: "identity_confirmed",
+      message: `已确认 ${candidate.security_name}（${candidate.symbol}），正在创建研究任务`,
+    });
+    void runPrompt(normalizedPrompt, selection);
   };
 
   const ensureGoalSession = useCallback(async (title: string): Promise<string> => {
@@ -1090,6 +1420,36 @@ export function Agent() {
     }
   }, [forceScrollToBottom, messages, sessionId, setupSSE, status, syncCompletedAttempt, t]);
 
+  const handleDeepReportTaskStarted = useCallback((task: DeepReportTaskStarted) => {
+    const sid = act().sessionId || sessionId;
+    if (!sid) return;
+    const createsRevision = task.action === "refresh" || task.action === "revise" || task.action === "repair";
+    activeDeepReportAttemptRef.current = createsRevision ? task.attemptId : null;
+    const wasAlreadyStreaming = act().status === "streaming";
+    setupSSE(sid);
+    setReasoningActive(false);
+    act().clearStreaming();
+    useAgentStore.setState({ toolCalls: [] });
+    act().setStatus("streaming");
+    setDeepReportMode(false);
+    setDeepReportResolution(null);
+    setDeepReportCandidates([]);
+    if (createsRevision) {
+      setDeepReportProgress((current) => {
+        if (wasAlreadyStreaming && current && ACTIVE_DEEP_REPORT_PHASES.has(current.phase)) {
+          return current;
+        }
+        return {
+          reportId: task.reportId,
+          phase: "queued",
+          message: deepReportTaskStartedMessage(task.action),
+        };
+      });
+    }
+    window.setTimeout(forceScrollToBottom, 0);
+    void syncCompletedAttempt(sid, task.attemptId);
+  }, [forceScrollToBottom, sessionId, setupSSE, syncCompletedAttempt]);
+
   const handleFork = useCallback(async (msg: AgentMessage) => {
     if (!sessionId || !msg.sourceMessageId) return;
     try {
@@ -1212,7 +1572,14 @@ export function Agent() {
   const liveIsHalted = isGlobalLiveHalt(liveHalted) || (liveStatus?.global_halted ?? false);
 
   return (
-    <div className="flex flex-col flex-1 min-w-0 overflow-hidden h-full">
+    <div className="relative flex h-full flex-1 min-w-0 overflow-hidden">
+      <SessionUsagePanel
+        sessionId={sessionId}
+        running={status === "streaming"}
+        refreshSignal={usageRefreshSignal}
+        forceRefreshSignal={usageForceRefreshSignal}
+      />
+      <div className="flex h-full flex-1 min-w-0 flex-col overflow-hidden">
       <div ref={listRef} className="flex-1 overflow-auto p-6 scroll-smooth relative">
         <div className="max-w-3xl mx-auto space-y-4">
           {sessionLoading && (
@@ -1228,7 +1595,13 @@ export function Agent() {
               ))}
             </div>
           )}
-          {!sessionLoading && messages.length === 0 && <WelcomeScreen onExample={runPrompt} />}
+          {!sessionLoading && messages.length === 0 && (
+            <WelcomeScreen
+              onExample={runPrompt}
+              onDraft={handleWelcomeDraft}
+              onModeSelect={handleWelcomeModeSelect}
+            />
+          )}
 
           {timelineRows.map((row, rowIdx) => {
             if (row.render === "live") {
@@ -1271,6 +1644,9 @@ export function Agent() {
                   onFork={g.msg.type === "answer" ? handleFork : undefined}
                   canEdit={g.msg.type === "user" && g.msg.id === latestUserMessageId && status !== "streaming"}
                   onEdit={handleEditUserMessage}
+                  onPreviewReport={setReportPreviewTarget}
+                  deepReportBusy={status === "streaming"}
+                  onDeepReportTaskStarted={handleDeepReportTaskStarted}
                 />
               </div>
             );
@@ -1300,7 +1676,9 @@ export function Agent() {
                 )}
                 {streamingText && (
                   <div className="prose prose-sm dark:prose-invert max-w-none leading-relaxed">
-                    {streamingText}
+                    {activeDeepReportAttemptRef.current
+                      ? "正在收集并核验财务、行业和市场资料…"
+                      : streamingText}
                     <span className="inline-block w-0.5 h-4 bg-primary ml-0.5 animate-pulse align-middle" />
                   </div>
                 )}
@@ -1349,6 +1727,36 @@ export function Agent() {
               </span>
             </div>
           )}
+          {(deepReportMode || deepReportProgress) && (
+            <div className="flex items-center gap-1">
+              <span className="inline-flex max-w-full items-center gap-1.5 rounded-lg bg-cyan-500/10 px-2.5 py-1 text-xs font-medium text-cyan-700 dark:text-cyan-300">
+                {deepReportProgress && ["queued", "resolving", "financial_data", "financial_standardization", "industry_evidence", "deterministic_calculation", "chapter_writing", "compiling", "review", "repairing", "auditing", "pdf"].includes(deepReportProgress.phase) ? (
+                  <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+                ) : (
+                  <BookOpen className="h-3 w-3 shrink-0" />
+                )}
+                <span className="truncate">
+                  {deepReportProgress?.message || "单股穿透式深度研究"}
+                </span>
+                {deepReportProgress?.qualityStatus && (
+                  <span className="shrink-0 font-mono text-[10px]">{deepReportProgress.qualityStatus}</span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => { setDeepReportMode(false); setDeepReportProgress(null); setDeepReportResolution(null); setDeepReportCandidates([]); }}
+                  className="shrink-0 hover:text-destructive"
+                  aria-label="关闭穿透式研究状态"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </span>
+            </div>
+          )}
+          <DeepReportEquityPicker
+            candidates={deepReportCandidates}
+            disabled={status === "streaming"}
+            onConfirm={confirmDeepReportCandidate}
+          />
           {goalComposerActive && (
             <div className="flex items-center gap-1">
               <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-primary/10 text-primary text-xs font-medium">
@@ -1596,32 +2004,40 @@ export function Agent() {
                     {t('agent.uploadPdf')}
                   </button>
                   <div className="border-t my-1" />
-                  <button
-                    type="button"
-                    onClick={() => {
+                  <ResearchGoalMenuItem
+                    onSelect={() => {
                       setShowUploadMenu(false);
                       setSwarmPreset(null);
+                      setDeepReportMode(false);
+                      setDeepReportResolution(null);
+                      setDeepReportCandidates([]);
                       setGoalComposerActive(true);
                       inputRef.current?.focus();
                     }}
-                    className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
-                  >
-                    <Target className="h-4 w-4" />
-                    {t('agent.newResearchGoal')}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
+                  />
+                  <DeepReportMenuItem
+                    onSelect={() => {
                       setShowUploadMenu(false);
                       setGoalComposerActive(false);
+                      setSwarmPreset(null);
+                      setDeepReportMode(true);
+                      setDeepReportProgress(null);
+                      setDeepReportResolution(null);
+                      setDeepReportCandidates([]);
+                      inputRef.current?.focus();
+                    }}
+                  />
+                  <SwarmTeamMenuItem
+                    onSelect={() => {
+                      setShowUploadMenu(false);
+                      setGoalComposerActive(false);
+                      setDeepReportMode(false);
+                      setDeepReportResolution(null);
+                      setDeepReportCandidates([]);
                       setSwarmPreset({ name: "auto", title: "Agent Swarm" });
                       inputRef.current?.focus();
                     }}
-                    className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
-                  >
-                    <Users className="h-4 w-4" />
-                    {t('agent.runSwarmTeam')}
-                  </button>
+                  />
                   <div className="border-t my-1" />
                   <button
                     type="button"
@@ -1659,7 +2075,14 @@ export function Agent() {
               ref={inputRef}
               value={input}
               rows={1}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={(e) => {
+                setInput(e.target.value);
+                setDeepReportCandidates([]);
+                if (deepReportResolution?.request !== e.target.value.trim()) {
+                  setDeepReportResolution(null);
+                  if (deepReportMode) setDeepReportProgress(null);
+                }
+              }}
               onCompositionStart={() => {
                 isComposingRef.current = true;
               }}
@@ -1690,6 +2113,8 @@ export function Agent() {
               placeholder={
                 goalComposerActive
                   ? t('agent.describeGoal')
+                  : deepReportMode
+                    ? "输入一家上市公司名称或准确股票代码，生成穿透式深度研究"
                   : t('agent.placeholder')
               }
               className="flex-1 px-4 py-2.5 rounded-xl border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow resize-none max-h-32 overflow-y-auto"
@@ -1726,6 +2151,13 @@ export function Agent() {
           </div>
         </div>
       </form>
+      </div>
+      {reportPreviewTarget && (
+        <ReportPreviewPanel
+          target={reportPreviewTarget}
+          onClose={() => setReportPreviewTarget(null)}
+        />
+      )}
     </div>
   );
 }
