@@ -432,6 +432,7 @@ class OpenAICodexLLM:
         tools: list[dict[str, Any]] | None = None,
         reasoning_effort: str | None = None,
         codex_url: str | None = None,
+        max_output_tokens: int | None = None,
     ) -> None:
         if httpx is None:
             raise RuntimeError("OpenAI Codex OAuth requires httpx. Install dependencies first.")
@@ -440,6 +441,9 @@ class OpenAICodexLLM:
         self.timeout = timeout
         self.tools = tools or []
         self.reasoning_effort = reasoning_effort
+        self.max_output_tokens = (
+            max(1, int(max_output_tokens)) if max_output_tokens is not None else None
+        )
         self.codex_url = validate_codex_base_url(
             codex_url or os.getenv("OPENAI_CODEX_BASE_URL", DEFAULT_CODEX_URL)
         )
@@ -452,6 +456,36 @@ class OpenAICodexLLM:
             tools=tools,
             reasoning_effort=self.reasoning_effort,
             codex_url=self.codex_url,
+            max_output_tokens=self.max_output_tokens,
+        )
+
+    def bind(self, **kwargs: Any) -> "OpenAICodexLLM":
+        """Return a clone retaining the requested client-side output ceiling.
+
+        The ChatGPT Codex Responses endpoint rejects the public Responses API
+        ``max_output_tokens`` field.  Callers therefore enforce this value from
+        provider-reported usage after the response instead of putting it on the
+        wire.  Retaining it here keeps the adapter compatible with LangChain's
+        ``bind(max_tokens=...)`` surface without pretending the endpoint accepts
+        a server-side cap.
+        """
+
+        value = kwargs.pop("max_tokens", kwargs.pop("max_output_tokens", None))
+        if kwargs:
+            raise TypeError(
+                "unsupported OpenAI Codex bind arguments: "
+                + ",".join(sorted(str(key) for key in kwargs))
+            )
+        return OpenAICodexLLM(
+            model=self.model,
+            temperature=self.temperature,
+            timeout=self.timeout,
+            tools=self.tools,
+            reasoning_effort=self.reasoning_effort,
+            codex_url=self.codex_url,
+            max_output_tokens=(
+                self.max_output_tokens if value is None else max(1, int(value))
+            ),
         )
 
     def _body(self, messages: list[dict[str, Any]], *, stream: bool) -> dict[str, Any]:

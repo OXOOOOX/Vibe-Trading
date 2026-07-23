@@ -10,9 +10,12 @@ from src.session.events import EventBus
 from src.session.models import Attempt, AttemptStatus
 from src.session.service import (
     _EQUITY_DEEP_REPORT_MAX_ITERATIONS,
+    _MONITOR_STRUCTURAL_REFRESH_MAX_ITERATIONS,
+    _MONITOR_STRUCTURAL_REFRESH_MAX_TOTAL_TOKENS,
     _STANDARD_AGENT_MAX_ITERATIONS,
     SessionService,
 )
+from src.reports.execution_policy import resolve_agent_execution_limits
 from src.session.store import SessionStore
 
 
@@ -26,10 +29,23 @@ class _DummyIndex:
 
 class _DummyAgentLoop:
     observed_max_iterations: list[int] = []
+    observed_max_total_tokens: list[int | None] = []
 
-    def __init__(self, *, registry, llm, event_callback, max_iterations, persistent_memory, usage_recorder) -> None:
-        del registry, llm, event_callback, persistent_memory, usage_recorder
+    def __init__(
+        self,
+        *,
+        registry,
+        llm,
+        event_callback,
+        max_iterations,
+        max_total_tokens,
+        persistent_memory,
+        usage_recorder,
+        **kwargs,
+    ) -> None:
+        del registry, llm, event_callback, persistent_memory, usage_recorder, kwargs
         self.observed_max_iterations.append(max_iterations)
+        self.observed_max_total_tokens.append(max_total_tokens)
 
     def run(self, *, user_message: str, history, session_id: str) -> dict[str, str]:
         del user_message, history, session_id
@@ -78,10 +94,22 @@ def test_run_with_agent_keeps_event_loop_responsive_during_registry_build(
     assert tick_times, "Expected the event loop ticker to run while registry build was pending"
     assert tick_times[0] < 0.18, f"Registry build blocked the event loop for too long: {tick_times[0]:.3f}s"
     assert _DummyAgentLoop.observed_max_iterations[-1] == _STANDARD_AGENT_MAX_ITERATIONS
+    assert _DummyAgentLoop.observed_max_total_tokens[-1] is None
 
 
 def test_equity_deep_report_has_dedicated_iteration_budget() -> None:
     assert _EQUITY_DEEP_REPORT_MAX_ITERATIONS > _STANDARD_AGENT_MAX_ITERATIONS
+
+
+def test_monitor_structural_refresh_has_bounded_agent_budget() -> None:
+    limits = resolve_agent_execution_limits(
+        is_deep_report=True,
+        generation_source="portfolio_monitor_structural_refresh",
+    )
+
+    assert limits.max_iterations == _MONITOR_STRUCTURAL_REFRESH_MAX_ITERATIONS == 20
+    assert limits.max_total_tokens == _MONITOR_STRUCTURAL_REFRESH_MAX_TOTAL_TOKENS == 240_000
+    assert limits.max_iterations < _EQUITY_DEEP_REPORT_MAX_ITERATIONS
 
 
 def test_deep_report_gate_defaults_to_disabled(monkeypatch) -> None:

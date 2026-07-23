@@ -30,6 +30,13 @@
     "model_discovery": "codex_oauth",
     "models": [
       {
+        "id": "openai-codex/gpt-5.3-codex-spark",
+        "label": "GPT-5.3-Codex-Spark",
+        "description": "Live coding model tested by this project.",
+        "default_reasoning_effort": "medium",
+        "reasoning_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"]
+      },
+      {
         "id": "openai-codex/gpt-5.6-sol",
         "label": "GPT-5.6 Sol",
         "description": "Frontier model for complex professional research and coding.",

@@ -47,7 +47,7 @@ def settings_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClie
     env_example = tmp_path / ".env.example"
     env_example.write_text(
         "VIBE_TRADING_DEEP_REPORT_ENABLED=1\n"
-        "VIBE_TRADING_DEEP_REPORT_PROFILES=equity_deep_research\n"
+        "VIBE_TRADING_DEEP_REPORT_PROFILES=equity_deep_research,etf_deep_research\n"
         "VIBE_TRADING_DEEP_RESEARCH_ENGINE=provider\n"
         "VIBE_TRADING_CODEX_DEEP_RESEARCH_ENABLED=0\n",
         encoding="utf-8",
@@ -56,7 +56,7 @@ def settings_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClie
     monkeypatch.setattr(api_server, "ENV_EXAMPLE_PATH", env_example)
     monkeypatch.delenv("API_AUTH_KEY", raising=False)
     monkeypatch.setenv("VIBE_TRADING_DEEP_REPORT_ENABLED", "1")
-    monkeypatch.setenv("VIBE_TRADING_DEEP_REPORT_PROFILES", "equity_deep_research")
+    monkeypatch.setenv("VIBE_TRADING_DEEP_REPORT_PROFILES", "equity_deep_research,etf_deep_research")
     monkeypatch.setenv("VIBE_TRADING_DEEP_RESEARCH_ENGINE", "provider")
     monkeypatch.setenv("VIBE_TRADING_CODEX_DEEP_RESEARCH_ENABLED", "0")
     return TestClient(api_server.app, client=("127.0.0.1", 51000))
@@ -418,10 +418,11 @@ def test_local_client_launches_only_fixed_login_command(
     ("profile", "revision_mode", "expected_tools"),
     [
         ("equity_deep_research", "initial", {"analyze_financial_snapshot", "report_workspace"}),
+        ("etf_deep_research", "initial", {"get_fund_flow", "report_workspace"}),
         ("equity_deep_research", "repair", {"report_workspace"}),
     ],
 )
-def test_session_routes_equity_deep_report_to_codex_without_provider_fallback(
+def test_session_routes_all_deep_report_profiles_to_codex_without_provider_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     profile: str,

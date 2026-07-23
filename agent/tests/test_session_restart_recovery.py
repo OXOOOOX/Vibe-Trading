@@ -68,6 +68,35 @@ def test_restart_recovery_closes_orphaned_deep_report_and_is_idempotent(
     assert len(service.store.get_messages(session.session_id)) == 1
 
 
+def test_restart_recovery_gives_chat_retry_instead_of_report_revision_action(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    session = service.store.create_session(Session(title="ordinary chat"))
+    attempt = service.store.create_attempt(
+        Attempt(
+            session_id=session.session_id,
+            status=AttemptStatus.RUNNING,
+            metadata={"response_mode": "chat"},
+        )
+    )
+
+    assert service.recover_interrupted_attempts() == 1
+
+    recovered = service.store.get_attempt(session.session_id, attempt.attempt_id)
+    assert recovered is not None
+    assert recovered.status == AttemptStatus.FAILED
+    assert "重新发送上一条请求" in str(recovered.error)
+    assert "revision" not in str(recovered.error)
+    replies = [
+        message
+        for message in service.store.get_messages(session.session_id)
+        if message.linked_attempt_id == attempt.attempt_id and message.role == "assistant"
+    ]
+    assert len(replies) == 1
+    assert replies[0].content == recovered.error
+
+
 def test_restart_recovery_preserves_already_published_report(tmp_path: Path) -> None:
     service = _service(tmp_path)
     session = service.store.create_session(Session(title="published"))

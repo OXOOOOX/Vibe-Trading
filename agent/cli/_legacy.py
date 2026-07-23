@@ -4506,7 +4506,7 @@ _PROVIDER_CHOICES: list[dict[str, str | None]] = [
         "key_env": None,
         "base_env": "OPENAI_CODEX_BASE_URL",
         "base_url": "https://chatgpt.com/backend-api/codex/responses",
-        "model": "openai-codex/gpt-5.3-codex",
+        "model": "openai-codex/gpt-5.6-terra",
         "key_prefix": None,
         "key_placeholder": None,
     },

@@ -1,18 +1,15 @@
-"""AgentLoop single stream retry on ProviderStreamError.
+"""AgentLoop bounded stream retries on ProviderStreamError.
 
 Mirrors the swarm worker policy: a transient mid-stream failure (connection
-reset, relay hiccup, 5xx) is retried exactly once; a deterministic 4xx fails
-the run immediately with error_code=provider_stream_error and no wasted
-request. Deltas from the failed attempt are dropped so the trace does not
-contain duplicated thinking text.
+reset, relay hiccup, 5xx) is retried up to MAX_RETRIES; a deterministic 4xx
+fails the run immediately with error_code=provider_stream_error and no wasted
+request. A stream_reset event lets consumers discard failed partial deltas.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Callable
-
-import pytest
 
 import src.agent.loop as loop_mod
 from src.providers.chat import LLMResponse, ProviderStreamError
@@ -126,6 +123,7 @@ def _run(
     from src.tools import build_registry
 
     monkeypatch.setattr(loop_mod, "STREAM_RETRY_DELAY_S", 0.0)
+    monkeypatch.setenv("MAX_RETRIES", "2")
     pm = PersistentMemory()
     agent = AgentLoop(
         registry=build_registry(persistent_memory=pm, include_shell_tools=False),
@@ -169,17 +167,37 @@ def test_transient_stream_failure_is_retried_and_run_succeeds(
     assert reset["iter"] == 1
     assert reset["provider"] == "deepseek"
     assert reset["model"] == "deepseek-v4-pro"
+    assert reset["retry_number"] == 1
+    assert reset["max_retries"] == 2
 
 
-def test_double_stream_failure_fails_run(monkeypatch, tmp_path: Path) -> None:
-    """Two consecutive transient failures → failed run, no third attempt."""
+def test_two_transient_stream_failures_are_retried(monkeypatch, tmp_path: Path) -> None:
+    """Two configured retries allow a third stream call to succeed."""
     llm = _FlakyLoopLLM([_transient_error(), _transient_error()], "Final answer.")
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    result = _run(monkeypatch, tmp_path, llm, events)
+
+    assert result["status"] == "success"
+    assert llm.calls == 3
+    resets = [data for event_type, data in events if event_type == "stream_reset"]
+    assert [data["retry_number"] for data in resets] == [1, 2]
+
+
+def test_transient_stream_failure_exhaustion_is_bounded(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """MAX_RETRIES=2 gives three total calls, then fails without looping."""
+    llm = _FlakyLoopLLM(
+        [_transient_error(), _transient_error(), _transient_error()],
+        "Final answer.",
+    )
 
     result = _run(monkeypatch, tmp_path, llm)
 
     assert result["status"] == "failed"
     assert result["error_code"] == "provider_stream_error"
-    assert llm.calls == 2
+    assert llm.calls == 3
 
 
 def test_non_retryable_4xx_fails_without_retry(monkeypatch, tmp_path: Path) -> None:

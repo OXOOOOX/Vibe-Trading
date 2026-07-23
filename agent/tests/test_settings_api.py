@@ -29,6 +29,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
                 "VIBE_TRADING_DEEP_REPORT_ENABLED=0",
                 "VIBE_TRADING_DEEP_REPORT_PROFILES=equity_deep_research",
                 "VIBE_TRADING_MONITOR_AUTO_DEEP_REPORT_ENABLED=0",
+                "VIBE_TRADING_DEEP_RESEARCH_ENGINE=provider",
             ]
         )
         + "\n",
@@ -42,6 +43,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setenv("VIBE_TRADING_DEEP_REPORT_ENABLED", "0")
     monkeypatch.setenv("VIBE_TRADING_DEEP_REPORT_PROFILES", "equity_deep_research")
     monkeypatch.setenv("VIBE_TRADING_MONITOR_AUTO_DEEP_REPORT_ENABLED", "0")
+    monkeypatch.setenv("VIBE_TRADING_DEEP_RESEARCH_ENGINE", "provider")
     return TestClient(api_server.app, client=("127.0.0.1", 50000))
 
 
@@ -136,6 +138,69 @@ def test_get_data_source_settings_treats_placeholder_as_unconfigured(
     assert not (tmp_path / ".env").exists()
 
 
+def test_codex_provider_exposes_gpt_56_model_choices() -> None:
+    provider = api_server.LLM_PROVIDER_BY_NAME["openai-codex"]
+
+    assert provider.default_model == "openai-codex/gpt-5.6-terra"
+    assert provider.model_discovery == "codex_oauth"
+    assert [model.id for model in provider.models] == [
+        "openai-codex/gpt-5.3-codex-spark",
+        "openai-codex/gpt-5.6-sol",
+        "openai-codex/gpt-5.6-terra",
+        "openai-codex/gpt-5.6-luna",
+    ]
+
+
+def test_refresh_codex_models_returns_account_visible_choices(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.providers.openai_codex as codex_provider
+
+    monkeypatch.setattr(api_server, "_codex_models_client_version", lambda: "0.145.0")
+    monkeypatch.setattr(
+        codex_provider,
+        "list_openai_codex_models",
+        lambda **kwargs: [
+            {
+                "id": "openai-codex/gpt-5.6-terra",
+                "label": "GPT-5.6-Terra",
+                "description": "Balanced",
+                "default_reasoning_effort": "medium",
+                "reasoning_efforts": ["low", "medium", "high"],
+            }
+        ],
+    )
+
+    response = client.get("/settings/llm/models?provider=openai-codex")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["source"] == "remote"
+    assert body["warning"] is None
+    assert body["models"][0]["id"] == "openai-codex/gpt-5.6-terra"
+
+
+def test_refresh_codex_models_falls_back_without_hiding_failure(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.providers.openai_codex as codex_provider
+
+    def _fail(**kwargs: object) -> list[dict]:
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(codex_provider, "list_openai_codex_models", _fail)
+
+    response = client.get("/settings/llm/models?provider=openai-codex")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["source"] == "configured"
+    assert "provider unavailable" in body["warning"]
+    assert body["models"][2]["id"] == "openai-codex/gpt-5.6-terra"
+
+
 def test_research_settings_switch_persists_and_applies_without_restart(
     client: TestClient, tmp_path: Path,
 ) -> None:
@@ -146,6 +211,9 @@ def test_research_settings_switch_persists_and_applies_without_restart(
     assert initial.json()["equity_deep_research_enabled"] is False
     assert initial.json()["monitor_auto_deep_report_enabled"] is False
     assert initial.json()["effective_monitor_auto_deep_report_enabled"] is False
+    assert initial.json()["deep_research_engine"] == "provider"
+    assert initial.json()["codex_cli_model"] == "gpt-5.6-terra"
+    assert initial.json()["codex_cli_reasoning_effort"] == "medium"
     assert not (tmp_path / ".env").exists()
 
     enabled = client.put(
@@ -157,8 +225,9 @@ def test_research_settings_switch_persists_and_applies_without_restart(
     body = enabled.json()
     assert body["deep_report_enabled"] is True
     assert body["equity_deep_research_enabled"] is True
-    assert body["enabled_profiles"] == ["equity_deep_research"]
-    assert body["available_profiles"] == ["equity_deep_research"]
+    assert body["etf_deep_research_enabled"] is True
+    assert body["enabled_profiles"] == ["equity_deep_research", "etf_deep_research"]
+    assert body["available_profiles"] == ["equity_deep_research", "etf_deep_research"]
     assert body["monitor_auto_deep_report_enabled"] is False
     assert body["effective_monitor_auto_deep_report_enabled"] is False
     assert api_server.os.environ["VIBE_TRADING_DEEP_REPORT_ENABLED"] == "1"
@@ -186,7 +255,7 @@ def test_research_settings_switch_persists_and_applies_without_restart(
 
     env_text = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "VIBE_TRADING_DEEP_REPORT_ENABLED=0" in env_text
-    assert "VIBE_TRADING_DEEP_REPORT_PROFILES=equity_deep_research" in env_text
+    assert "VIBE_TRADING_DEEP_REPORT_PROFILES=equity_deep_research,etf_deep_research" in env_text
     assert "VIBE_TRADING_MONITOR_AUTO_DEEP_REPORT_ENABLED=0" in env_text
 
 
@@ -199,8 +268,57 @@ def test_research_settings_default_to_disabled_when_unconfigured(monkeypatch) ->
 
     assert body.deep_report_enabled is False
     assert body.equity_deep_research_enabled is False
+    assert body.etf_deep_research_enabled is False
     assert body.monitor_auto_deep_report_enabled is False
     assert body.effective_monitor_auto_deep_report_enabled is False
+    assert body.codex_cli_model == "gpt-5.6-terra"
+    assert body.codex_cli_reasoning_effort == "medium"
+
+
+def test_component_research_settings_are_fail_closed_and_hard_bounded(
+    client: TestClient, tmp_path: Path,
+) -> None:
+    initial = client.get("/settings/research")
+    assert initial.status_code == 200
+    assert initial.json()["etf_component_research_generation_enabled"] is False
+    assert initial.json()["etf_component_research_live_run_enabled"] is False
+    assert initial.json()["component_research_generation_policy"]["max_auto_repairs"] == 0
+
+    enabled = client.put(
+        "/settings/research",
+        json={
+            "etf_component_research_generation_enabled": True,
+            "etf_component_research_live_run_enabled": True,
+            "component_research_max_components_per_etf_run": 3,
+            "component_research_max_components_per_day": 5,
+            "component_research_max_model_calls_per_day": 5,
+            "component_research_max_input_tokens_per_component": 6000,
+            "component_research_max_output_tokens_per_component": 1000,
+            "component_research_max_input_tokens_per_day": 30000,
+            "component_research_max_output_tokens_per_day": 3000,
+        },
+    )
+    assert enabled.status_code == 200
+    body = enabled.json()
+    assert body["etf_component_research_generation_enabled"] is True
+    assert body["etf_component_research_live_run_enabled"] is True
+    assert (
+        body["component_research_generation_policy"]
+        ["max_output_tokens_per_component"]
+        == 1000
+    )
+    env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "ETF_COMPONENT_RESEARCH_GENERATION_ENABLED=1" in env_text
+    assert "ETF_COMPONENT_RESEARCH_LIVE_RUN_ENABLED=1" in env_text
+
+    rejected = client.put(
+        "/settings/research",
+        json={
+            "etf_component_research_generation_enabled": False,
+            "etf_component_research_live_run_enabled": True,
+        },
+    )
+    assert rejected.status_code == 400
 
 
 def test_settings_response_never_exposes_configured_secret_hints(

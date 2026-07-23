@@ -48,6 +48,7 @@ describe("WelcomeScreen", () => {
     expect(screen.getByRole("button", { name: /Portfolio health check/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Quick stock analysis/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Equity deep research/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Formal weekly review/ })).toBeInTheDocument();
     expect(screen.getByText("Use the portfolio ledger as truth and refresh decision-critical quotes first")).toBeInTheDocument();
   });
 
@@ -77,6 +78,17 @@ describe("WelcomeScreen", () => {
     await user.click(screen.getByRole("button", { name: /Equity deep research/ }));
 
     expect(onModeSelect).toHaveBeenCalledWith("deepReport");
+  });
+
+  it("puts a formal user-weekly request into the composer", async () => {
+    render(<WelcomeScreen onExample={onExample} onDraft={onDraft} onModeSelect={onModeSelect} />);
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: /Formal weekly review/ }));
+
+    expect(onDraft).toHaveBeenCalledWith(expect.stringContaining("weekly_report"));
+    expect(onDraft).toHaveBeenCalledWith(expect.stringContaining("formal user-facing weekly report"));
+    expect(onExample).not.toHaveBeenCalled();
   });
 
   it("calls onExample with prompt when an example button is clicked", async () => {

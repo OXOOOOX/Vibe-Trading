@@ -40,7 +40,10 @@ def classify_tool(tool_name: str, tool: Any | None = None) -> str:
     name = (tool_name or "").lower()
     if name.startswith("mcp__") or getattr(tool, "_adapter", None) is not None:
         return "mcp"
-    if name in {"web_search", "read_url", "get_stock_news", "get_research_reports", "read_document"}:
+    if name in {
+        "web_search", "read_url", "read_research_document", "query_research_knowledge",
+        "get_stock_news", "get_research_reports", "read_document",
+    }:
         return "web"
     if any(token in name for token in ("market", "quote", "price", "kline", "stock_profile", "data_context")):
         return "market"

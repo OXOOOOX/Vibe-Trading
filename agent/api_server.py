@@ -257,6 +257,7 @@ class ResearchSettingsResponse(BaseModel):
 
     deep_report_enabled: bool
     equity_deep_research_enabled: bool
+    etf_deep_research_enabled: bool
     monitor_auto_deep_report_enabled: bool
     effective_monitor_auto_deep_report_enabled: bool
     deep_research_engine: DeepResearchEngine
@@ -265,6 +266,9 @@ class ResearchSettingsResponse(BaseModel):
     effective_codex_cli_enabled: bool
     codex_cli_model: str
     codex_cli_reasoning_effort: str
+    etf_component_research_generation_enabled: bool
+    etf_component_research_live_run_enabled: bool
+    component_research_generation_policy: Dict[str, Any]
     enabled_profiles: List[str]
     available_profiles: List[str]
     env_path: str
@@ -336,7 +340,29 @@ class RecordPortfolioTradeRequest(BaseModel):
     quantity: float = Field(..., gt=0)
     price: float = Field(..., gt=0)
     trade_date: Optional[str] = Field(None, max_length=64)
+    fees: Optional[float] = Field(None, ge=0)
+    taxes: Optional[float] = Field(None, ge=0)
+    broker_reported_pnl: Optional[float] = None
+    idempotency_key: Optional[str] = Field(None, min_length=1, max_length=160)
     notes: Optional[str] = Field(None, max_length=1000)
+
+
+class PortfolioReconciliationPreviewRequest(BaseModel):
+    """Broker facts used to build a non-mutating portfolio reconciliation."""
+
+    raw_text: Optional[str] = Field(None, max_length=200_000)
+    holdings: List[Dict[str, Any]] = Field(default_factory=list)
+    trades: List[Dict[str, Any]] = Field(default_factory=list)
+    cash: Optional[float] = Field(None, ge=0)
+    cash_currency: str = Field("CNY", min_length=1, max_length=16)
+    broker_reported_pnl: Optional[float] = None
+    source_label: str = Field("broker_snapshot", min_length=1, max_length=200)
+
+
+class PortfolioReconciliationCommitRequest(BaseModel):
+    """Optimistic-lock token required for an explicit reconciliation commit."""
+
+    expected_revision: int = Field(..., ge=0)
 
 
 class EditPortfolioHoldingRequest(BaseModel):
@@ -424,6 +450,23 @@ class UpdateResearchSettingsRequest(BaseModel):
     codex_cli_enabled: Optional[bool] = None
     codex_cli_model: Optional[str] = Field(None, min_length=1, max_length=128)
     codex_cli_reasoning_effort: Optional[str] = Field(None, min_length=1, max_length=16)
+    etf_component_research_generation_enabled: Optional[bool] = None
+    etf_component_research_live_run_enabled: Optional[bool] = None
+    component_research_max_components_per_etf_run: Optional[int] = Field(None, ge=1, le=3)
+    component_research_max_components_per_day: Optional[int] = Field(None, ge=1, le=5)
+    component_research_max_model_calls_per_day: Optional[int] = Field(None, ge=1, le=5)
+    component_research_max_input_tokens_per_component: Optional[int] = Field(
+        None, ge=256, le=6000
+    )
+    component_research_max_output_tokens_per_component: Optional[int] = Field(
+        None, ge=64, le=1000
+    )
+    component_research_max_input_tokens_per_day: Optional[int] = Field(
+        None, ge=256, le=30000
+    )
+    component_research_max_output_tokens_per_day: Optional[int] = Field(
+        None, ge=64, le=3000
+    )
 
 
 class GeneratePdfRequest(BaseModel):
@@ -455,7 +498,7 @@ class SendMessageRequest(BaseModel):
     """Send chat message: natural-language strategy description."""
     content: str = Field(..., description="Natural language strategy description", min_length=1, max_length=5000)
     response_mode: Literal["chat", "deep_report"] = "chat"
-    report_profile: Optional[Literal["equity_deep_research"]] = None
+    report_profile: Optional[Literal["equity_deep_research", "etf_deep_research"]] = None
     routing_decision_id: Optional[str] = Field(None, max_length=100)
 
 
@@ -482,6 +525,21 @@ class MessageResponse(BaseModel):
     created_at: str
     linked_attempt_id: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+
+
+class SendReportArtifactToFeishuRequest(BaseModel):
+    """One explicit report-center file delivery to a bound Feishu chat."""
+
+    source: Literal["report_library", "deep_report", "run"]
+    report_id: str = Field(min_length=1, max_length=128)
+    artifact_id: str = Field(min_length=1, max_length=160)
+    target_id: Optional[str] = Field(default=None, max_length=128)
+
+
+class UpdateFeishuDeliverySettingsRequest(BaseModel):
+    """Choose the single global target used by report delivery and new monitors."""
+
+    default_target_id: Optional[str] = Field(default=None, max_length=128)
 
 
 class CreateGoalRequest(BaseModel):
@@ -836,7 +894,11 @@ async def _reject_untrusted_loopback_host(request: Request, call_next):
 # text/html`` (e.g. a user pasting the URL into the address bar).
 
 _FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
-_SPA_HTML_EXACT_PATHS: frozenset[str] = frozenset({"/correlation", "/portfolio"})
+_SPA_HTML_EXACT_PATHS: frozenset[str] = frozenset({
+    "/correlation",
+    "/portfolio",
+    "/reports",
+})
 # Each regex matches a complete request path. Trailing slash optional.
 _SPA_HTML_PATH_REGEX: tuple[re.Pattern[str], ...] = (
     # ``/runs/{run_id}`` — RunDetail page. Excludes ``/runs/{id}/code``,
@@ -883,6 +945,17 @@ async def _run_startup_preflight() -> None:
     from src.market_cache import get_market_refresh_service
 
     get_market_refresh_service().prepare_startup()
+    if "etf_deep_research" in {
+        item.strip()
+        for item in os.getenv(
+            "VIBE_TRADING_DEEP_REPORT_PROFILES",
+            "equity_deep_research,etf_deep_research",
+        ).split(",")
+        if item.strip()
+    }:
+        from src.reports.etf_research import get_etf_research_store
+
+        get_etf_research_store().initialize()
     session_service = _get_session_service()
     if session_service is not None:
         recovered_attempts = session_service.recover_interrupted_attempts()
@@ -899,7 +972,26 @@ async def _run_startup_preflight() -> None:
         if dispatcher is not None:
             dispatcher.start()
     await _get_portfolio_daily_scheduler().start()
+    await _get_portfolio_weekly_scheduler().start()
     await _get_portfolio_monitoring_runtime().start()
+    if _env_flag_enabled("VIBE_TRADING_REPORT_LIBRARY_ENABLED"):
+        from src.reports.catalog import get_report_library_service
+
+        try:
+            result = await asyncio.to_thread(
+                get_report_library_service().reconcile,
+                deep_report_service=_get_deep_report_service(),
+                daily_service=_get_portfolio_daily_service(),
+                weekly_service=_get_portfolio_weekly_service(),
+                monitoring_service=_get_portfolio_monitoring_service(),
+            )
+            if result.get("errors"):
+                logger.warning(
+                    "report library startup reconciliation completed with %s error(s)",
+                    len(result["errors"]),
+                )
+        except Exception:
+            logger.exception("report library startup reconciliation failed")
 
 
 @app.on_event("shutdown")
@@ -909,6 +1001,8 @@ async def _stop_scheduled_research_on_shutdown() -> None:
         await _portfolio_monitoring_runtime.stop()
     if _portfolio_daily_scheduler is not None:
         await _portfolio_daily_scheduler.stop()
+    if _portfolio_weekly_scheduler is not None:
+        await _portfolio_weekly_scheduler.stop()
     await _stop_channel_runtime()
     if _session_dispatcher is not None:
         await _session_dispatcher.stop()
@@ -1291,7 +1385,7 @@ LLM_REASONING_EFFORTS = {"", "low", "medium", "high", "max"}
 CODEX_CLI_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 LLM_API_KEY_PLACEHOLDERS = {"", "sk-or-v1-your-key-here", "sk-xxx", "xxx", "gsk_xxx"}
 TUSHARE_TOKEN_PLACEHOLDERS = {"", "your-tushare-token"}
-DEEP_REPORT_PROFILES = ("equity_deep_research",)
+DEEP_REPORT_PROFILES = ("equity_deep_research", "etf_deep_research")
 
 
 def _codex_models_client_version() -> str:
@@ -1545,15 +1639,23 @@ def _build_research_settings_response(values: Optional[Dict[str, str]] = None) -
         item.strip()
         for item in env_values.get(
             "VIBE_TRADING_DEEP_REPORT_PROFILES",
-            "equity_deep_research",
+            "equity_deep_research,etf_deep_research",
         ).split(",")
         if item.strip()
     }
     enabled_profiles = [profile for profile in DEEP_REPORT_PROFILES if profile in configured_profiles]
+    from src.reports.component_research_generation import (
+        component_research_generation_policy,
+    )
+
+    component_policy = component_research_generation_policy(env_values)
     return ResearchSettingsResponse(
         deep_report_enabled=deep_report_enabled,
         equity_deep_research_enabled=(
             deep_report_enabled and "equity_deep_research" in enabled_profiles
+        ),
+        etf_deep_research_enabled=(
+            deep_report_enabled and "etf_deep_research" in enabled_profiles
         ),
         monitor_auto_deep_report_enabled=monitor_auto_deep_report_enabled,
         effective_monitor_auto_deep_report_enabled=(
@@ -1575,6 +1677,9 @@ def _build_research_settings_response(values: Optional[Dict[str, str]] = None) -
             env_values.get("VIBE_TRADING_CODEX_REASONING_EFFORT", "medium").strip().lower()
             or "medium"
         ),
+        etf_component_research_generation_enabled=component_policy.enabled,
+        etf_component_research_live_run_enabled=component_policy.live_run_enabled,
+        component_research_generation_policy=component_policy.to_dict(),
         enabled_profiles=enabled_profiles,
         available_profiles=list(DEEP_REPORT_PROFILES),
         env_path=_project_relative_path(ENV_PATH),
@@ -2172,6 +2277,25 @@ async def get_run_report_preview(run_id: str):
     }
 
 
+@app.get("/runs/{run_id}/report-artifact", dependencies=[Depends(require_auth)])
+async def get_run_report_artifact(run_id: str, download: bool = Query(False)):
+    """Serve the selected legacy-run Markdown inline unless download is explicit."""
+
+    _validate_path_param(run_id, "run_id")
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.is_dir():
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    report_path = _run_report_preview_path(run_dir)
+    if report_path is None:
+        raise HTTPException(status_code=404, detail="Markdown report not found for this run")
+    return FileResponse(
+        report_path,
+        media_type="text/markdown; charset=utf-8",
+        filename=report_path.name,
+        content_disposition_type="attachment" if download else "inline",
+    )
+
+
 @app.get("/runs/{run_id}", response_model=RunResponse, dependencies=[Depends(require_auth)])
 async def get_run_result(
     run_id: str,
@@ -2524,6 +2648,15 @@ async def update_research_settings(payload: UpdateResearchSettingsRequest):
         and payload.codex_cli_enabled is None
         and payload.codex_cli_model is None
         and payload.codex_cli_reasoning_effort is None
+        and payload.etf_component_research_generation_enabled is None
+        and payload.etf_component_research_live_run_enabled is None
+        and payload.component_research_max_components_per_etf_run is None
+        and payload.component_research_max_components_per_day is None
+        and payload.component_research_max_model_calls_per_day is None
+        and payload.component_research_max_input_tokens_per_component is None
+        and payload.component_research_max_output_tokens_per_component is None
+        and payload.component_research_max_input_tokens_per_day is None
+        and payload.component_research_max_output_tokens_per_day is None
     ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -2590,17 +2723,74 @@ async def update_research_settings(payload: UpdateResearchSettingsRequest):
     # setting that would reactivate later.
     if not deep_report_enabled:
         monitor_auto_enabled = False
+    component_generation_enabled = (
+        payload.etf_component_research_generation_enabled
+        if payload.etf_component_research_generation_enabled is not None
+        else current.etf_component_research_generation_enabled
+    )
+    component_live_enabled = (
+        payload.etf_component_research_live_run_enabled
+        if payload.etf_component_research_live_run_enabled is not None
+        else current.etf_component_research_live_run_enabled
+    )
+    if component_live_enabled and not component_generation_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Component research live run requires the generation gate",
+        )
+    if not component_generation_enabled:
+        component_live_enabled = False
     updates = {
         "VIBE_TRADING_DEEP_REPORT_ENABLED": "1" if deep_report_enabled else "0",
         "VIBE_TRADING_MONITOR_AUTO_DEEP_REPORT_ENABLED": "1" if monitor_auto_enabled else "0",
         **engine_env_updates(deep_research_engine),
         "VIBE_TRADING_CODEX_MODEL": codex_cli_model,
         "VIBE_TRADING_CODEX_REASONING_EFFORT": codex_cli_reasoning_effort,
-        # The first release exposes exactly one audited Profile. Keeping the
-        # whitelist explicit prevents future Profiles from becoming active
-        # merely because the total switch is enabled.
-        "VIBE_TRADING_DEEP_REPORT_PROFILES": "equity_deep_research",
+        # Keep the audited Profile whitelist explicit. Unknown future Profiles
+        # never become active merely because the parent switch is enabled.
+        "VIBE_TRADING_DEEP_REPORT_PROFILES": "equity_deep_research,etf_deep_research",
+        "ETF_COMPONENT_RESEARCH_GENERATION_ENABLED": (
+            "1" if component_generation_enabled else "0"
+        ),
+        "ETF_COMPONENT_RESEARCH_LIVE_RUN_ENABLED": (
+            "1" if component_live_enabled else "0"
+        ),
     }
+    current_policy = current.component_research_generation_policy
+    policy_fields = {
+        "ETF_COMPONENT_RESEARCH_MAX_COMPONENTS_PER_ETF_RUN": (
+            payload.component_research_max_components_per_etf_run,
+            "max_components_per_etf_run",
+        ),
+        "ETF_COMPONENT_RESEARCH_MAX_COMPONENTS_PER_DAY": (
+            payload.component_research_max_components_per_day,
+            "max_components_per_day",
+        ),
+        "ETF_COMPONENT_RESEARCH_MAX_MODEL_CALLS_PER_DAY": (
+            payload.component_research_max_model_calls_per_day,
+            "max_model_calls_per_day",
+        ),
+        "ETF_COMPONENT_RESEARCH_MAX_INPUT_TOKENS_PER_COMPONENT": (
+            payload.component_research_max_input_tokens_per_component,
+            "max_input_tokens_per_component",
+        ),
+        "ETF_COMPONENT_RESEARCH_MAX_OUTPUT_TOKENS_PER_COMPONENT": (
+            payload.component_research_max_output_tokens_per_component,
+            "max_output_tokens_per_component",
+        ),
+        "ETF_COMPONENT_RESEARCH_MAX_INPUT_TOKENS_PER_DAY": (
+            payload.component_research_max_input_tokens_per_day,
+            "max_input_tokens_per_day",
+        ),
+        "ETF_COMPONENT_RESEARCH_MAX_OUTPUT_TOKENS_PER_DAY": (
+            payload.component_research_max_output_tokens_per_day,
+            "max_output_tokens_per_day",
+        ),
+    }
+    for env_name, (provided, policy_key) in policy_fields.items():
+        updates[env_name] = str(
+            provided if provided is not None else current_policy[policy_key]
+        )
     _write_env_values(ENV_PATH, updates)
     os.environ.update(updates)
     return _build_research_settings_response(_read_env_values(ENV_PATH))
@@ -2730,8 +2920,9 @@ async def record_portfolio_trade(payload: RecordPortfolioTradeRequest):
     from src.portfolio.state import record_trade
 
     trade = payload.model_dump(exclude_none=True)
+    idempotency_key = str(trade.pop("idempotency_key", "") or "") or None
     try:
-        state = record_trade(trade=trade)
+        state = record_trade(trade=trade, idempotency_key=idempotency_key)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _build_portfolio_review(state)
@@ -2741,9 +2932,10 @@ async def record_portfolio_trade(payload: RecordPortfolioTradeRequest):
     "/portfolio/trades/{trade_id}",
     response_model=PortfolioReviewResponse,
     dependencies=[Depends(require_local_or_auth)],
+    deprecated=True,
 )
 async def delete_portfolio_trade(trade_id: str):
-    """Delete one trade record without reverting its holding adjustment."""
+    """Compatibility route: append a reversal marker; never delete an applied event."""
     from src.portfolio.state import delete_trade
 
     try:
@@ -2751,6 +2943,62 @@ async def delete_portfolio_trade(trade_id: str):
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return _build_portfolio_review(state)
+
+
+@app.post(
+    "/portfolio/trades/{trade_id}/reversal",
+    response_model=PortfolioReviewResponse,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def reverse_portfolio_trade(trade_id: str):
+    """Append an auditable reversal marker without guessing a holding correction."""
+
+    from src.portfolio.state import delete_trade
+
+    try:
+        state = delete_trade(trade_id=trade_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return _build_portfolio_review(state)
+
+
+@app.post(
+    "/portfolio/reconciliation/preview",
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def preview_portfolio_reconciliation(payload: PortfolioReconciliationPreviewRequest):
+    """Build and persist a read-only reconciliation preview."""
+
+    from src.portfolio.state import preview_reconciliation
+
+    try:
+        return preview_reconciliation(**payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post(
+    "/portfolio/reconciliation/{reconciliation_id}/commit",
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def commit_portfolio_reconciliation(
+    reconciliation_id: str,
+    payload: PortfolioReconciliationCommitRequest,
+):
+    """Commit an explicitly reviewed broker snapshot under optimistic locking."""
+
+    from src.portfolio.ledger import PortfolioRevisionConflict
+    from src.portfolio.state import commit_reconciliation
+
+    try:
+        return commit_reconciliation(
+            reconciliation_id,
+            expected_revision=payload.expected_revision,
+        )
+    except PortfolioRevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.post(
@@ -3121,9 +3369,82 @@ _channel_manager = None
 _goal_store = None
 _portfolio_daily_service = None
 _portfolio_daily_scheduler = None
+_portfolio_weekly_service = None
+_portfolio_weekly_scheduler = None
 _portfolio_monitoring_service = None
 _portfolio_monitoring_runtime = None
 _runtime_event_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _session_weekly_public_run(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a session-safe weekly run without local artifact paths."""
+
+    value = dict(record)
+    value["artifacts"] = [
+        {key: item for key, item in dict(artifact).items() if key != "path"}
+        for artifact in record.get("artifacts") or []
+    ]
+    run_id = str(value.get("run_id") or "")
+    if run_id:
+        value["status_url"] = f"/portfolio/weekly-runs/{run_id}"
+    return value
+
+
+async def _handle_session_weekly_report(
+    command: str, payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Bridge the synchronous Agent tool onto the API event-loop service."""
+
+    service = _get_portfolio_weekly_service()
+    if command == "start":
+        raw_symbols = payload.get("symbols")
+        if raw_symbols is not None and not isinstance(raw_symbols, list):
+            raise ValueError("symbols must be a list")
+        records = await service.start(
+            week_end=str(payload.get("week_end") or "").strip() or None,
+            symbols=(
+                [str(item) for item in raw_symbols if str(item).strip()]
+                if raw_symbols is not None
+                else None
+            ),
+            refresh_policy=str(payload.get("refresh_policy") or "ensure_fresh"),
+            report_profile="weekly_review_v1",
+            report_audience="user",
+            force_new=bool(payload.get("force_new")),
+            single_source_authorized=bool(payload.get("single_source_authorized")),
+            trigger="session",
+        )
+        return {
+            "status": "accepted",
+            "report_audience": "user",
+            "reports_url": "/reports",
+            "runs": [_session_weekly_public_run(item) for item in records],
+        }
+    if command == "get":
+        run_id = str(payload.get("run_id") or "").strip()
+        if not run_id:
+            raise ValueError("run_id is required for command=get")
+        record = service.get_run(run_id)
+        if record is None:
+            raise ValueError("weekly run not found")
+        return {
+            "status": "ok",
+            "report_audience": str(record.get("report_audience") or "user"),
+            "run": _session_weekly_public_run(record),
+        }
+    if command == "list":
+        limit = max(1, min(int(payload.get("limit") or 20), 100))
+        return {
+            "status": "ok",
+            "report_audience": "user",
+            "reports_url": "/reports",
+            "runs": [
+                _session_weekly_public_run(item)
+                for item in service.list_runs(limit)
+                if str(item.get("report_audience") or "user") == "user"
+            ],
+        }
+    raise ValueError("command must be start, get, or list")
 
 
 def _get_session_service():
@@ -3155,6 +3476,7 @@ def _get_session_service():
         event_bus=event_bus,
         runs_dir=RUNS_DIR,
         usage_store=UsageStore(),
+        weekly_report_handler=_handle_session_weekly_report,
     )
     return _session_service
 
@@ -3222,12 +3544,40 @@ def _get_portfolio_daily_scheduler():
     return _portfolio_daily_scheduler
 
 
+def _get_portfolio_weekly_service():
+    """Return the isolated formal weekly-report orchestrator."""
+
+    global _portfolio_weekly_service
+    if _portfolio_weekly_service is None:
+        from src.portfolio.weekly import WeeklyReportRunService
+
+        _portfolio_weekly_service = WeeklyReportRunService(
+            session_service=_get_session_service(),
+            pdf_renderer=_render_pdf_reportlab,
+        )
+    return _portfolio_weekly_service
+
+
+def _get_portfolio_weekly_scheduler():
+    """Return the durable, default-off weekly report scheduler."""
+
+    global _portfolio_weekly_scheduler
+    if _portfolio_weekly_scheduler is None:
+        from src.portfolio.weekly import WeeklyReportScheduler
+
+        _portfolio_weekly_scheduler = WeeklyReportScheduler(
+            _get_portfolio_weekly_service,
+        )
+    return _portfolio_weekly_scheduler
+
+
 def _get_portfolio_monitoring_service():
     """Return the persistent portfolio monitoring application service."""
 
     global _portfolio_monitoring_service
     if _portfolio_monitoring_service is None:
         from src.portfolio.monitoring import MonitoringService
+        from src.reports.catalog import get_report_library_service
 
         session_service = _get_session_service()
         _portfolio_monitoring_service = MonitoringService(
@@ -3236,6 +3586,7 @@ def _get_portfolio_monitoring_service():
                 if session_service is not None
                 else None
             ),
+            report_library_service=get_report_library_service(),
             auto_deep_report_submitter=_submit_monitor_auto_deep_report,
         )
         # Reuse the latest channel target learned by the daily-report runtime.
@@ -3261,70 +3612,236 @@ async def _queue_monitor_auto_deep_report(payload: Dict[str, Any]) -> Dict[str, 
     security_name = str(payload.get("security_name") or symbol).strip()
     research_date = str(payload.get("research_date") or "").strip()
     reasons = [str(item) for item in payload.get("research_reasons") or [] if str(item)]
+    structural_refresh = bool(payload.get("structural_refresh"))
+    parent_report_id = str(payload.get("parent_report_id") or "").strip()
     if not symbol or not research_date:
         raise ValueError("symbol and research_date are required")
+    from src.reports.instrument_profile import instrument_type as classify_instrument_type
 
-    existing_report = service.deep_reports.latest_for_symbol(
-        symbol,
-        report_date=research_date,
+    report_profile = (
+        "etf_deep_research"
+        if classify_instrument_type(symbol) == "etf"
+        else "equity_deep_research"
     )
-    if existing_report is not None and existing_report.quality_status != "failed_validation":
-        return {
-            "status": "reused",
-            "report_id": existing_report.report_id,
-            "session_id": existing_report.session_id,
-            "deduplicated": True,
-        }
+    subject_label = "ETF" if report_profile == "etf_deep_research" else "单股"
 
-    source_event_id = f"auto-equity-deep-report:{research_date}:{symbol}"
+    parent_report = None
+    if structural_refresh:
+        if not parent_report_id:
+            raise ValueError("parent_report_id is required for structural refresh")
+        parent_report = service.deep_reports.get(parent_report_id)
+        if parent_report is None:
+            raise ValueError(f"parent Deep Report not found: {parent_report_id}")
+        if parent_report.status != "completed":
+            raise ValueError("only a completed Deep Report can be refreshed")
+        if parent_report.symbol and parent_report.symbol.upper() != symbol:
+            raise ValueError("parent Deep Report symbol does not match refresh symbol")
+        if parent_report.profile not in {
+            "equity_deep_research",
+            "etf_deep_research",
+            "index_deep_research",
+        }:
+            raise ValueError("parent report profile does not support structural refresh")
+        report_profile = parent_report.profile
+        security_name = str(parent_report.security_name or security_name or symbol)
+        if parent_report.generation_source == "portfolio_monitor_structural_refresh":
+            return {
+                "status": "refresh_already_attempted",
+                "report_id": parent_report.report_id,
+                "session_id": parent_report.session_id,
+                "parent_report_id": parent_report.parent_report_id,
+                "deduplicated": True,
+            }
+
+    if not structural_refresh:
+        existing_report = service.deep_reports.latest_for_symbol(
+            symbol,
+            report_date=research_date,
+        )
+        if existing_report is not None and existing_report.quality_status != "failed_validation":
+            return {
+                "status": "reused",
+                "report_id": existing_report.report_id,
+                "session_id": existing_report.session_id,
+                "deduplicated": True,
+            }
+
+    # Preserve the original equity idempotency key while giving ETF research
+    # its own durable namespace.
+    source_event_prefix = (
+        "auto-etf-deep-report"
+        if report_profile == "etf_deep_research"
+        else "auto-equity-deep-report"
+    )
+    base_source_event_id = (
+        f"{source_event_prefix}-structural-refresh:{symbol}:{parent_report_id}"
+        if structural_refresh
+        else f"{source_event_prefix}:{research_date}:{symbol}"
+    )
+    source_event_id = base_source_event_id
+    refresh_retry_attempt = 0
     queued = dispatcher.store.get_by_source_event("api", source_event_id)
     if queued is not None:
-        return {
-            "status": queued.status,
-            "job_id": queued.job_id,
-            "session_id": queued.session_id,
-            "attempt_id": queued.attempt_id,
-            "deduplicated": True,
-        }
+        queued_status = str(queued.status or "")
+        if structural_refresh and queued_status in {"completed", "failed", "cancelled"}:
+            refreshed_report = service.deep_reports.find_by_attempt(
+                str(queued.session_id or ""),
+                str(queued.attempt_id or ""),
+            )
+            retryable_infrastructure_failure = bool(
+                queued_status in {"failed", "cancelled"}
+                and (
+                    refreshed_report is None
+                    or str(refreshed_report.status or "") != "completed"
+                )
+            )
+            if retryable_infrastructure_failure:
+                refresh_retry_attempt = 1
+                source_event_id = f"{base_source_event_id}:retry-1"
+                retry_job = dispatcher.store.get_by_source_event("api", source_event_id)
+                if retry_job is None:
+                    queued = None
+                else:
+                    queued = retry_job
+                    queued_status = str(retry_job.status or "")
+                    if queued_status in {"completed", "failed", "cancelled"}:
+                        refreshed_report = service.deep_reports.find_by_attempt(
+                            str(retry_job.session_id or ""),
+                            str(retry_job.attempt_id or ""),
+                        )
+                        return {
+                            "status": "refresh_already_attempted",
+                            "refresh_outcome": queued_status,
+                            "job_id": retry_job.job_id,
+                            "session_id": retry_job.session_id,
+                            "attempt_id": retry_job.attempt_id,
+                            "parent_report_id": parent_report_id,
+                            "report_id": (
+                                refreshed_report.report_id if refreshed_report is not None else None
+                            ),
+                            "report_quality_status": (
+                                refreshed_report.quality_status if refreshed_report is not None else None
+                            ),
+                            "error": getattr(retry_job, "error", None),
+                            "retry_attempt": refresh_retry_attempt,
+                            "retry_exhausted": queued_status in {"failed", "cancelled"},
+                            "deduplicated": True,
+                        }
+                    return {
+                        "status": queued_status,
+                        "job_id": retry_job.job_id,
+                        "session_id": retry_job.session_id,
+                        "attempt_id": retry_job.attempt_id,
+                        "retry_attempt": refresh_retry_attempt,
+                        "deduplicated": True,
+                    }
+            else:
+                return {
+                    "status": "refresh_already_attempted",
+                    "refresh_outcome": queued_status,
+                    "job_id": queued.job_id,
+                    "session_id": queued.session_id,
+                    "attempt_id": queued.attempt_id,
+                    "parent_report_id": parent_report_id,
+                    "report_id": (
+                        refreshed_report.report_id if refreshed_report is not None else None
+                    ),
+                    "report_quality_status": (
+                        refreshed_report.quality_status if refreshed_report is not None else None
+                    ),
+                    "error": getattr(queued, "error", None),
+                    "retry_exhausted": False,
+                    "deduplicated": True,
+                }
+        if queued is not None:
+            return {
+                "status": queued_status,
+                "job_id": queued.job_id,
+                "session_id": queued.session_id,
+                "attempt_id": queued.attempt_id,
+                **({"retry_attempt": refresh_retry_attempt} if refresh_retry_attempt else {}),
+                "deduplicated": True,
+            }
 
-    reason_text = "、".join(reasons) or "自主监控需要新的公司级研究证据"
-    session = service.create_session(
-        title=f"{security_name}（{symbol}）穿透式深度研究 · AI自主监控",
-        config={
-            "internal": True,
-            "research_session": {
-                "kind": "equity_deep_research",
-                "symbol": symbol,
-                "security_name": security_name,
-                "origin": "portfolio_monitor_autopilot",
-                "planner_job_id": str(payload.get("job_id") or ""),
-            },
-        },
-    )
-    content = (
-        f"AI 自主监控因“{reason_text}”自动发起研究。"
-        f"请对 {security_name}（{symbol}）生成穿透式单股深度研究报告；"
-        "严格执行 equity_deep_research 的数据门控、确定性计算和证据链要求。"
-    )
-    result = await dispatcher.submit(
-        session.session_id,
-        content,
-        source="api",
-        source_event_id=source_event_id,
-        source_metadata={
+    reason_text = "、".join(reasons) or "自主监控需要新的结构性研究证据"
+    if structural_refresh:
+        assert parent_report is not None
+        session_id = parent_report.session_id
+        content = (
+            f"AI 自主监控发现结构报告 {parent_report.report_id} 未形成合格监测点位"
+            f"（{reason_text}），请基于最新可核验数据创建一次完整更新 revision。"
+            "重点重新核对结构趋势、关键支撑/阻力、失效条件、复核触发器和量价确认；"
+            "只有证据链和确定性计算都满足契约时才提交监测候选，仍不满足时必须保留"
+            " candidates=[] 与真实数据缺口，禁止为完成格式而编造点位。"
+        )
+        generation_source = "portfolio_monitor_structural_refresh"
+        source_metadata = {
             "response_mode": "deep_report",
-            "report_profile": "equity_deep_research",
+            "report_profile": report_profile,
+            "parent_report_id": parent_report.report_id,
+            "revision_mode": "full_refresh",
+            "generation_source": generation_source,
+            "generation_reason": reason_text,
+            "monitor_planner_job_id": str(payload.get("job_id") or ""),
+            "monitor_trigger_type": str(payload.get("trigger_type") or ""),
+            "monitor_source_bundle_sha256": str(
+                payload.get("source_bundle_sha256") or ""
+            ),
+            **(
+                {"monitor_refresh_retry": refresh_retry_attempt}
+                if refresh_retry_attempt
+                else {}
+            ),
+        }
+    else:
+        session = service.create_session(
+            title=f"{security_name}（{symbol}）穿透式深度研究 · AI自主监控",
+            config={
+                "internal": True,
+                "research_session": {
+                    "kind": report_profile,
+                    "symbol": symbol,
+                    "security_name": security_name,
+                    "origin": "portfolio_monitor_autopilot",
+                    "planner_job_id": str(payload.get("job_id") or ""),
+                },
+            },
+        )
+        session_id = session.session_id
+        content = (
+            f"AI 自主监控因“{reason_text}”自动发起研究。"
+            f"请对 {security_name}（{symbol}）生成穿透式{subject_label}深度研究报告；"
+            f"严格执行 {report_profile} 的数据门控、确定性计算和证据链要求。"
+        )
+        source_metadata = {
+            "response_mode": "deep_report",
+            "report_profile": report_profile,
             "generation_source": "portfolio_monitor_autopilot",
             "generation_reason": reason_text,
             "monitor_planner_job_id": str(payload.get("job_id") or ""),
             "monitor_trigger_type": str(payload.get("trigger_type") or ""),
-        },
+        }
+    result = await dispatcher.submit(
+        session_id,
+        content,
+        source="api",
+        source_event_id=source_event_id,
+        source_metadata=source_metadata,
         include_shell_tools=False,
     )
     return {
         **result,
         "status": result.get("status") or "queued",
-        "session_id": session.session_id,
+        "session_id": session_id,
+        **({"retry_attempt": refresh_retry_attempt} if refresh_retry_attempt else {}),
+        **(
+            {
+                "parent_report_id": parent_report_id,
+                "revision_mode": "full_refresh",
+            }
+            if structural_refresh
+            else {}
+        ),
         "deduplicated": bool(result.get("deduplicated")),
     }
 
@@ -3638,6 +4155,222 @@ async def _stop_channel_runtime() -> None:
     """Stop the channel runtime when it was initialized."""
     if _channel_runtime is not None:
         await _channel_runtime.stop()
+
+
+def _resolve_report_delivery_artifact(
+    payload: SendReportArtifactToFeishuRequest,
+) -> tuple[Path, str, str]:
+    """Resolve an indexed, deep-report, or legacy-run artifact without path input."""
+
+    source = payload.source
+    report_id = payload.report_id.strip()
+    artifact_id = payload.artifact_id.strip()
+    filename = ""
+    media_type = "application/octet-stream"
+
+    if source == "run":
+        _validate_path_param(report_id, "run_id")
+        if artifact_id != "markdown":
+            raise HTTPException(status_code=404, detail="Run report artifact not found")
+        path = _run_report_preview_path(RUNS_DIR / report_id)
+        if path is None:
+            raise HTTPException(status_code=404, detail="Markdown report not found for this run")
+        return path, path.name, "text/markdown"
+
+    if source == "report_library":
+        from src.reports.catalog import get_report_library_service
+
+        catalog_report = get_report_library_service().get_report(report_id)
+        if catalog_report is None:
+            raise HTTPException(status_code=404, detail="Report library item not found")
+        artifact = next(
+            (
+                dict(item)
+                for item in catalog_report.get("artifacts") or []
+                if str(item.get("artifact_id") or "") == artifact_id
+            ),
+            None,
+        )
+        if artifact is None or not artifact.get("available"):
+            raise HTTPException(status_code=404, detail="Report artifact not found")
+        filename = str(artifact.get("filename") or "")
+        media_type = str(artifact.get("media_type") or media_type)
+        locator = str(artifact.get("source_locator") or "")
+        if locator.startswith("deep-report:"):
+            _, report_id, artifact_id = locator.split(":", 2)
+            source = "deep_report"
+        elif locator.startswith("daily-run:"):
+            _, run_id, daily_artifact_id = locator.split(":", 2)
+            resolved = _get_portfolio_daily_service().store.resolve_artifact(
+                run_id, daily_artifact_id
+            )
+            if not resolved:
+                raise HTTPException(status_code=404, detail="Daily report artifact not found")
+            resolved_artifact, path = resolved
+            return (
+                Path(path),
+                filename or str(resolved_artifact.get("filename") or Path(path).name),
+                media_type
+                or str(resolved_artifact.get("media_type") or "application/octet-stream"),
+            )
+        else:
+            raise HTTPException(status_code=409, detail="This report artifact cannot be delivered")
+
+    if source == "deep_report":
+        service = _get_deep_report_service()
+        if service is None or service.get(report_id) is None:
+            raise HTTPException(status_code=404, detail="Deep Report not found")
+        try:
+            if artifact_id == "pdf":
+                path, record = service.ensure_pdf(report_id, _render_pdf_reportlab)
+            else:
+                path = service.artifact_path(report_id, artifact_id)
+                record = service.require(report_id)
+        except (FileNotFoundError, KeyError):
+            raise HTTPException(status_code=404, detail="Deep Report artifact not found")
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        record_artifact = next(
+            (
+                item
+                for item in record.artifacts
+                if str(item.get("artifact_id") or "") == artifact_id
+            ),
+            {},
+        )
+        return (
+            Path(path),
+            filename or str(record_artifact.get("filename") or Path(path).name),
+            media_type
+            if media_type != "application/octet-stream"
+            else str(
+                record_artifact.get("artifact_type")
+                or ("application/pdf" if artifact_id == "pdf" else "text/markdown")
+            ),
+        )
+
+    raise HTTPException(status_code=400, detail="Unsupported report artifact source")
+
+
+@app.post("/reports/send-to-feishu", dependencies=[Depends(require_local_or_auth)])
+async def send_report_artifact_to_feishu(payload: SendReportArtifactToFeishuRequest):
+    """Send exactly the file selected in the report-center preview to Feishu."""
+
+    path, filename, media_type = _resolve_report_delivery_artifact(payload)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Report artifact file not found")
+
+    store = _get_portfolio_monitoring_service().store
+    targets = [
+        target
+        for target in store.list_targets()
+        if target.get("channel") == "feishu" and target.get("status") == "active"
+    ]
+    if payload.target_id:
+        targets = [
+            target for target in targets if target.get("target_id") == payload.target_id
+        ]
+    else:
+        default_target_id = store.get_default_delivery_target_id()
+        if default_target_id:
+            targets = [
+                target for target in targets if target.get("target_id") == default_target_id
+            ]
+    if not targets:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "delivery_target_required",
+                "message": "请先在全局设置中绑定并选择飞书发送目标",
+            },
+        )
+    if len(targets) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "delivery_target_required",
+                "message": "已绑定多个飞书目标，请先在全局设置中选择默认目标",
+            },
+        )
+
+    from src.channels.bus.events import OutboundMessage
+
+    target = targets[0]
+    runtime = await _start_channel_runtime()
+    try:
+        receipt = await runtime.manager.send_direct(
+            OutboundMessage(
+                channel="feishu",
+                chat_id=str(target.get("chat_id") or ""),
+                content=f"从统一报告中心发送：{filename}",
+                media=[str(path)],
+                metadata={
+                    "_channel_runtime": True,
+                    "delivery_mode": "report_center_artifact",
+                    "report_source": payload.source,
+                    "report_id": payload.report_id,
+                    "artifact_id": payload.artifact_id,
+                    "media_type": media_type,
+                },
+            )
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    result = receipt.as_dict() if receipt is not None else {"status": "sent"}
+    chat_id = str(target.get("chat_id") or "")
+    target_name = f"{'群聊' if target.get('chat_type') == 'group' else '私聊'} · {chat_id[-6:] or '已绑定'}"
+    return {
+        **result,
+        "filename": filename,
+        "target_id": str(target.get("target_id") or ""),
+        "target_name": target_name,
+    }
+
+
+@app.get("/settings/feishu-delivery", dependencies=[Depends(require_local_or_auth)])
+async def get_feishu_delivery_settings():
+    return _get_portfolio_monitoring_service().store.get_delivery_settings()
+
+
+@app.put("/settings/feishu-delivery", dependencies=[Depends(require_settings_write_auth)])
+async def update_feishu_delivery_settings(payload: UpdateFeishuDeliverySettingsRequest):
+    try:
+        return _get_portfolio_monitoring_service().store.set_default_delivery_target(
+            payload.default_target_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post(
+    "/settings/feishu-delivery/binding-codes",
+    dependencies=[Depends(require_settings_write_auth)],
+    status_code=201,
+)
+async def create_feishu_delivery_binding_code():
+    return _get_portfolio_monitoring_service().store.create_binding_code()
+
+
+@app.get(
+    "/settings/feishu-delivery/binding-codes/{binding_id}",
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def get_feishu_delivery_binding_code(binding_id: str):
+    result = _get_portfolio_monitoring_service().store.get_binding_code(binding_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="binding code not found")
+    return result
+
+
+@app.post(
+    "/settings/feishu-delivery/targets/{target_id}/revoke",
+    dependencies=[Depends(require_settings_write_auth)],
+)
+async def revoke_feishu_delivery_target(target_id: str):
+    try:
+        return _get_portfolio_monitoring_service().store.revoke_target(target_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="delivery target not found") from exc
 
 
 def _get_goal_store():
@@ -4222,6 +4955,23 @@ def _normalize_reportlab_glyphs(value: str) -> str:
     return value.replace("¥", "￥").replace("\u2011", "-")
 
 
+def _reportlab_table_width_shares(headers: list[str]) -> list[float]:
+    """Return content-aware ReportLab column widths for known report tables."""
+
+    if headers == ["优先级", "标的", "触发条件", "建议响应"]:
+        return [0.12, 0.22, 0.28, 0.38]
+    if headers == ["优先级", "触发条件", "建议响应"]:
+        return [0.14, 0.34, 0.52]
+    if headers == ["指标", "数值", "期间/时点", "口径"]:
+        return [0.27, 0.17, 0.28, 0.28]
+    if headers == ["成分", "权重", "入选原因", "研究状态", "可用摘要"]:
+        # The component summary carries most of the evidence-backed prose.
+        # Give it nearly half the page so the deterministic penetration table
+        # reads horizontally instead of becoming a very tall grid.
+        return [0.16, 0.08, 0.14, 0.14, 0.48]
+    return [1 / len(headers)] * len(headers) if headers else []
+
+
 def _render_pdf_reportlab(title: str, content: str) -> bytes:
     """Render a portable PDF fallback that does not require GTK/Pango."""
     import html
@@ -4275,10 +5025,10 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
         spaceAfter=5,
     )
     heading_styles = {
-        1: ParagraphStyle("CJKH1", parent=base, fontSize=18, leading=23, spaceBefore=13, spaceAfter=9),
-        2: ParagraphStyle("CJKH2", parent=base, fontSize=15, leading=20, spaceBefore=11, spaceAfter=7),
-        3: ParagraphStyle("CJKH3", parent=base, fontSize=12.5, leading=18, spaceBefore=9, spaceAfter=5),
-        4: ParagraphStyle("CJKH4", parent=base, fontSize=11, leading=16, spaceBefore=7, spaceAfter=4),
+        1: ParagraphStyle("CJKH1", parent=base, fontSize=18, leading=23, spaceBefore=13, spaceAfter=9, keepWithNext=1),
+        2: ParagraphStyle("CJKH2", parent=base, fontSize=15, leading=20, spaceBefore=11, spaceAfter=7, keepWithNext=1),
+        3: ParagraphStyle("CJKH3", parent=base, fontSize=12.5, leading=18, spaceBefore=9, spaceAfter=5, keepWithNext=1),
+        4: ParagraphStyle("CJKH4", parent=base, fontSize=11, leading=16, spaceBefore=7, spaceAfter=4, keepWithNext=1),
     }
     heading = heading_styles[2]
     title_style = ParagraphStyle(
@@ -4380,7 +5130,16 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
         rendered = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", rendered)
         rendered = re.sub(r"__([^_]+)__", r"<b>\1</b>", rendered)
         rendered = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", rendered)
+        rendered = re.sub(
+            r"\[\^(\d+)\]",
+            r'<super><font size="7" color="#2563eb">[\1]</font></super>',
+            rendered,
+        )
         rendered = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r'<link href="\2" color="#2563eb">\1</link>', rendered)
+        # Internal report-library links are meaningful in Markdown but are not
+        # portable PDF URLs. Render the title cleanly; the adjacent index code
+        # remains the durable lookup key.
+        rendered = re.sub(r"\[([^\]]+)\]\((/[^)]+)\)", r'<font color="#2563eb">\1</font>', rendered)
         return rendered
 
     def table_cells(line: str) -> list[str]:
@@ -4405,12 +5164,7 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
             for row_index, row in enumerate(normalized)
         ]
         available_width = A4[0] - 36 * mm
-        if headers == ["优先级", "标的", "触发条件", "建议响应"]:
-            width_shares = [0.12, 0.22, 0.28, 0.38]
-        elif headers == ["优先级", "触发条件", "建议响应"]:
-            width_shares = [0.14, 0.34, 0.52]
-        else:
-            width_shares = [1 / column_count] * column_count
+        width_shares = _reportlab_table_width_shares(headers)
         table = Table(
             data,
             colWidths=[available_width * share for share in width_shares],
@@ -4520,9 +5274,43 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
         leftMargin=18 * mm,
         rightMargin=18 * mm,
         topMargin=20 * mm,
-        bottomMargin=20 * mm,
+        bottomMargin=23 * mm,
         title=title,
     )
+    version_match = re.search(r"报告版本：第\s*(\d+)\s*版", content)
+    date_match = re.search(r"数据更新至：\s*(\d{4}-\d{2}-\d{2})", content)
+    footer_identity = " · ".join(
+        value for value in (
+            title.strip(),
+            date_match.group(1) if date_match else None,
+            f"第 {version_match.group(1)} 版" if version_match else None,
+        ) if value
+    )
+
+    def fit_footer(value: str, max_width: float) -> str:
+        rendered = value
+        while rendered and pdfmetrics.stringWidth(rendered, font_name, 8) > max_width:
+            rendered = rendered[:-1]
+        return rendered if rendered == value else rendered.rstrip() + "…"
+
+    def draw_delivery_footer(canvas, doc) -> None:
+        canvas.saveState()
+        canvas.setStrokeColor(colors.HexColor("#cbd5e1"))
+        canvas.setLineWidth(0.4)
+        canvas.line(18 * mm, 16 * mm, A4[0] - 18 * mm, 16 * mm)
+        canvas.setFillColor(colors.HexColor("#64748b"))
+        canvas.setFont(font_name, 8)
+        canvas.drawString(
+            18 * mm,
+            11 * mm,
+            fit_footer(footer_identity or "Vibe-Trading 研究报告", 132 * mm),
+        )
+        canvas.drawRightString(
+            A4[0] - 18 * mm,
+            11 * mm,
+            f"第 {canvas.getPageNumber()} 页",
+        )
+        canvas.restoreState()
     story = [
         Paragraph(replace_emoji(html.escape(title.strip() or "Research Report")), title_style),
         Paragraph(f"由 Vibe-Trading 生成 · {datetime.now().strftime('%Y-%m-%d %H:%M')}", base),
@@ -4559,6 +5347,11 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
             level = len(heading_match.group(1))
             story.append(Paragraph(inline_markdown(heading_match.group(2)), heading_styles[level]))
             line_index += 1
+            # Markdown requires a blank line after headings, but turning that
+            # blank into a standalone Spacer breaks ReportLab's keepWithNext
+            # chain and can strand a heading at the bottom of a page.
+            while line_index < len(content_lines) and not content_lines[line_index].strip():
+                line_index += 1
             continue
         if line.startswith("|"):
             table_lines = [line]
@@ -4583,7 +5376,11 @@ def _render_pdf_reportlab(title: str, content: str) -> bytes:
         line_index += 1
     if code_lines:
         story.append(Preformatted(replace_emoji_plain("\n".join(code_lines)), code_style))
-    document.build(story)
+    document.build(
+        story,
+        onFirstPage=draw_delivery_footer,
+        onLaterPages=draw_delivery_footer,
+    )
     return buffer.getvalue()
 
 
@@ -5863,6 +6660,14 @@ register_portfolio_daily_routes(
     get_scheduler=_get_portfolio_daily_scheduler,
 )
 
+from src.api.portfolio_weekly_routes import register_portfolio_weekly_routes  # noqa: E402
+register_portfolio_weekly_routes(
+    app,
+    require_local_or_auth,
+    get_service=_get_portfolio_weekly_service,
+    get_scheduler=_get_portfolio_weekly_scheduler,
+)
+
 from src.api.portfolio_monitor_routes import register_portfolio_monitor_routes  # noqa: E402
 register_portfolio_monitor_routes(
     app,
@@ -5887,6 +6692,29 @@ register_deep_report_routes(
     get_service=_get_deep_report_service,
     get_dispatcher=_get_session_dispatcher,
     pdf_renderer=_render_pdf_reportlab,
+)
+
+from src.api.report_library_routes import register_report_library_routes  # noqa: E402
+from src.data_layer import get_unified_data_service  # noqa: E402
+
+register_report_library_routes(
+    app,
+    require_local_or_auth,
+    get_deep_report_service=_get_deep_report_service,
+    get_daily_service=_get_portfolio_daily_service,
+    get_weekly_service=_get_portfolio_weekly_service,
+    get_monitoring_service=_get_portfolio_monitoring_service,
+    get_data_service=get_unified_data_service,
+)
+
+from src.api.component_research_generation_routes import (  # noqa: E402
+    register_component_research_generation_routes,
+)
+
+register_component_research_generation_routes(
+    app,
+    require_local_or_auth,
+    require_settings_write_auth,
 )
 
 # ============================================================================

@@ -43,6 +43,7 @@ from src.portfolio.answer_guard import (
     compact_portfolio_tool_result,
     find_portfolio_answer_conflict,
 )
+from src.portfolio.state import normalize_symbol
 from src.tools.background_tools import get_background_manager
 from src.tools.redaction import redact_payload
 from src.tools.swarm_tool import extract_explicit_preset_name
@@ -59,6 +60,16 @@ STREAM_RETRY_DELAY_S = float(os.getenv("VT_STREAM_RETRY_DELAY_S", "1.0"))
 TOOL_TIMEOUT_SECONDS = float(os.getenv("VIBE_TRADING_TOOL_TIMEOUT_SECONDS", "1800"))
 GOAL_MAX_CONTINUATIONS = int(os.getenv("VIBE_TRADING_GOAL_MAX_CONTINUATIONS", "3"))
 LLM_USAGE_ARTIFACT = "llm_usage.json"
+
+
+def _configured_stream_max_retries() -> int:
+    """Return the bounded number of retries for a transient provider stream."""
+
+    try:
+        value = int(os.getenv("MAX_RETRIES", "2"))
+    except (TypeError, ValueError):
+        value = 2
+    return max(0, min(value, 20))
 
 # Layer 2: Context collapse thresholds
 COLLAPSE_THRESHOLD = int(TOKEN_THRESHOLD * 0.7)
@@ -433,8 +444,11 @@ class AgentLoop:
         memory: Optional[WorkspaceMemory] = None,
         event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         max_iterations: int = 50,
+        max_total_tokens: int | None = None,
         persistent_memory: Optional[Any] = None,
         usage_recorder: Optional[UsageRecorder] = None,
+        attempt_id: str = "",
+        research_turn_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Initialize AgentLoop.
 
@@ -444,6 +458,8 @@ class AgentLoop:
             memory: Workspace memory (created fresh if not provided).
             event_callback: Event callback (event_type, data).
             max_iterations: Maximum number of loop iterations.
+            max_total_tokens: Optional provider-reported token ceiling. Tool
+                execution stops once the ceiling is reached.
             persistent_memory: PersistentMemory for cross-session recall.
         """
         self.registry = registry
@@ -451,12 +467,105 @@ class AgentLoop:
         self.memory = memory or WorkspaceMemory()
         self._event_callback = event_callback
         self.max_iterations = max_iterations
+        self.max_total_tokens = (
+            max(1, int(max_total_tokens)) if max_total_tokens is not None else None
+        )
         self._called_ok: set[str] = set()
         self._cancel_event = threading.Event()
         self._previous_summary: str = ""
         self._persistent_memory = persistent_memory
         self._run_iteration: int = 0
         self._usage_recorder = usage_recorder
+        self._attempt_id = str(attempt_id or "")
+        self._research_turn_context = dict(research_turn_context or {})
+
+    def _prepare_tool_args(self, tc: Any) -> Dict[str, Any]:
+        """Inject host-owned transaction and research scope metadata."""
+
+        args = _normalize_tool_run_dir(tc.arguments, self.memory.run_dir)
+        if tc.name == "portfolio_state" and self._attempt_id:
+            action = str(args.get("action") or "get")
+            if action != "get":
+                args["_attempt_id"] = self._attempt_id
+                args["_idempotency_key"] = f"{self._attempt_id}:{tc.id}"
+                revision = self._research_turn_context.get("portfolio_revision")
+                if revision is not None:
+                    args["_expected_revision"] = revision
+        primary = str(self._research_turn_context.get("primary_symbol") or "").upper()
+        if primary and tc.name == "get_data_context":
+            args["_subject_symbol"] = primary
+            if self._research_turn_context.get("live_required"):
+                args["force_live"] = True
+        if primary and tc.name == "get_fund_flow":
+            args["_subject_symbol"] = primary
+            proxy_symbols = {
+                str(item.get("symbol") or "").upper()
+                for item in (self._research_turn_context.get("proxy_relations") or [])
+                if str(item.get("role") or "") == "fund_flow_reference"
+            }
+            requested = {
+                normalize_symbol(str(value))
+                for value in (args.get("codes") or [])
+                if str(value).strip()
+            }
+            if requested & proxy_symbols:
+                args["_relationship"] = "fund_flow_reference"
+        return args
+
+    def _research_scope_violation(self, tc: Any) -> dict[str, Any] | None:
+        """Reject a tool call that would silently substitute another symbol."""
+
+        primary = normalize_symbol(str(self._research_turn_context.get("primary_symbol") or ""))
+        if not primary:
+            return None
+        allowed_data = {
+            normalize_symbol(str(value))
+            for value in (self._research_turn_context.get("allowed_data_symbols") or [primary])
+        }
+        if tc.name == "get_data_context" and str(tc.arguments.get("action") or "context") != "bars":
+            requested = {
+                normalize_symbol(str(value))
+                for value in (tc.arguments.get("symbols") or [])
+                if str(value).strip()
+            }
+            disallowed = sorted(requested - allowed_data)
+            if disallowed:
+                return {
+                    "error_code": "research_symbol_scope_violation",
+                    "primary_symbol": primary,
+                    "blocked_symbols": disallowed,
+                    "message": "Non-primary market/price context is not authorized for this turn.",
+                }
+        if tc.name == "get_fund_flow":
+            proxies = {
+                normalize_symbol(str(item.get("symbol") or ""))
+                for item in (self._research_turn_context.get("proxy_relations") or [])
+                if str(item.get("role") or "") == "fund_flow_reference"
+            }
+            requested = {
+                normalize_symbol(str(value))
+                for value in (tc.arguments.get("codes") or [])
+                if str(value).strip()
+            }
+            disallowed = sorted(requested - ({primary} | proxies))
+            if disallowed:
+                return {
+                    "error_code": "fund_flow_proxy_not_authorized",
+                    "primary_symbol": primary,
+                    "blocked_symbols": disallowed,
+                    "message": "Fund-flow proxy requires explicit user authorization.",
+                }
+        if tc.name == "portfolio_state" and str(tc.arguments.get("action") or "get") == "record_trade":
+            trade = dict(tc.arguments.get("trade") or {})
+            symbol = normalize_symbol(str(trade.get("symbol") or trade.get("code") or ""))
+            if symbol and symbol != primary:
+                return {
+                    "error_code": "portfolio_trade_subject_mismatch",
+                    "primary_symbol": primary,
+                    "blocked_symbols": [symbol],
+                    "message": "A single-symbol research session cannot record another symbol's trade.",
+                }
+        return None
 
     def cancel(self) -> None:
         """Cancel the current loop.
@@ -536,6 +645,7 @@ class AgentLoop:
         goal_continuations = 0
         goal_last_progress: tuple[int, int] | None = None
         portfolio_guard_retries = 0
+        token_budget_reason: str | None = None
         wrap_up_at = max(1, int(self.max_iterations * 0.8))
 
         try:
@@ -624,47 +734,48 @@ class AgentLoop:
                 if is_last_iteration:
                     trace.write({"type": "forced_text_only", "iter": current_iter})
 
-                try:
-                    response = self.llm.stream_chat(
-                        messages,
-                        tools=tool_defs,
-                        on_text_chunk=_on_text_chunk,
-                        on_reasoning_chunk=_on_reasoning_chunk,
-                        should_cancel=self._cancel_event.is_set,
-                    )
-                except ProviderStreamError as exc:
-                    # One retry for transient mid-stream failures (connection
-                    # reset, relay hiccup) — mirrors the swarm worker policy.
-                    # Deterministic 4xx errors fail immediately. Deltas from
-                    # the failed attempt are dropped so the trace does not
-                    # contain duplicated thinking text.
-                    if not exc.retryable:
-                        raise
-                    logger.warning(
-                        "Provider stream failed (iter %s), retrying once: %s",
-                        current_iter,
-                        exc,
-                    )
-                    self._emit(
-                        "stream_reset",
-                        {
-                            "iter": current_iter,
-                            "reason": "provider_stream_retry",
-                            "provider": exc.provider,
-                            "model": exc.model,
-                        },
-                    )
-                    thinking_chunks.clear()
-                    reasoning_chars = 0
-                    last_reasoning_emit = None
-                    _time.sleep(STREAM_RETRY_DELAY_S)
-                    response = self.llm.stream_chat(
-                        messages,
-                        tools=tool_defs,
-                        on_text_chunk=_on_text_chunk,
-                        on_reasoning_chunk=_on_reasoning_chunk,
-                        should_cancel=self._cancel_event.is_set,
-                    )
+                max_stream_retries = _configured_stream_max_retries()
+                stream_retry_number = 0
+                while True:
+                    try:
+                        response = self.llm.stream_chat(
+                            messages,
+                            tools=tool_defs,
+                            on_text_chunk=_on_text_chunk,
+                            on_reasoning_chunk=_on_reasoning_chunk,
+                            should_cancel=self._cancel_event.is_set,
+                        )
+                        break
+                    except ProviderStreamError as exc:
+                        # Retry only transient transport/5xx failures. The
+                        # stream_reset event tells consumers to discard partial
+                        # deltas from the failed stream before rendering the
+                        # next attempt. Deterministic 4xx errors fail at once.
+                        if not exc.retryable or stream_retry_number >= max_stream_retries:
+                            raise
+                        stream_retry_number += 1
+                        logger.warning(
+                            "Provider stream failed (iter %s), retrying %s/%s: %s",
+                            current_iter,
+                            stream_retry_number,
+                            max_stream_retries,
+                            exc,
+                        )
+                        self._emit(
+                            "stream_reset",
+                            {
+                                "iter": current_iter,
+                                "reason": "provider_stream_retry",
+                                "provider": exc.provider,
+                                "model": exc.model,
+                                "retry_number": stream_retry_number,
+                                "max_retries": max_stream_retries,
+                            },
+                        )
+                        thinking_chunks.clear()
+                        reasoning_chars = 0
+                        last_reasoning_emit = None
+                        _time.sleep(STREAM_RETRY_DELAY_S * stream_retry_number)
 
                 # Cancelled mid-stream: discard this turn's partial response and
                 # end the run now, without executing any of its tool calls.
@@ -686,6 +797,9 @@ class AgentLoop:
                             "iter": current_iter,
                         },
                     )
+                reported_total_tokens = int(
+                    llm_usage_summary.get("totals", {}).get("total_tokens") or 0
+                )
                 if active_goal_id and session_id:
                     token_delta = int(usage_delta.get("total_tokens") or 0) if usage_delta else 0
                     turn_delta = 0 if goal_turn_accounted else 1
@@ -737,7 +851,9 @@ class AgentLoop:
                         break
 
                     portfolio_conflict = find_portfolio_answer_conflict(
-                        messages, final_content
+                        messages,
+                        final_content,
+                        self._research_turn_context,
                     )
                     if portfolio_conflict is not None:
                         can_retry = (
@@ -749,6 +865,7 @@ class AgentLoop:
                                 "type": "portfolio_answer_conflict",
                                 "iter": current_iter,
                                 "matched_text": portfolio_conflict.matched_text,
+                                "conflict_code": portfolio_conflict.conflict_code,
                                 "holdings_count": len(portfolio_conflict.holdings),
                                 "action": "retry" if can_retry else "fallback",
                             }
@@ -757,6 +874,7 @@ class AgentLoop:
                             {
                                 "type": "portfolio_answer_conflict",
                                 "matched_text": portfolio_conflict.matched_text,
+                                "conflict_code": portfolio_conflict.conflict_code,
                                 "holdings_count": len(portfolio_conflict.holdings),
                                 "action": "retry" if can_retry else "fallback",
                             }
@@ -873,6 +991,39 @@ class AgentLoop:
                     react_trace.append({"type": "answer", "content": final_content[:500]})
                     break
 
+                if (
+                    self.max_total_tokens is not None
+                    and reported_total_tokens >= self.max_total_tokens
+                ):
+                    token_budget_reason = (
+                        "reached autonomous token budget "
+                        f"({reported_total_tokens}/{self.max_total_tokens}) before executing more tools"
+                    )
+                    trace.write(
+                        {
+                            "type": "token_budget_exhausted",
+                            "iter": current_iter,
+                            "reported_total_tokens": reported_total_tokens,
+                            "max_total_tokens": self.max_total_tokens,
+                        }
+                    )
+                    react_trace.append(
+                        {
+                            "type": "token_budget_exhausted",
+                            "reported_total_tokens": reported_total_tokens,
+                            "max_total_tokens": self.max_total_tokens,
+                        }
+                    )
+                    self._emit(
+                        "token_budget_exhausted",
+                        {
+                            "iter": current_iter,
+                            "reported_total_tokens": reported_total_tokens,
+                            "max_total_tokens": self.max_total_tokens,
+                        },
+                    )
+                    break
+
                 _inject_swarm_preset_hint(
                     response.tool_calls,
                     extract_explicit_preset_name(user_message),
@@ -928,6 +1079,10 @@ class AgentLoop:
         elif (run_dir / "artifacts" / "metrics.csv").exists() or final_content:
             state_store.mark_success(run_dir)
             final_status = "success"
+        elif token_budget_reason is not None:
+            final_reason = token_budget_reason
+            state_store.mark_failure(run_dir, final_reason)
+            final_status = "failed"
         elif empty_model_response_iter is not None:
             provider = os.getenv("LANGCHAIN_PROVIDER", "openai").strip().lower() or "openai"
             model = getattr(self.llm, "model_name", None) or os.getenv("LANGCHAIN_MODEL_NAME", "").strip() or "(unset)"
@@ -964,6 +1119,7 @@ class AgentLoop:
             "react_trace": react_trace,
             "iterations": iteration,
             "max_iterations": self.max_iterations,
+            "max_total_tokens": self.max_total_tokens,
         }
         if final_reason is not None:
             result["reason"] = final_reason
@@ -1008,6 +1164,36 @@ class AgentLoop:
                 focus_topic = tc.arguments.get("focus_topic", "")
                 messages.append(context.format_tool_result(tc.id, "compact", '{"status":"ok","message":"Compressing..."}'))
                 trace.write({"type": "compact_requested", "iter": iteration})
+                continue
+
+            violation = self._research_scope_violation(tc)
+            if violation is not None:
+                blocked = json.dumps(
+                    {"status": "error", **violation}, ensure_ascii=False
+                )
+                messages.append(context.format_tool_result(tc.id, tc.name, blocked))
+                trace.write(
+                    {
+                        "type": "tool_scope_blocked",
+                        "iter": iteration,
+                        "tool": tc.name,
+                        "call_id": tc.id,
+                        **violation,
+                    }
+                )
+                react_trace.append(
+                    {"type": "tool_scope_blocked", "tool": tc.name, **violation}
+                )
+                self._emit(
+                    "tool_result",
+                    {
+                        "tool": tc.name,
+                        "tool_call_id": tc.id,
+                        "status": "error",
+                        "error_code": violation["error_code"],
+                        "preview": violation["message"],
+                    },
+                )
                 continue
 
             tool_def = self.registry.get(tc.name)
@@ -1104,7 +1290,7 @@ class AgentLoop:
         # Prepare args + emit events
         runnable: list[tuple] = []
         for tc in tool_calls:
-            args = _normalize_tool_run_dir(tc.arguments, self.memory.run_dir)
+            args = self._prepare_tool_args(tc)
             redacted_args = redact_payload(args)
             event_args = {k: str(v)[:200] for k, v in redacted_args.items()}
             self._emit(
@@ -1174,7 +1360,7 @@ class AgentLoop:
             react_trace: React trace list.
             iteration: Current iteration.
         """
-        args = _normalize_tool_run_dir(tc.arguments, self.memory.run_dir)
+        args = self._prepare_tool_args(tc)
 
         redacted_args = redact_payload(args)
         event_args = {k: str(v)[:200] for k, v in redacted_args.items()}

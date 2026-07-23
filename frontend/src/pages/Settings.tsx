@@ -24,9 +24,11 @@ import {
   type ChannelRuntimeStatus,
   type CodexCliStatus,
   type DataSourceSettings,
+  type FeishuDeliverySettings,
   type LLMModelOption,
   type LLMProviderOption,
   type LLMSettings,
+  type MonitorDeliveryBindingAttempt,
   type ResearchSettings,
 } from "@/lib/api";
 import { getApiAuthKey, setApiAuthKey } from "@/lib/apiAuth";
@@ -63,6 +65,35 @@ function toForm(settings: LLMSettings): LLMFormState {
   };
 }
 
+function mergeWithCurrentModel(
+  discoveredOptions: LLMModelOption[],
+  fallbackOptions: LLMModelOption[],
+  currentModel: string | undefined,
+): LLMModelOption[] {
+  const discoveredIds = new Set(discoveredOptions.map((option) => option.id));
+  const merged: LLMModelOption[] = [...discoveredOptions];
+  for (const option of fallbackOptions) {
+    if (!discoveredIds.has(option.id)) {
+      merged.push(option);
+      discoveredIds.add(option.id);
+    }
+  }
+
+  if (!currentModel || merged.some((option) => option.id === currentModel)) {
+    return merged;
+  }
+
+  return [
+    {
+      id: currentModel,
+      label: currentModel,
+      description: "Use the exact model id currently configured for this provider.",
+      reasoning_efforts: [],
+    },
+    ...merged,
+  ];
+}
+
 export function Settings() {
 
   const [settings, setSettings] = useState<LLMSettings | null>(null);
@@ -72,6 +103,11 @@ export function Settings() {
   const [codexLoadError, setCodexLoadError] = useState<string | null>(null);
   const [channelStatus, setChannelStatus] = useState<ChannelRuntimeStatus | null>(null);
   const [channelLoadError, setChannelLoadError] = useState<string | null>(null);
+  const [feishuDelivery, setFeishuDelivery] = useState<FeishuDeliverySettings | null>(null);
+  const [feishuDeliveryError, setFeishuDeliveryError] = useState<string | null>(null);
+  const [feishuDeliverySaving, setFeishuDeliverySaving] = useState(false);
+  const [feishuBinding, setFeishuBinding] = useState<MonitorDeliveryBindingAttempt | null>(null);
+  const [feishuBindingLoading, setFeishuBindingLoading] = useState(false);
   const [form, setForm] = useState<LLMFormState | null>(null);
   const [apiKey, setApiKey] = useState("");
   const [localApiKey, setLocalApiKeyState] = useState(() => getApiAuthKey());
@@ -114,8 +150,14 @@ export function Settings() {
           status: null,
           error: error instanceof Error ? error.message : "Unknown error",
         })),
+      api.getFeishuDeliverySettings()
+        .then((settings) => ({ settings, error: null }))
+        .catch((error: unknown) => ({
+          settings: null,
+          error: error instanceof Error ? error.message : "Unknown error",
+        })),
     ])
-      .then(([llmData, dataSourceData, researchData, codexResult, channelResult]) => {
+      .then(([llmData, dataSourceData, researchData, codexResult, channelResult, feishuResult]) => {
         if (!alive) return;
         setSettings(llmData);
         setForm(toForm(llmData));
@@ -128,6 +170,8 @@ export function Settings() {
         setCodexLoadError(codexResult.error);
         setChannelStatus(channelResult.status);
         setChannelLoadError(channelResult.error);
+        setFeishuDelivery(feishuResult.settings);
+        setFeishuDeliveryError(feishuResult.error);
         setSettingsLoadError(null);
       })
       .catch((error) => {
@@ -189,7 +233,11 @@ export function Settings() {
     [form?.provider, providers],
   );
   const selectableModels = form
-    ? (modelChoicesByProvider[form.provider] ?? selectedProvider?.models ?? [])
+    ? mergeWithCurrentModel(
+        modelChoicesByProvider[form.provider] ?? [],
+        selectedProvider?.models ?? [],
+        form.model_name,
+      )
     : [];
   const selectedModelOption = selectableModels.find((model) => model.id === form?.model_name);
   const usingCustomModel = selectableModels.length > 0 && !selectedModelOption;
@@ -223,6 +271,65 @@ export function Settings() {
     setApiKey("");
     setClearApiKey(false);
     setModelRefreshNote(null);
+  };
+
+  const saveDefaultFeishuTarget = async (targetId: string | null) => {
+    setFeishuDeliverySaving(true);
+    setFeishuDeliveryError(null);
+    try {
+      setFeishuDelivery(await api.updateFeishuDeliverySettings(targetId));
+      toast.success(targetId ? "默认飞书发送目标已更新" : "已清除默认飞书发送目标");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "保存失败";
+      setFeishuDeliveryError(message);
+      toast.error(message);
+    } finally {
+      setFeishuDeliverySaving(false);
+    }
+  };
+
+  const createFeishuBinding = async () => {
+    setFeishuBindingLoading(true);
+    setFeishuDeliveryError(null);
+    try {
+      setFeishuBinding(await api.createFeishuDeliveryBindingCode());
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "绑定码创建失败";
+      setFeishuDeliveryError(message);
+      toast.error(message);
+    } finally {
+      setFeishuBindingLoading(false);
+    }
+  };
+
+  const checkFeishuBinding = async () => {
+    if (!feishuBinding) return;
+    setFeishuBindingLoading(true);
+    try {
+      const result = await api.getFeishuDeliveryBindingCode(feishuBinding.binding_id);
+      setFeishuBinding(result);
+      if (result.status === "claimed") {
+        setFeishuDelivery(await api.getFeishuDeliverySettings());
+        toast.success("飞书发送目标绑定成功");
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "绑定状态检查失败");
+    } finally {
+      setFeishuBindingLoading(false);
+    }
+  };
+
+  const revokeFeishuTarget = async (targetId: string) => {
+    setFeishuDeliverySaving(true);
+    try {
+      await api.revokeFeishuDeliveryTarget(targetId);
+      setFeishuDelivery(await api.getFeishuDeliverySettings());
+      toast.success("飞书发送目标已停用");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "停用失败");
+    } finally {
+      setFeishuDeliverySaving(false);
+    }
   };
 
   const refreshAvailableModels = async () => {
@@ -1018,6 +1125,76 @@ export function Settings() {
             </div>
           </>
         )}
+
+        <section className="mt-5 border-t pt-5" aria-labelledby="feishu-delivery-title">
+          <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+            <div>
+              <h3 id="feishu-delivery-title" className="text-sm font-semibold">飞书发送目标</h3>
+              <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
+                Report 一键发送和新建 AI 监控默认继承这里的唯一默认目标；已有监控保留自己的独立目标。
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={createFeishuBinding}
+              disabled={feishuBindingLoading}
+              className="inline-flex items-center justify-center gap-2 rounded-md border px-3 py-2 text-xs font-medium hover:bg-muted disabled:opacity-50"
+            >
+              {feishuBindingLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <MessageSquareMore className="h-3.5 w-3.5" />}
+              绑定新的私聊或群聊
+            </button>
+          </div>
+
+          {feishuDeliveryError ? (
+            <div role="alert" className="mt-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-700 dark:text-amber-300">{feishuDeliveryError}</div>
+          ) : null}
+
+          {feishuBinding && feishuBinding.status === "pending" ? (
+            <div className="mt-3 rounded-md border border-blue-500/25 bg-blue-500/5 p-3 text-sm">
+              <div className="font-medium">在目标飞书会话发送以下绑定命令</div>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <code className="min-w-0 flex-1 break-all rounded bg-background px-2.5 py-2 text-xs">{feishuBinding.command || `/绑定监控 ${feishuBinding.code}`}</code>
+                <button type="button" onClick={() => void navigator.clipboard.writeText(feishuBinding.command || `/绑定监控 ${feishuBinding.code}`)} className="inline-flex items-center gap-1.5 rounded border bg-background px-2.5 py-2 text-xs hover:bg-muted"><Copy className="h-3.5 w-3.5" />复制</button>
+                <button type="button" onClick={checkFeishuBinding} disabled={feishuBindingLoading} className="inline-flex items-center gap-1.5 rounded border bg-background px-2.5 py-2 text-xs hover:bg-muted disabled:opacity-50"><RefreshCw className="h-3.5 w-3.5" />检查绑定状态</button>
+              </div>
+            </div>
+          ) : null}
+
+          {feishuDelivery?.requires_selection ? (
+            <div className="mt-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-700 dark:text-amber-300">
+              当前有多个激活目标但尚未设置默认值。Report 将禁止猜测发送目标，请在下方选择一个默认目标。
+            </div>
+          ) : null}
+
+          <div className="mt-3 grid gap-2">
+            {(feishuDelivery?.targets || []).map((target) => {
+              const active = target.status === "active";
+              return (
+                <article key={target.target_id} className="flex flex-col gap-3 rounded-md border bg-muted/10 p-3 sm:flex-row sm:items-center">
+                  <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
+                    <input
+                      type="radio"
+                      name="default-feishu-target"
+                      value={target.target_id}
+                      checked={feishuDelivery?.default_target_id === target.target_id}
+                      disabled={!active || feishuDeliverySaving}
+                      onChange={() => void saveDefaultFeishuTarget(target.target_id)}
+                      className="h-4 w-4 accent-primary"
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-sm font-medium">飞书 · {target.chat_type === "group" ? "群聊" : "私聊"} · …{target.chat_id.slice(-6)}</span>
+                      <span className="mt-0.5 block text-xs text-muted-foreground">{active ? (feishuDelivery?.effective_target_id === target.target_id ? "当前有效发送目标" : "已绑定") : "已停用"}</span>
+                    </span>
+                  </label>
+                  {active ? <button type="button" onClick={() => void revokeFeishuTarget(target.target_id)} disabled={feishuDeliverySaving} className="rounded border px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-muted disabled:opacity-50">停用</button> : null}
+                </article>
+              );
+            })}
+            {feishuDelivery && feishuDelivery.targets.length === 0 ? (
+              <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">尚未绑定飞书发送目标。绑定后，单一目标会自动成为有效发送目标。</div>
+            ) : null}
+          </div>
+        </section>
       </section>
 
       <div className="space-y-2">

@@ -20,6 +20,7 @@ export const TOOL_LABELS: Record<string, string> = {
   record_report_evidence: "登记研究依据",
   financial_rigor: "执行财务与估值计算",
   report_workspace: "整理报告章节",
+  weekly_report: "创建正式周报",
   trading_connections: "查看交易账户连接",
   trading_select_connection: "选择交易账户",
   trading_check: "检查交易账户连接",

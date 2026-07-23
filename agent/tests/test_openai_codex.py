@@ -76,6 +76,20 @@ def test_codex_body_strips_provider_prefix_and_converts_tools() -> None:
     assert body["input"][0]["content"][0]["text"] == "Say hi."
 
 
+def test_codex_bind_retains_client_cap_without_sending_unsupported_field() -> None:
+    adapter = OpenAICodexLLM(model=DEFAULT_CODEX_MODEL)
+
+    bounded = adapter.bind(max_tokens=1000)
+    body = bounded._body(
+        [{"role": "user", "content": "Return JSON."}],
+        stream=True,
+    )
+
+    assert adapter.max_output_tokens is None
+    assert bounded.max_output_tokens == 1000
+    assert "max_output_tokens" not in body
+
+
 def test_missing_codex_token_raises_login_hint(monkeypatch: pytest.MonkeyPatch) -> None:
     oauth_cli_kit = pytest.importorskip(
         "oauth_cli_kit",

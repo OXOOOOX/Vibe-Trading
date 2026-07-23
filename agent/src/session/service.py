@@ -5,33 +5,58 @@ V5: Uses AgentLoop instead of the fixed pipeline behind the generate skill.
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import concurrent.futures
 import json
 import os
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional
 
 from src.session.events import EventBus
 from src.session.models import Attempt, AttemptStatus, Message, Session
 from src.session.search import get_shared_index
 from src.session.store import SessionStore
-from src.usage import UsageRecorder, UsageStore, bind_usage_recorder
 from src.reports.execution import (
     DEEP_RESEARCH_ENGINE_CODEX_CLI,
     resolve_deep_research_engine,
 )
+from src.reports.execution_policy import (
+    EQUITY_DEEP_REPORT_MAX_ITERATIONS as _EQUITY_DEEP_REPORT_MAX_ITERATIONS,
+    MONITOR_STRUCTURAL_REFRESH_MAX_ITERATIONS as _MONITOR_STRUCTURAL_REFRESH_MAX_ITERATIONS,
+    MONITOR_STRUCTURAL_REFRESH_MAX_TOTAL_TOKENS as _MONITOR_STRUCTURAL_REFRESH_MAX_TOTAL_TOKENS,
+    STANDARD_AGENT_MAX_ITERATIONS as _STANDARD_AGENT_MAX_ITERATIONS,
+    resolve_agent_execution_limits,
+)
+from src.reports.runtime import handle_report_workspace_command, persist_report_event
+from src.reports.etf_report_readiness import etf_report_presentation
+from src.usage import UsageRecorder, UsageStore, bind_usage_recorder
 
 if TYPE_CHECKING:
     from src.agent.loop import AgentLoop
 
 # Dedicated thread pool limited to four concurrent agents to avoid exhausting the default executor.
 _AGENT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="agent")
-_STANDARD_AGENT_MAX_ITERATIONS = 50
-_EQUITY_DEEP_REPORT_MAX_ITERATIONS = 100
+_DEEP_REPORT_RESTART_INTERRUPTION = (
+    "后端进程在任务完成前重启，本次运行已中断；"
+    "请使用“用新数据更新”创建新的 revision。"
+)
+_CHAT_RESTART_INTERRUPTION = (
+    "后端进程在任务完成前重启，本次运行已中断；请重新发送上一条请求。"
+)
+
+
+def _confirmed_report_subject(request_content: str) -> tuple[str, str]:
+    match = re.search(
+        r"研究对象已由用户确认：\s*(.+?)（(\d{6}\.(?:SH|SZ|BJ|HK|US))）",
+        str(request_content or ""),
+        re.I,
+    )
+    if not match:
+        return "", ""
+    return match.group(2).upper(), match.group(1).strip()
 
 # Portfolio-page sessions are explicitly research-only. Keep their registry
 # narrow enough that an LLM cannot reach any broker/order tool even if a live
@@ -42,12 +67,14 @@ _PORTFOLIO_ANALYSIS_TOOL_NAMES = [
     "publish_obsidian_note",
     "portfolio_state",
     "get_data_context",
+    "get_official_filings",
     "web_search",
     "read_url",
     "read_research_document",
     "query_research_knowledge",
     "get_sector_info",
     "get_fund_flow",
+    "get_market_rules",
     "get_northbound_flow",
     "get_margin_trading",
     "get_block_trades",
@@ -55,12 +82,18 @@ _PORTFOLIO_ANALYSIS_TOOL_NAMES = [
     "get_shareholder_count",
     "get_lockup_expiry",
     "pattern",
+    "weekly_report",
 ]
 
 # Daily-run workers receive an immutable data manifest in their prompt. They
 # may load a formatting/research skill, but cannot re-read portfolio state,
 # bypass the data refresh policy, write files, or reach any broker surface.
 _PORTFOLIO_DAILY_RUN_TOOL_NAMES = ["load_skill"]
+
+# Weekly method workers receive the same frozen-input boundary as Daily Run
+# workers.  They may load the versioned methodology, but cannot refetch data,
+# mutate state, write files, call a swarm, or reach broker/order surfaces.
+_PORTFOLIO_WEEKLY_RUN_TOOL_NAMES = ["load_skill"]
 
 # Remote chat channels are intentionally limited to research and backtesting.
 # This is an actual registry allowlist, not a prompt-only promise: broker,
@@ -70,6 +103,7 @@ _CHANNEL_RESEARCH_TOOL_NAMES = [
     "load_skill",
     "portfolio_state",
     "get_data_context",
+    "get_official_filings",
     "web_search",
     "read_url",
     "read_research_document",
@@ -79,6 +113,7 @@ _CHANNEL_RESEARCH_TOOL_NAMES = [
     "analyze_image",
     "get_sector_info",
     "get_fund_flow",
+    "get_market_rules",
     "get_northbound_flow",
     "get_margin_trading",
     "get_block_trades",
@@ -130,6 +165,7 @@ _EQUITY_DEEP_RESEARCH_TOOL_NAMES = [
     "search_symbol",
     "analyze_financial_snapshot",
     "get_data_context",
+    "get_official_filings",
     "web_search",
     "read_url",
     "read_research_document",
@@ -142,10 +178,42 @@ _EQUITY_DEEP_RESEARCH_TOOL_NAMES = [
     "financial_rigor",
     "report_workspace",
 ]
+_ETF_DEEP_RESEARCH_TOOL_NAMES = [
+    "search_symbol",
+    "prepare_etf_research",
+    "get_data_context",
+    "get_official_filings",
+    "web_search",
+    "read_url",
+    "read_research_document",
+    "query_research_knowledge",
+    "read_document",
+    "read_file",
+    "get_sector_info",
+    "get_fund_flow",
+    "get_market_rules",
+    "get_shareholder_count",
+    "record_report_evidence",
+    "report_workspace",
+]
 _EQUITY_DEEP_FINANCIAL_COMMANDS = {
     "calc",
     "implied_terminal_earnings",
     "validate_terminal_scenarios",
+}
+
+_ENRICHMENT_TASK_LABELS = {
+    "annual_filings": "历史年报",
+    "business_position": "产业与竞争资料",
+    "consensus": "连续前瞻盈利预测",
+    "terminal_inputs": "长期经营情景依据",
+}
+_ENRICHMENT_STATUS_LABELS = {
+    "planned": "等待搜集",
+    "running": "正在继续核验",
+    "satisfied": "已取得可用证据",
+    "exhausted": "已完成规定检索，仍有资料缺口",
+    "not_applicable": "本次无需补充",
 }
 
 
@@ -170,6 +238,10 @@ def _research_tool_names_for_session(
     portfolio_daily_run = dict(config.get("portfolio_daily_run") or {})
     if portfolio_daily_run.get("research_only"):
         return _PORTFOLIO_DAILY_RUN_TOOL_NAMES
+
+    portfolio_weekly_run = dict(config.get("portfolio_weekly_run") or {})
+    if portfolio_weekly_run.get("research_only"):
+        return _PORTFOLIO_WEEKLY_RUN_TOOL_NAMES
 
     portfolio_analysis = dict(config.get("portfolio_analysis") or {})
     if portfolio_analysis.get("research_only"):
@@ -204,6 +276,9 @@ class SessionService:
         event_bus: EventBus,
         runs_dir: Path,
         usage_store: UsageStore | None = None,
+        weekly_report_handler: (
+            Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None
+        ) = None,
     ) -> None:
         """Initialize the session service.
 
@@ -216,6 +291,7 @@ class SessionService:
         self.event_bus = event_bus
         self.runs_dir = runs_dir
         self.usage_store = usage_store or UsageStore(store.base_dir.parent / "sessions.db")
+        self.weekly_report_handler = weekly_report_handler
         self._active_loops: Dict[str, "AgentLoop"] = {}
         self._session_locks: Dict[str, asyncio.Lock] = {}
         try:
@@ -273,8 +349,7 @@ class SessionService:
     @staticmethod
     def _index_research_session_message(session: Session, message: Message) -> None:
         research = dict((session.config or {}).get("research_session") or {})
-        linked_report_id = str((message.metadata or {}).get("linked_report_id") or "")
-        if not research and not linked_report_id:
+        if not research:
             return
         symbol = str(research.get("symbol") or research.get("resolved_symbol") or "").upper()
         try:
@@ -519,14 +594,26 @@ class SessionService:
                 if not self._deep_report_enabled():
                     raise RuntimeError("Deep Report is disabled by VIBE_TRADING_DEEP_REPORT_ENABLED")
                 report_profile = report_profile or "equity_deep_research"
+                qualified = re.search(r"(?<!\d)(\d{6})\.(SH|SZ)(?![A-Z0-9])", content.upper())
+                if qualified:
+                    code, exchange = qualified.groups()
+                    inferred_profile = (
+                        "etf_deep_research"
+                        if (
+                            (exchange == "SH" and code.startswith("5"))
+                            or (exchange == "SZ" and code.startswith(("15", "16")))
+                        )
+                        else "equity_deep_research"
+                    )
+                    report_profile = inferred_profile
                 allowed = self._enabled_deep_report_profiles()
                 if report_profile not in allowed:
                     raise ValueError(f"report profile is not enabled: {report_profile}")
-                if report_profile != "equity_deep_research":
-                    raise ValueError(f"unsupported report profile: {report_profile}")
-                from src.reports import build_equity_deep_research_prompt
+                from src.reports import build_deep_research_prompt, get_report_profile
 
-                attempt_prompt = build_equity_deep_research_prompt(
+                get_report_profile(report_profile)
+                attempt_prompt = build_deep_research_prompt(
+                    report_profile,
                     content,
                     parent_report_id=str(metadata.get("parent_report_id") or "") or None,
                     revision_sections=[
@@ -555,6 +642,26 @@ class SessionService:
             if role != "user":
                 return {"message_id": message.message_id}
 
+            research_turn_context: dict[str, Any] = {}
+            if response_mode == "chat" and (session.config or {}).get("research_session"):
+                from src.research.turn_context import (
+                    build_research_turn_context,
+                    update_proxy_authorizations,
+                )
+
+                research_config = dict(session.config.get("research_session") or {})
+                user_messages = [
+                    (item.message_id, item.content)
+                    for item in self.store.get_all_messages(session_id)
+                    if item.role == "user"
+                ]
+                update_proxy_authorizations(research_config, user_messages)
+                session.config["research_session"] = research_config
+                turn = build_research_turn_context(session.config, content)
+                research_turn_context = turn.to_dict()
+                if turn.primary_symbol:
+                    attempt_prompt = f"{turn.prompt_block()}\n\n[USER_REQUEST]\n{attempt_prompt}"
+
             attempt = Attempt(
                 attempt_id=attempt_id or uuid.uuid4().hex[:12],
                 session_id=session_id,
@@ -570,6 +677,14 @@ class SessionService:
                     "linked_report_id": linked_report_id or None,
                     "generation_source": metadata.get("generation_source") or "manual",
                     "generation_reason": metadata.get("generation_reason") or "",
+                    "research_depth": metadata.get("research_depth") or "standard",
+                    "extended_research_consent": bool(metadata.get("extended_research_consent")),
+                    "research_enrichment_plan": (
+                        dict(metadata.get("research_enrichment_plan") or {})
+                        if isinstance(metadata.get("research_enrichment_plan"), dict)
+                        else {}
+                    ),
+                    "research_turn_context": research_turn_context,
                 },
             )
             self.store.create_attempt(attempt)
@@ -631,6 +746,7 @@ class SessionService:
                 if key in {
                     "response_mode", "report_profile", "parent_report_id", "revision_sections",
                     "revision_mode", "linked_report_id", "generation_source", "generation_reason",
+                    "research_depth", "extended_research_consent", "research_enrichment_plan",
                 }
             }
             attempt_prompt = content
@@ -651,9 +767,10 @@ class SessionService:
                     f"[LINKED_STRUCTURED_CONTEXT]\n{linked_content[:24000]}"
                 )
             elif attempt_metadata.get("response_mode") == "deep_report":
-                from src.reports import build_equity_deep_research_prompt
+                from src.reports import build_deep_research_prompt
 
-                attempt_prompt = build_equity_deep_research_prompt(
+                attempt_prompt = build_deep_research_prompt(
+                    str(attempt_metadata.get("report_profile") or "equity_deep_research"),
                     content,
                     parent_report_id=str(attempt_metadata.get("parent_report_id") or "") or None,
                     revision_sections=[
@@ -661,6 +778,21 @@ class SessionService:
                     ],
                     revision_mode=str(attempt_metadata.get("revision_mode") or "initial"),
                 )
+            if attempt_metadata.get("response_mode", "chat") == "chat" and (
+                session.config or {}
+            ).get("research_session"):
+                from src.research.turn_context import (
+                    build_research_turn_context,
+                    update_proxy_authorizations,
+                )
+
+                research_config = dict(session.config.get("research_session") or {})
+                update_proxy_authorizations(research_config, [(target.message_id, content)])
+                session.config["research_session"] = research_config
+                turn = build_research_turn_context(session.config, content)
+                attempt_metadata["research_turn_context"] = turn.to_dict()
+                if turn.primary_symbol:
+                    attempt_prompt = f"{turn.prompt_block()}\n\n[USER_REQUEST]\n{attempt_prompt}"
             attempt = Attempt(
                 session_id=session_id,
                 parent_attempt_id=session.last_attempt_id,
@@ -714,15 +846,30 @@ class SessionService:
         """
 
         recovered = 0
-        interruption = (
-            "后端进程在任务完成前重启，本次运行已中断；"
-            "请使用“用新数据更新”创建新的 revision。"
-        )
         for attempt in self.store.list_attempts():
             if attempt.status not in {AttemptStatus.PENDING, AttemptStatus.RUNNING}:
                 continue
 
+            # Agent-originated portfolio writes are provisional until the
+            # attempt completes. A process restart makes completion impossible,
+            # so stale pending mutations must be discarded deterministically.
+            try:
+                from src.portfolio.state import discard_attempt_mutations
+
+                discard_attempt_mutations(attempt.attempt_id)
+            except Exception:
+                pass
+
             report = self.deep_reports.find_by_attempt(attempt.session_id, attempt.attempt_id)
+            is_deep_report = (
+                report is not None
+                or str(attempt.metadata.get("response_mode") or "") == "deep_report"
+            )
+            interruption = (
+                _DEEP_REPORT_RESTART_INTERRUPTION
+                if is_deep_report
+                else _CHAT_RESTART_INTERRUPTION
+            )
             if report is not None and report.status == "completed":
                 attempt.mark_completed(summary=self._format_deep_report_delivery(report))
             elif report is not None and report.status == "cancelled":
@@ -809,10 +956,14 @@ class SessionService:
         """Execute an Attempt in the background."""
         report_record = None
         if attempt.metadata.get("response_mode") == "deep_report":
+            request_content = str(
+                attempt.metadata.get("request_content") or attempt.prompt
+            )
+            confirmed_symbol, confirmed_name = _confirmed_report_subject(request_content)
             report_record = self.deep_reports.begin(
                 session_id=session.session_id,
                 attempt_id=attempt.attempt_id,
-                request_content=str(attempt.metadata.get("request_content") or attempt.prompt),
+                request_content=request_content,
                 profile=str(attempt.metadata.get("report_profile") or "equity_deep_research"),
                 parent_report_id=str(attempt.metadata.get("parent_report_id") or "") or None,
                 generation_source=str(attempt.metadata.get("generation_source") or "") or None,
@@ -821,8 +972,17 @@ class SessionService:
                 revision_sections=[
                     str(value) for value in (attempt.metadata.get("revision_sections") or [])
                 ],
+                symbol=confirmed_symbol,
+                security_name=confirmed_name,
+                security_name_source=("user_confirmed" if confirmed_symbol else ""),
             )
             attempt.metadata["report_id"] = report_record.report_id
+            enrichment_plan = attempt.metadata.get("research_enrichment_plan")
+            if isinstance(enrichment_plan, dict) and enrichment_plan.get("tasks"):
+                self.deep_reports.initialize_enrichment_plan(
+                    report_record.report_id,
+                    enrichment_plan,
+                )
         attempt.mark_running()
         self.store.update_attempt(attempt)
         self.event_bus.emit(session.session_id, "attempt.started", {"attempt_id": attempt.attempt_id})
@@ -851,6 +1011,7 @@ class SessionService:
                     {
                         "attempt_id": attempt.attempt_id,
                         "report_id": report_record.report_id,
+                        "report_profile": report_record.profile,
                         "phase": phase,
                         "message": message,
                     },
@@ -864,6 +1025,26 @@ class SessionService:
                 include_shell_tools=include_shell_tools,
                 session_config=dict(session.config),
             )
+            if attempt.metadata.get("response_mode") == "chat":
+                from src.portfolio.state import (
+                    commit_attempt_mutations,
+                    discard_attempt_mutations,
+                )
+
+                if result.get("status") == "success":
+                    try:
+                        committed_state = commit_attempt_mutations(attempt.attempt_id)
+                        result["portfolio_revision"] = committed_state.revision
+                    except Exception as exc:
+                        discard_attempt_mutations(attempt.attempt_id)
+                        result = {
+                            **result,
+                            "status": "failed",
+                            "reason": f"portfolio_commit_failed: {exc}",
+                            "error_code": "portfolio_commit_failed",
+                        }
+                else:
+                    discard_attempt_mutations(attempt.attempt_id)
             if result.get("status") == "success":
                 attempt.mark_completed(summary=result.get("content", ""))
             elif result.get("status") == "cancelled":
@@ -914,22 +1095,35 @@ class SessionService:
                             },
                         )
                         workspace = self.deep_reports.inspect_workspace(report_record.report_id)
-                        target_sections = [
+                        workspace_target_sections = [
                             section_id
                             for section_id, section in dict(workspace.get("sections") or {}).items()
                             if str((section or {}).get("status")) != "passed"
                         ]
+                        repair_context = self.deep_reports.repair_context(
+                            report_record.report_id,
+                            list(evaluation["validation"].get("issues") or []),
+                        )
+                        target_sections = list(dict.fromkeys([
+                            *workspace_target_sections,
+                            *list(repair_context.get("section_ids") or []),
+                        ]))
                         original_prompt = attempt.prompt
                         original_revision_mode = attempt.metadata.get("revision_mode")
                         attempt.metadata["pre_repair_run_dir"] = attempt.run_dir
                         attempt.metadata["agent_summary"] = attempt.summary
                         attempt.metadata["revision_mode"] = "repair"
+                        repair_profile = (
+                            "ETF" if report_record.profile == "etf_deep_research" else "EQUITY"
+                        )
                         attempt.prompt = (
-                            "[EQUITY_DEEP_REPORT_REPAIR]\n"
+                            f"[{repair_profile}_DEEP_REPORT_REPAIR]\n"
                             "首次 Report Workspace 编译未通过。不要重新输出整篇报告，也不要手工替代确定性计算。\n"
                             f"需要修复的章节：{', '.join(target_sections) or '根据校验问题定位'}\n"
                             "校验问题：\n- "
                             + "\n- ".join(evaluation["validation"].get("issues") or [])
+                            + "\n"
+                            + str(repair_context.get("prompt_block") or "")
                             + "\n先用 report_workspace.inspect 读取对应章节和 Fact/Evidence，"
                             "再用 report_workspace.submit_section 只提交修复后的章节正文。"
                         )
@@ -993,6 +1187,7 @@ class SessionService:
                         "report_revision": report_record.revision,
                         "report_parent_id": report_record.parent_report_id,
                         "report_delivery_kind": report_record.delivery_kind,
+                        "report_etf_readiness": report_record.etf_readiness,
                     }
                 )
 
@@ -1004,8 +1199,14 @@ class SessionService:
             if attempt.metrics:
                 reply_metadata["metrics"] = attempt.metrics
             if report_record is not None:
+                visible_modules = (
+                    report_record.report_sections
+                    if report_record.profile == "etf_deep_research"
+                    and report_record.report_sections
+                    else report_record.analysis_modules
+                )
                 missing_modules = [
-                    key for key, value in report_record.analysis_modules.items()
+                    key for key, value in visible_modules.items()
                     if value.status in {
                         "warning", "failed_validation", "insufficient_evidence", "not_requested",
                     }
@@ -1026,6 +1227,9 @@ class SessionService:
                         "report_parent_id": report_record.parent_report_id,
                         "report_revision_mode": report_record.revision_mode,
                         "report_delivery_kind": report_record.delivery_kind,
+                        "report_research_coverage": report_record.research_coverage,
+                        "report_history_delta": report_record.history_delta,
+                        "report_etf_readiness": report_record.etf_readiness,
                     }
                 )
 
@@ -1072,6 +1276,9 @@ class SessionService:
                      "report_parent_id": report_record.parent_report_id,
                      "report_revision_mode": report_record.revision_mode,
                      "report_delivery_kind": report_record.delivery_kind,
+                     "report_research_coverage": report_record.research_coverage,
+                     "report_history_delta": report_record.history_delta,
+                     "report_etf_readiness": report_record.etf_readiness,
                  } if report_record is not None else {})},
             )
             if report_record is not None:
@@ -1109,11 +1316,36 @@ class SessionService:
                             }
                             for key, value in report_record.analysis_modules.items()
                         },
+                        "research_coverage": report_record.research_coverage,
+                        "history_delta": report_record.history_delta,
+                        "etf_readiness": report_record.etf_readiness,
+                        "pipeline_checks": {
+                            key: value.to_dict() if hasattr(value, "to_dict") else {
+                                "status": value.status,
+                                "coverage": value.coverage,
+                                "reason": value.reason,
+                            }
+                            for key, value in report_record.pipeline_checks.items()
+                        },
+                        "report_sections": {
+                            key: {
+                                "status": value.status,
+                                "coverage": value.coverage,
+                                "reason": value.reason,
+                            }
+                            for key, value in report_record.report_sections.items()
+                        },
                         "missing_modules": missing_modules,
                     },
                 )
 
         except Exception as exc:
+            try:
+                from src.portfolio.state import discard_attempt_mutations
+
+                discard_attempt_mutations(attempt.attempt_id)
+            except Exception:
+                pass
             attempt.mark_failed(error=str(exc))
             self.store.update_attempt(attempt)
             if report_record is not None:
@@ -1131,7 +1363,10 @@ class SessionService:
 
     @staticmethod
     def _enabled_deep_report_profiles() -> set[str]:
-        raw = os.getenv("VIBE_TRADING_DEEP_REPORT_PROFILES", "equity_deep_research")
+        raw = os.getenv(
+            "VIBE_TRADING_DEEP_REPORT_PROFILES",
+            "equity_deep_research,etf_deep_research",
+        )
         return {item.strip() for item in raw.split(",") if item.strip()}
 
     @staticmethod
@@ -1190,18 +1425,84 @@ class SessionService:
             attempt_id=attempt_id,
             notify=_usage_notify,
         )
-        pm = PersistentMemory()
-
-        safe_overrides = sanitize_session_overrides(session_config) if session_config else session_config
-        agent_config = load_runtime_agent_config(overrides=safe_overrides)
-
         def event_callback(event_type: str, data: Dict[str, Any]) -> None:
             """Forward AgentLoop events to the SSE event bus."""
+            report_id = str(attempt.metadata.get("report_id") or "")
+            report_profile = str(attempt.metadata.get("report_profile") or "")
+            if event_type == "report.official_filing_refresh":
+                refresh = dict(data.get("refresh") or {})
+                coverage = dict(refresh.get("coverage") or {})
+                documents_by_year = dict(coverage.get("documents_by_year") or {})
+                document_refs = list(refresh.get("document_refs") or [])
+                for documents in documents_by_year.values():
+                    if not isinstance(documents, list):
+                        continue
+                    document_refs.extend(
+                        str(item.get("document_ref") or "")
+                        for item in documents
+                        if isinstance(item, dict) and item.get("document_ref")
+                    )
+                covered_years = [int(value) for value in coverage.get("covered_years") or []]
+                provider_attempts = [
+                    dict(item) for item in refresh.get("provider_attempts") or []
+                    if isinstance(item, dict)
+                ]
+                outcome = "evidence_accepted" if covered_years else "no_results"
+                if not covered_years and any(
+                    str(item.get("status") or "") in {"failed", "document_failed"}
+                    for item in provider_attempts
+                ):
+                    outcome = "retrieval_failed"
+                task_status = None
+                if report_id and self.deep_reports.enrichment_plan(report_id):
+                    receipt = self.deep_reports.record_research_attempt(
+                        report_id,
+                        task_id="annual_filings",
+                        outcome=outcome,
+                        query=(
+                            "official annual reports: "
+                            + ",".join(str(value) for value in data.get("annual_years") or [])
+                        ),
+                        document_refs=list(dict.fromkeys(value for value in document_refs if value)),
+                        covered_years=covered_years,
+                        detail=json.dumps(provider_attempts, ensure_ascii=False, default=str)[:2000],
+                    )
+                    task_status = dict(receipt.get("task") or {}).get("status")
+                self.event_bus.emit(
+                    session_id,
+                    "report.progress",
+                    {
+                        "attempt_id": attempt_id,
+                        "report_id": report_id,
+                        "phase": "source_verification",
+                        "message": (
+                            f"历史年报归档：已覆盖 {len(covered_years)} 个年度，"
+                            f"{_ENRICHMENT_STATUS_LABELS.get(str(task_status), '已记录本次结果')}"
+                        ),
+                        "task_id": "annual_filings",
+                        "task_status": task_status,
+                        "outcome": outcome,
+                    },
+                )
+                return
+            persisted = bool(
+                report_id
+                and persist_report_event(
+                    self.deep_reports,
+                    report_id,
+                    report_profile,
+                    event_type,
+                    data,
+                    allowed_deterministic_commands=(
+                        _EQUITY_DEEP_FINANCIAL_COMMANDS
+                        if report_profile == "equity_deep_research"
+                        else None
+                    ),
+                )
+            )
             if event_type == "report.analysis_snapshot":
-                report_id = str(attempt.metadata.get("report_id") or "")
                 analysis = data.get("analysis")
-                if report_id and isinstance(analysis, dict):
-                    self.deep_reports.attach_analysis(report_id, analysis)
+                if persisted and isinstance(analysis, dict):
                     self.event_bus.emit(
                         session_id,
                         "report.progress",
@@ -1216,10 +1517,7 @@ class SessionService:
                     )
                 return
             if event_type == "report.external_evidence":
-                report_id = str(attempt.metadata.get("report_id") or "")
-                bundle = data.get("bundle")
-                if report_id and isinstance(bundle, dict):
-                    self.deep_reports.attach_external_evidence(report_id, bundle)
+                if persisted:
                     self.event_bus.emit(
                         session_id,
                         "report.progress",
@@ -1231,17 +1529,34 @@ class SessionService:
                         },
                     )
                 return
+            if event_type in {
+                "report.etf_component_selection",
+                "report.component_digest_resolution",
+            }:
+                if persisted:
+                    phase = (
+                        "financial_standardization"
+                        if event_type == "report.etf_component_selection"
+                        else "industry_evidence"
+                    )
+                    message = (
+                        "ETF 成分结构与确定性选择已保存"
+                        if event_type == "report.etf_component_selection"
+                        else "成分研究复用状态与来源已保存"
+                    )
+                    self.event_bus.emit(
+                        session_id,
+                        "report.progress",
+                        {
+                            "attempt_id": attempt_id,
+                            "report_id": report_id,
+                            "phase": phase,
+                            "message": message,
+                        },
+                    )
+                return
             if event_type == "report.deterministic_result":
-                report_id = str(attempt.metadata.get("report_id") or "")
-                command = str(data.get("command") or "")
-                result = data.get("result")
-                if report_id and command and isinstance(result, dict):
-                    if (
-                        attempt.metadata.get("report_profile") == "equity_deep_research"
-                        and command not in {"implied_terminal_earnings", "validate_terminal_scenarios"}
-                    ):
-                        raise ValueError(f"deterministic command is not allowed for equity_deep_research: {command}")
-                    self.deep_reports.attach_deterministic_result(report_id, command, result)
+                if persisted:
                     self.event_bus.emit(
                         session_id,
                         "report.progress",
@@ -1254,10 +1569,8 @@ class SessionService:
                     )
                 return
             if event_type == "report.audit_result":
-                report_id = str(attempt.metadata.get("report_id") or "")
                 audit_result = data.get("result")
-                if report_id and isinstance(audit_result, dict):
-                    self.deep_reports.attach_audit_result(report_id, audit_result)
+                if persisted and isinstance(audit_result, dict):
                     self.event_bus.emit(
                         session_id,
                         "report.progress",
@@ -1271,7 +1584,6 @@ class SessionService:
                     )
                 return
             if event_type == "report.workspace_section":
-                report_id = str(attempt.metadata.get("report_id") or "")
                 self.event_bus.emit(
                     session_id,
                     "report.progress",
@@ -1281,6 +1593,42 @@ class SessionService:
                         "phase": "chapter_writing",
                         "message": f"章节 {data.get('section_id') or ''} 已通过工作区校验",
                         "section_id": data.get("section_id"),
+                    },
+                )
+                return
+            if event_type == "report.research_enrichment":
+                task_id = str(data.get("task_id") or "")
+                task_status = str(data.get("status") or "running")
+                self.event_bus.emit(
+                    session_id,
+                    "report.progress",
+                    {
+                        "attempt_id": attempt_id,
+                        "report_id": report_id,
+                        "phase": "source_verification",
+                        "message": (
+                            f"{_ENRICHMENT_TASK_LABELS.get(task_id, '补充资料')}："
+                            f"{_ENRICHMENT_STATUS_LABELS.get(task_status, '已记录本次核验')}"
+                        ),
+                        "task_id": task_id,
+                        "task_status": task_status,
+                        "outcome": data.get("outcome"),
+                    },
+                )
+                return
+            if event_type == "report.monitoring_bundle":
+                self.event_bus.emit(
+                    session_id,
+                    "report.progress",
+                    {
+                        "attempt_id": attempt_id,
+                        "report_id": report_id,
+                        "phase": "monitoring_bundle",
+                        "message": (
+                            "结构层监控依据已校验；"
+                            f"保留 {int(data.get('candidate_count') or 0)} 个候选"
+                        ),
+                        "candidate_count": int(data.get("candidate_count") or 0),
                     },
                 )
                 return
@@ -1295,75 +1643,43 @@ class SessionService:
             attempt.metadata.get("response_mode") == "deep_report"
             and attempt.metadata.get("report_profile") == "equity_deep_research"
         )
-
-        def _workspace_string_list(value: Any) -> list[str]:
-            if isinstance(value, list):
-                return [str(item) for item in value if str(item).strip()]
-            if isinstance(value, str) and value.strip():
-                raw = value.strip()
-                if raw.startswith("[") and raw.endswith("]"):
-                    try:
-                        parsed = ast.literal_eval(raw)
-                    except (SyntaxError, ValueError):
-                        parsed = None
-                    if isinstance(parsed, list):
-                        return [str(item) for item in parsed if str(item).strip()]
-                return [item.strip(" \t'\"") for item in raw.split(",") if item.strip(" \t'\"")]
-            return []
-
-        def _workspace_bool(value: Any, default: bool = True) -> bool:
-            if value is None:
-                return default
-            if isinstance(value, str):
-                return value.strip().lower() not in {"0", "false", "no", "off"}
-            return bool(value)
+        is_etf_deep_report = (
+            attempt.metadata.get("response_mode") == "deep_report"
+            and attempt.metadata.get("report_profile") == "etf_deep_research"
+        )
+        is_deep_report = is_equity_deep_report or is_etf_deep_report
 
         def _report_workspace_handler(command: str, payload: dict[str, Any]) -> dict[str, Any]:
             report_id = str(attempt.metadata.get("report_id") or "")
-            if not is_equity_deep_report or not report_id:
+            if not is_deep_report or not report_id:
                 raise ValueError("report workspace is unavailable outside an active Deep Report")
-            if command == "inspect":
-                fact_metrics = _workspace_string_list(payload.get("fact_metrics"))
-                evidence_domains = _workspace_string_list(payload.get("evidence_domains"))
-                return {
-                    "status": "ok",
-                    **self.deep_reports.inspect_workspace(
-                        report_id,
-                        section_ids=_workspace_string_list(payload.get("section_ids")) or None,
-                        # Unfiltered inspect is deliberately catalog-only.  A
-                        # complete Fact/Evidence ledger plus eight inherited
-                        # section bodies can exceed a model context before it
-                        # writes anything.  The Agent first sees catalogs, then
-                        # requests only the records needed for a section.
-                        fact_metrics=fact_metrics or ["__catalog_only__"],
-                        evidence_domains=evidence_domains or ["__catalog_only__"],
-                        include_module_statuses=_workspace_bool(
-                            payload.get("include_module_statuses"), True
-                        ),
-                        include_section_bodies=(
-                            _workspace_bool(payload.get("include_section_bodies"))
-                            if payload.get("include_section_bodies") is not None
-                            else None
-                        ),
-                    ),
-                }
-            if command == "submit_section":
-                section_id = str(payload.get("section_id") or "")
-                body_markdown = str(payload.get("body_markdown") or "")
-                section = self.deep_reports.submit_section(
-                    report_id,
-                    section_id=section_id,
-                    body_markdown=body_markdown,
-                )
-                return {"status": "ok", "section": section.to_dict()}
-            raise ValueError(f"unknown report workspace command: {command}")
+            return handle_report_workspace_command(
+                self.deep_reports,
+                report_id,
+                command,
+                payload,
+            )
+
+        def _weekly_report_handler(
+            command: str, payload: dict[str, Any]
+        ) -> dict[str, Any]:
+            if self.weekly_report_handler is None:
+                raise ValueError("weekly report service is unavailable")
+            future = asyncio.run_coroutine_threadsafe(
+                self.weekly_report_handler(command, payload), loop
+            )
+            return future.result(timeout=30)
 
         research_tool_names = (
             list(_EQUITY_DEEP_RESEARCH_TOOL_NAMES)
             if is_equity_deep_report
-            else _research_tool_names_for_session(session_config)
+            else (
+                list(_ETF_DEEP_RESEARCH_TOOL_NAMES)
+                if is_etf_deep_report
+                else _research_tool_names_for_session(session_config)
+            )
         )
-        if is_equity_deep_report:
+        if is_deep_report:
             revision_mode = str(attempt.metadata.get("revision_mode") or "initial")
             if revision_mode == "repair":
                 # A repair round receives only the failed section bodies, exact
@@ -1378,7 +1694,7 @@ class SessionService:
                 ]
 
         history = self._convert_messages_to_history(messages) if messages else None
-        if is_equity_deep_report and self._codex_cli_enabled():
+        if is_deep_report and self._codex_cli_enabled():
             from src.codex_cli import CodexResearchRunner
 
             report_id = str(attempt.metadata.get("report_id") or "")
@@ -1393,13 +1709,15 @@ class SessionService:
                 session_id=session_id,
                 attempt_id=attempt_id,
                 report_id=report_id,
-                report_profile="equity_deep_research",
+                report_profile=str(attempt.metadata.get("report_profile") or "equity_deep_research"),
                 revision_mode=str(attempt.metadata.get("revision_mode") or "initial"),
                 prompt=attempt.prompt,
                 history=history,
                 reports_dir=self.deep_reports.base_dir,
                 allowed_tools=list(research_tool_names or ["report_workspace"]),
-                financial_rigor_commands=_EQUITY_DEEP_FINANCIAL_COMMANDS,
+                financial_rigor_commands=(
+                    _EQUITY_DEEP_FINANCIAL_COMMANDS if is_equity_deep_report else None
+                ),
                 event_callback=event_callback,
                 usage_recorder=usage_recorder,
                 semaphore=self._codex_semaphore,
@@ -1411,6 +1729,10 @@ class SessionService:
                 self._active_loops.pop(session_id, None)
 
         llm = ChatLLM()
+        pm = PersistentMemory()
+        safe_overrides = sanitize_session_overrides(session_config) if session_config else session_config
+        agent_config = load_runtime_agent_config(overrides=safe_overrides)
+
         if research_tool_names is not None:
             registry = await loop.run_in_executor(
                 _AGENT_EXECUTOR,
@@ -1423,7 +1745,10 @@ class SessionService:
                         _EQUITY_DEEP_FINANCIAL_COMMANDS if is_equity_deep_report else None
                     ),
                     report_workspace_handler=(
-                        _report_workspace_handler if is_equity_deep_report else None
+                        _report_workspace_handler if is_deep_report else None
+                    ),
+                    weekly_report_handler=(
+                        _weekly_report_handler if self.weekly_report_handler else None
                     ),
                 ),
             )
@@ -1438,20 +1763,26 @@ class SessionService:
                     event_callback=event_callback,
                     warn_callback=_mcp_collision_warn,
                     exclude_tool_names=_UNIFIED_DATA_SUPERSEDED_TOOL_NAMES,
+                    weekly_report_handler=(
+                        _weekly_report_handler if self.weekly_report_handler else None
+                    ),
                 ),
             )
 
+        execution_limits = resolve_agent_execution_limits(
+            is_deep_report=is_deep_report,
+            generation_source=str(attempt.metadata.get("generation_source") or ""),
+        )
         agent = AgentLoop(
             registry=registry,
             llm=llm,
             event_callback=event_callback,
-            max_iterations=(
-                _EQUITY_DEEP_REPORT_MAX_ITERATIONS
-                if is_equity_deep_report
-                else _STANDARD_AGENT_MAX_ITERATIONS
-            ),
+            max_iterations=execution_limits.max_iterations,
+            max_total_tokens=execution_limits.max_total_tokens,
             persistent_memory=pm,
             usage_recorder=usage_recorder,
+            attempt_id=attempt_id,
+            research_turn_context=dict(attempt.metadata.get("research_turn_context") or {}),
         )
         self._active_loops[session_id] = agent
 
@@ -1541,6 +1872,22 @@ class SessionService:
     def _format_deep_report_delivery(record: Any) -> str:
         identity = record.security_name or record.symbol or "单股"
         symbol = f"（{record.symbol}）" if record.symbol else ""
+        if record.profile == "etf_deep_research":
+            presentation = etf_report_presentation(record.etf_readiness)
+            if record.quality_status == "failed_validation":
+                presentation = etf_report_presentation({"status": "not_publishable"})
+            metrics = dict(record.etf_readiness.get("metrics") or {})
+            coverage = float(metrics.get("component_research_coverage") or 0.0)
+            if presentation["status"] == "not_publishable":
+                return (
+                    f"{identity}{symbol}ETF 研究第 {record.revision} 版尚未形成正式报告。"
+                    "关键数据或内容没有通过发布前校验；你可以打开诊断结果查看原因，系统不会生成 PDF。"
+                )
+            return (
+                f"{identity}{symbol}{presentation['title_label']}第 {record.revision} 版已生成。"
+                f"成分研究覆盖率为 {coverage:.1%}。{presentation['completion_message']}；"
+                "点击下方卡片即可阅读报告。"
+            )
         if record.quality_status == "failed_validation":
             return (
                 f"{identity}{symbol}穿透式深度研究第 {record.revision} 版尚未形成正式报告。"

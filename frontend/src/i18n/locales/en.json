@@ -153,6 +153,17 @@
           "footer": "Best for reviewable listed-company research. Modules with insufficient evidence are explicitly downgraded.",
           "cta": "Enter deep research mode"
         },
+        "weeklyReport": {
+          "title": "Formal weekly review",
+          "description": "Create a persisted weekly report for one stock or ETF and keep it in the report library.",
+          "eyebrow": "Completed week · Formal run · Markdown + PDF",
+          "detail1": "Resolve the exact security and use the latest completed trading week by default",
+          "detail2": "Create a formal WeeklyReportRun with structured JSON, Markdown, and PDF artifacts",
+          "detail3": "Keep this user-facing report separate from the reserved monitor-facing profile",
+          "footer": "Research only: it does not activate monitoring, send files, execute trades, or authorize extended component research.",
+          "cta": "Add a stock or ETF",
+          "prompt": "Generate a formal user-facing weekly report for [company, ETF, or exact ticker]. Resolve the exact security first, then call weekly_report with command=start for the latest completed trading week. Do not replace the formal run with a chat summary. Do not activate monitoring, deliver files, execute trades, or authorize P4B2 research."
+        },
         "marketReview": {
           "title": "Pre / post-market review",
           "description": "Combine holdings, overnight markets, and news into the next-session watch list.",
@@ -479,6 +490,7 @@
     "connectorRuntimeHalted": "Connector runtime halted",
     "checkConnector": "Check connector",
     "analyzePortfolio": "Analyze connector portfolio",
+    "weeklyReport": "Create formal weekly review",
     "executionTimedOut": "Execution timed out, automatically stopped",
     "researchGoalAttached": "Research goal attached",
     "failedToStartGoal": "Failed to start goal.",

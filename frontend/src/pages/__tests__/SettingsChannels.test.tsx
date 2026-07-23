@@ -11,6 +11,11 @@ const apiMock = vi.hoisted(() => ({
   getChannelStatus: vi.fn(),
   startChannels: vi.fn(),
   stopChannels: vi.fn(),
+  getFeishuDeliverySettings: vi.fn(),
+  updateFeishuDeliverySettings: vi.fn(),
+  createFeishuDeliveryBindingCode: vi.fn(),
+  getFeishuDeliveryBindingCode: vi.fn(),
+  revokeFeishuDeliveryTarget: vi.fn(),
   updateLLMSettings: vi.fn(),
   updateDataSourceSettings: vi.fn(),
   updateResearchSettings: vi.fn(),
@@ -121,6 +126,7 @@ function researchSettings(enabled = true, auto = false, codex = false) {
   return {
     deep_report_enabled: enabled,
     equity_deep_research_enabled: enabled,
+    etf_deep_research_enabled: enabled,
     monitor_auto_deep_report_enabled: auto,
     effective_monitor_auto_deep_report_enabled: enabled && auto,
     deep_research_engine: codex ? "codex_cli" as const : "provider" as const,
@@ -129,8 +135,8 @@ function researchSettings(enabled = true, auto = false, codex = false) {
     effective_codex_cli_enabled: enabled && codex,
     codex_cli_model: "gpt-5.6-terra",
     codex_cli_reasoning_effort: "medium",
-    enabled_profiles: ["equity_deep_research"],
-    available_profiles: ["equity_deep_research"],
+    enabled_profiles: ["equity_deep_research", "etf_deep_research"],
+    available_profiles: ["equity_deep_research", "etf_deep_research"],
     env_path: "agent/.env",
   };
 }
@@ -206,6 +212,12 @@ describe("Settings IM channels panel", () => {
       message: "opened",
     });
     apiMock.getChannelStatus.mockResolvedValue(channelStatus());
+    apiMock.getFeishuDeliverySettings.mockResolvedValue({
+      targets: [],
+      default_target_id: null,
+      effective_target_id: null,
+      requires_selection: false,
+    });
     apiMock.startChannels.mockResolvedValue(channelStatus({ running: true }));
     apiMock.stopChannels.mockResolvedValue(channelStatus());
     apiMock.updateResearchSettings.mockResolvedValue(researchSettings(false));
@@ -231,6 +243,35 @@ describe("Settings IM channels panel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Start channels" }));
 
     await waitFor(() => expect(apiMock.startChannels).toHaveBeenCalledTimes(1));
+  });
+
+  it("requires and persists one global default when multiple Feishu targets are active", async () => {
+    const targets = [
+      { target_id: "target-group", channel: "feishu", chat_id: "oc_group123456", chat_type: "group", session_key: "feishu:group", status: "active", created_at: "2026-07-19T10:00:00Z" },
+      { target_id: "target-p2p", channel: "feishu", chat_id: "ou_user654321", chat_type: "p2p", session_key: "feishu:p2p", status: "active", created_at: "2026-07-19T10:01:00Z" },
+    ];
+    apiMock.getFeishuDeliverySettings.mockResolvedValueOnce({
+      targets,
+      default_target_id: null,
+      effective_target_id: null,
+      requires_selection: true,
+    });
+    apiMock.updateFeishuDeliverySettings.mockResolvedValue({
+      targets,
+      default_target_id: "target-group",
+      effective_target_id: "target-group",
+      requires_selection: false,
+    });
+
+    render(<Settings />);
+
+    expect(await screen.findByText("飞书发送目标")).toBeInTheDocument();
+    expect(screen.getByText(/多个激活目标但尚未设置默认值/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("radio", { name: /飞书 · 群聊 · …123456/ }));
+
+    await waitFor(() => {
+      expect(apiMock.updateFeishuDeliverySettings).toHaveBeenCalledWith("target-group");
+    });
   });
 
   it("keeps core settings usable when channel status is unavailable", async () => {
