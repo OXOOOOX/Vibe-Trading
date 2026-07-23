@@ -46,6 +46,7 @@ wiki/.wrangler/
 wiki/.cache/
 .vibe-dev/
 .vibe-record/
+.runtime/
 .cache/
 .remotion/
 
@@ -67,6 +68,8 @@ data/overnight*.log
 data/*.log
 data/test_write.txt
 agent/.pytest_tmp/
+/.pytest_tmp_*/
+/agent/data/*.sqlite3
 agent/vibe_trading.egg-info/
 agent/vibe_trading_ai.egg-info/
 agent/tests/e2e_backtest/
