@@ -39,6 +39,7 @@ _SCOPE_LABELS = {
     "fund_flow": "资金流",
     "news": "新闻",
     "fundamentals": "基本面",
+    "etf_share": "ETF份额",
 }
 _SCOPE_STATUS_LABELS = {
     "verified": "已校核",
@@ -51,6 +52,56 @@ _CONDITION_STATUS_LABELS = {
     "available": "可设置",
     "not_recommended": "暂不建议",
     "data_insufficient": "数据不足",
+}
+_MONITORING_STATUS_LABELS = {
+    "available": "可生成监控候选",
+    "not_recommended": "暂不建议生成监控候选",
+    "data_insufficient": "数据不足，无法生成监控候选",
+}
+_HORIZON_LABELS = {"daily": "日线", "weekly": "周线", "intraday": "盘中"}
+_ADJUSTMENT_LABELS = {"raw": "原始不复权价格", "qfq": "前复权价格", "hfq": "后复权价格"}
+_UNIT_LABELS = {"CNY": "人民币元", "ratio": "倍", "shares": "股", "lots": "手"}
+_BASELINE_LABELS = {"same_time_bucket_median": "同时段历史成交量中位数"}
+_ACTIVATION_LABELS = {"manual_confirmation_required": "须经人工确认后启用"}
+_TRADE_EXECUTION_LABELS = {"forbidden": "禁止自动交易"}
+_INTENT_LABELS = {
+    "watch": "观察",
+    "breakout": "突破观察",
+    "buy_point": "买点观察",
+    "add_position": "加仓观察",
+    "stop_loss": "止损风险观察",
+    "take_profit": "止盈观察",
+}
+_TRIGGER_KIND_LABELS = {
+    "price_cross_above": "价格向上穿越",
+    "price_cross_below": "价格向下穿越",
+    "price_zone_enter": "价格进入区间",
+    "price_zone_exit": "价格离开区间",
+}
+_INTERVAL_LABELS = {"1m": "1分钟", "5m": "5分钟", "30m": "30分钟", "1d": "日线", "1w": "周线"}
+_VOLUME_METRIC_LABELS = {
+    "same_time_bucket_median": "同时段成交量中位数",
+    "same_bucket_5m_volume_ratio": "同时段5分钟成交量比",
+    "same_clock_cumulative_volume_ratio": "同一时刻累计成交量比",
+    "absolute_cumulative_volume": "累计成交量",
+}
+_COMPARATOR_LABELS = {"gte": "不低于", "lte": "不高于", "gt": "高于", "lt": "低于"}
+_MAPPING_STATUS_LABELS = {"mapped": "已映射", "partial": "部分映射"}
+_AUTOMATION_STATUS_LABELS = {"action_ready": "条件已映射，可供人工启用", "watch_only": "仅观察"}
+_CHANGE_TYPE_LABELS = {
+    "new": "新增",
+    "unchanged": "未变化",
+    "modified": "已修改",
+    "raised": "上调",
+    "lowered": "下调",
+    "withdrawn": "已撤回",
+}
+_CONDITION_ROLE_LABELS = {"required": "必要条件", "supportive": "辅助条件", "invalidation": "失效条件"}
+_CONDITION_COVERAGE_LABELS = {
+    "mapped": "已映射",
+    "awaiting_data": "等待所需数据",
+    "ambiguous": "含义待澄清",
+    "unsupported": "当前不支持",
 }
 
 
@@ -71,12 +122,64 @@ def _priority_label(priority: Any) -> str:
     return _PRIORITY_LABELS.get(key, f"🔵 {_table_cell(priority)}")
 
 
+def _label(mapping: dict[str, str], value: Any, default: str = "未识别") -> str:
+    if value in (None, ""):
+        return "—"
+    return mapping.get(str(value), default)
+
+
+def _trigger_text(trigger: dict[str, Any]) -> str:
+    kind = _label(_TRIGGER_KIND_LABELS, trigger.get("kind"), "价格条件")
+    if trigger.get("lower") is not None and trigger.get("upper") is not None:
+        level = f"{trigger.get('lower')}–{trigger.get('upper')}"
+    else:
+        level = str(trigger.get("threshold") or trigger.get("value") or "—")
+    interval = _label(_INTERVAL_LABELS, trigger.get("interval"), "未指定周期")
+    count = trigger.get("confirmation_count") or trigger.get("consecutive") or 1
+    return f"{kind} {level}；{interval}连续确认{count}次"
+
+
+def _invalidation_text(value: Any) -> str:
+    item = value if isinstance(value, dict) else {}
+    kind = _label(_TRIGGER_KIND_LABELS, item.get("kind"), "价格失效条件")
+    level = item.get("level") or item.get("value") or item.get("threshold") or "—"
+    return f"{kind} {level}"
+
+
+def _human_condition_text(value: Any) -> str:
+    text = str(value or "—")
+    replacements = (
+        ("price_cross_above", "价格向上穿越"),
+        ("price_cross_below", "价格向下穿越"),
+        ("price_zone_enter", "价格进入区间"),
+        ("price_zone_exit", "价格离开区间"),
+        ("watch_only", "仅观察"),
+        ("action_ready", "条件已映射，可供人工启用"),
+        ("observe", "继续观察"),
+        ("（1m，", "（1分钟，"),
+        ("（5m，", "（5分钟，"),
+        ("（30m，", "（30分钟，"),
+        ("（1d，", "（日线，"),
+        ("（1w，", "（周线，"),
+    )
+    for source, target in replacements:
+        text = text.replace(source, target)
+    return text
+
+
 def _scope_summary(brief: dict[str, Any]) -> str:
     scopes = brief.get("data_scopes") or {}
     if not isinstance(scopes, dict) or not scopes:
         return _DATA_STATUS_LABELS.get(str(brief.get("data_status") or ""), "未提供分区状态")
     parts = []
-    for scope in ("daily", "intraday", "fund_flow", "news", "fundamentals"):
+    for scope in (
+        "daily",
+        "intraday",
+        "fund_flow",
+        "news",
+        "fundamentals",
+        "etf_share",
+    ):
         raw = scopes.get(scope)
         if raw is None:
             continue
@@ -93,6 +196,27 @@ def _money(value: Any) -> float:
         return max(0.0, float(value or 0))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _signed_number(value: Any, suffix: str) -> str:
+    try:
+        return f"{float(value):+,.0f} {suffix}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _plain_number(value: Any, suffix: str) -> str:
+    try:
+        return f"{float(value):,.0f} {suffix}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _ratio_pct(value: Any) -> str:
+    try:
+        return f"{float(value) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return "—"
 
 
 def holding_value(holding: dict[str, Any]) -> float:
@@ -389,6 +513,12 @@ def render_holding_markdown(
 ) -> str:
     name = str(holding.get("name") or brief.get("symbol") or "个股")
     label = _security_label({"name": name, "symbol": brief.get("symbol")})
+    asset_type = str(
+        holding.get("asset_type") or holding.get("security_type") or ""
+    ).casefold()
+    report_label = (
+        "ETF晨报" if "etf" in name.casefold() or asset_type == "etf" else "个股晨报"
+    )
     trend = brief.get("trend") if isinstance(brief.get("trend"), dict) else {}
     condition_status = str(brief.get("condition_order_status") or (
         "available" if brief.get("condition_orders") else "not_recommended"
@@ -396,17 +526,124 @@ def render_holding_markdown(
     condition_summary = str(brief.get("condition_order_summary") or (
         "具体条件情景见正文。" if brief.get("condition_orders") else "等待趋势和量价信号进一步确认。"
     ))
+    monitoring_bundle = brief.get("monitoring_bundle")
+    monitoring_candidates = (
+        monitoring_bundle.get("candidates") or []
+        if isinstance(monitoring_bundle, dict)
+        else []
+    )
+    condition_status_label = _CONDITION_STATUS_LABELS.get(condition_status, "暂不建议")
+    if monitoring_candidates and not any(
+        item.get("automation_status") == "action_ready"
+        for item in monitoring_candidates
+        if isinstance(item, dict)
+    ):
+        condition_status_label = "仅观察（不可执行）"
     scope_summary = _scope_summary(brief)
     display_data_status = (
         scope_summary
         if isinstance(brief.get("data_scopes"), dict) and brief.get("data_scopes")
         else _DATA_STATUS_LABELS.get(data_status, data_status)
     )
+    market_data_basis = (
+        brief.get("market_data_basis")
+        if isinstance(brief.get("market_data_basis"), dict)
+        else {}
+    )
+    market_data_note = str(market_data_basis.get("note") or "").strip()
+    etf_share_context = (
+        brief.get("etf_share_context")
+        if isinstance(brief.get("etf_share_context"), dict)
+        else {}
+    )
+    method_snapshot = (
+        brief.get("analysis_method_snapshot")
+        if isinstance(brief.get("analysis_method_snapshot"), dict)
+        else {}
+    )
+    agent_analysis = (
+        brief.get("agent_analysis")
+        if isinstance(brief.get("agent_analysis"), dict)
+        else {}
+    )
+    method_lines: list[str] = ["## 分析方法与反证审查", ""]
+    regime = method_snapshot.get("regime") or {}
+    if method_snapshot:
+        method_lines.append(
+            f"- 确定性市场状态：{regime.get('stage') or '待确认'}；"
+            f"方向 {regime.get('direction') or '待确认'}；"
+            f"强度 {regime.get('strength') or '待确认'}；"
+            f"波动 {regime.get('volatility_state') or '待确认'}。"
+        )
+    if agent_analysis.get("status") == "completed":
+        labels = {
+            str(item.get("method_id")): str(item.get("label") or "已登记分析方法")
+            for item in method_snapshot.get("methods") or []
+            if isinstance(item, dict)
+        }
+        selected_methods = [
+            labels.get(str(item), "已登记分析方法")
+            for item in agent_analysis.get("selected_methods") or []
+        ]
+        method_lines.extend(
+            [
+                f"- 分析智能体采用的方法：{'、'.join(selected_methods) or '未选择'}。",
+                f"- 市场状态解释：{agent_analysis.get('regime_interpretation')}",
+                f"- 跨周期结论：{agent_analysis.get('cross_horizon_conclusion')}",
+                "- 支持证据："
+                + "；".join(agent_analysis.get("evidence_for") or ["未形成合格支持证据。"]),
+                "- 反对证据："
+                + "；".join(agent_analysis.get("counter_evidence") or ["未形成合格反对证据。"]),
+                "- 失效条件："
+                + "；".join(agent_analysis.get("invalidation_conditions") or ["等待下一次复核。"]),
+            ]
+        )
+    else:
+        method_lines.append(
+            "- 分析智能体的方法分析未运行；当前只保留确定性方法结果，不生成主观点位。"
+        )
+    method_lines.append("")
+    etf_share_lines: list[str] = []
+    if etf_share_context:
+        share = etf_share_context.get("share_history") or {}
+        peer = etf_share_context.get("peer_group") or {}
+        index_name = str(
+            peer.get("tracked_index_name")
+            or share.get("tracked_index_name")
+            or "未提供"
+        )
+        index_code = str(
+            peer.get("tracked_index_code")
+            or share.get("tracked_index_code")
+            or ""
+        )
+        index_label = f"{index_name}（{index_code}）" if index_code else index_name
+        etf_share_lines = [
+            "## ETF 份额与宽基资金代理",
+            "",
+            f"- 跟踪指数：{index_label}",
+            (
+                f"- 本基金份额：{_plain_number(share.get('current_units'), '份')}；"
+                f"1日 {_signed_number(share.get('delta_1d'), '份')}；"
+                f"5日 {_signed_number(share.get('delta_5d'), '份')}；"
+                f"20日 {_signed_number(share.get('delta_20d'), '份')}。"
+            ),
+            (
+                f"- 同指数 ETF 组：{int(peer.get('member_count') or 0)} 只；"
+                f"估算单日净流量 {_signed_number(peer.get('estimated_net_flow_1d'), '元')}；"
+                f"份额增加成员占比 {_ratio_pct(peer.get('inflow_member_ratio_1d'))}；"
+                f"变化覆盖率 {_ratio_pct(peer.get('unit_change_coverage_ratio'))}。"
+            ),
+            f"- 市场解读：{etf_share_context.get('interpretation') or '仅作资金参与度参考。'}",
+            f"- 口径边界：{etf_share_context.get('boundary') or '不得把份额变化直接等同指数涨跌。'}",
+            "",
+        ]
     lines = [
-        f"# {market_date} {label}个股晨报",
+        f"# {market_date} {label}{report_label}",
         "",
         f"- 标的：{label}",
         f"- 数据状态：{display_data_status}",
+        *([f"- 数据口径：{market_data_note}"] if market_data_note else []),
         f"- 今日结论：{_ACTION_LABELS.get(brief.get('action'), '观察')}",
         f"- 置信度：{_CONFIDENCE_LABELS.get(str(brief.get('confidence', 'low')), brief.get('confidence', '低'))}",
         f"- 受约束建议金额：{brief.get('constrained_amount') or '—'}",
@@ -417,8 +654,8 @@ def render_holding_markdown(
         f"- 趋势阶段：{trend.get('stage') or '待确认'}",
         f"- 趋势方向：{trend.get('direction') or '待确认'}",
         f"- 趋势强弱：{trend.get('strength') or '待确认'}",
-        f"- 置信度：{brief.get('confidence') or 'low'}",
-        f"- 条件单状态：{_CONDITION_STATUS_LABELS.get(condition_status, '暂不建议')}",
+        f"- 置信度：{_CONFIDENCE_LABELS.get(str(brief.get('confidence') or 'low'), '低')}",
+        f"- 条件单状态：{condition_status_label}",
         f"- 条件单：{condition_summary}",
         f"- 数据状态：{scope_summary}",
         f"- 数据截至：{brief.get('data_as_of') or '未提供'}",
@@ -432,6 +669,8 @@ def render_holding_markdown(
         "",
         *[f"- {item}" for item in brief.get("reasons") or []],
         "",
+        *etf_share_lines,
+        *method_lines,
         "## 今日观察点",
         "",
         *([f"- {item}" for item in brief.get("watch_points") or []] or ["- 暂无新增观察点。"]),
@@ -443,13 +682,89 @@ def render_holding_markdown(
     if conditions:
         lines.extend(["| 优先级 | 触发条件 | 建议响应 |", "|---|---|---|"])
         lines.extend(
-            f"| {_priority_label(item.get('priority'))} | {_table_cell(item.get('trigger'))} | {_table_cell(item.get('response'))} |"
+            f"| {_priority_label(item.get('priority'))} | "
+            f"{_table_cell(_human_condition_text(item.get('trigger')))} | "
+            f"{_table_cell(_human_condition_text(item.get('response')))} |"
             for item in conditions
         )
     elif condition_status == "data_insufficient":
         lines.append("- 条件单所需价格范围尚未完成校核，本次不提供精确触发价。")
     else:
         lines.append("- 今日不设置新增条件建议。")
+    if isinstance(monitoring_bundle, dict):
+        price_basis = monitoring_bundle.get("price_basis") or {}
+        price_volume = monitoring_bundle.get("price_volume_context") or {}
+        candidates = monitoring_candidates
+        lines.extend(
+            [
+                "",
+                "## 结构化监控候选",
+                "",
+                f"- 状态：{_label(_MONITORING_STATUS_LABELS, monitoring_bundle.get('monitoring_status') or 'data_insufficient')}",
+                f"- 周期：{_label(_HORIZON_LABELS, monitoring_bundle.get('horizon') or 'daily')}",
+                f"- 生成时间：{monitoring_bundle.get('generated_at') or '未提供'}",
+                f"- 数据截至：{monitoring_bundle.get('data_as_of') or '未提供'}",
+                f"- 价格口径：{_label(_ADJUSTMENT_LABELS, price_basis.get('adjustment') or 'raw')} / "
+                f"{_label(_UNIT_LABELS, price_basis.get('currency') or 'CNY')} / "
+                f"最小报价单位 {price_basis.get('tick_size') or '—'}",
+                f"- 量价基线：{_label(_BASELINE_LABELS, (price_volume.get('policy') or {}).get('baseline_method'), '已登记量价基线')}，"
+                f"{(price_volume.get('policy') or {}).get('baseline_sessions') or '—'} 个交易日，"
+                f"最少 {(price_volume.get('policy') or {}).get('min_samples') or '—'} 个样本",
+                f"- 激活边界：{_label(_ACTIVATION_LABELS, monitoring_bundle.get('activation_policy') or 'manual_confirmation_required')}；"
+                f"交易执行：{_label(_TRADE_EXECUTION_LABELS, monitoring_bundle.get('trade_execution') or 'forbidden')}",
+            ]
+        )
+        for warning in price_volume.get("warnings") or []:
+            lines.append(f"- 警告：{warning}")
+        if candidates:
+            lines.extend(
+                [
+                    "",
+                    "| 场景 | 意图 | 点位/触发 | 量价确认 | 映射/自动化 | 变化 |",
+                    "|---|---|---|---|---|---|",
+                ]
+            )
+            for candidate in candidates:
+                trigger = candidate.get("trigger") or {}
+                original = candidate.get("original_level") or {}
+                volume = candidate.get("volume_confirmation") or {}
+                level_text = (
+                    f"{original.get('lower')}–{original.get('upper')}"
+                    if original.get("kind") == "zone"
+                    else str(original.get("value") or "—")
+                )
+                lines.append(
+                    f"| {_table_cell(candidate.get('label'))} | {_label(_INTENT_LABELS, candidate.get('intent'))} | "
+                    f"{level_text}；{_trigger_text(trigger)} | "
+                    f"{_label(_VOLUME_METRIC_LABELS, volume.get('metric'), '成交量确认')} "
+                    f"{_label(_COMPARATOR_LABELS, volume.get('comparator'), '达到')} {volume.get('threshold')} "
+                    f"{_label(_UNIT_LABELS, volume.get('unit'), '倍')} | "
+                    f"{_label(_MAPPING_STATUS_LABELS, candidate.get('mapping_status'))} / "
+                    f"{_label(_AUTOMATION_STATUS_LABELS, candidate.get('automation_status'))} | "
+                    f"{_label(_CHANGE_TYPE_LABELS, candidate.get('change_type'))} |"
+                )
+            for candidate in candidates:
+                basis = candidate.get("calculation_basis") or {}
+                source_conditions = candidate.get("source_conditions") or []
+                interpretation = candidate.get("interpretation") or {}
+                lines.extend(
+                    [
+                        "",
+                        f"### {candidate.get('label')}",
+                        "",
+                        f"- 点位依据：{basis.get('summary') or basis.get('formula') or '未提供'}",
+                        f"- 失效条件：{_invalidation_text(candidate.get('invalidation'))}",
+                        f"- 量价解释：{interpretation.get('price_only') or ''} {interpretation.get('confirmed') or ''}",
+                    ]
+                )
+                lines.extend(
+                    f"- 原始条件（{_label(_CONDITION_ROLE_LABELS, item.get('role'))} / "
+                    f"{_label(_CONDITION_COVERAGE_LABELS, item.get('coverage_status'))}）：{item.get('source_text')}"
+                    for item in source_conditions
+                    if isinstance(item, dict)
+                )
+        else:
+            lines.extend(["", "- 本期没有通过严格校验的监控候选，未编造点位。"])
     if brief.get("constraint_notes"):
         lines.extend(["", "## 组合约束修正", "", *[f"- {item}" for item in brief["constraint_notes"]]])
     return "\n".join(lines).strip() + "\n"
@@ -501,8 +816,8 @@ def render_master_markdown(
                     [
                         _priority_label(condition.get("priority")),
                         _table_cell(_security_label(item)) if condition_index == 0 else "",
-                        _table_cell(condition.get("trigger")),
-                        _table_cell(condition.get("response")),
+                        _table_cell(_human_condition_text(condition.get("trigger"))),
+                        _table_cell(_human_condition_text(condition.get("response"))),
                     ]
                 )
                 + " |"

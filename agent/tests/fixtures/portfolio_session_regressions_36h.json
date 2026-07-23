@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "sanitized": true,
+  "source_audit": {
+    "session_count": 18,
+    "message_count": 203,
+    "symbol_mentions": {
+      "588870": 47,
+      "588000": 19,
+      "588100": 0
+    }
+  },
+  "scenarios": {
+    "symbol_scope": {
+      "primary_symbol": "588870.SH",
+      "proxy_symbol": "588000.SH",
+      "proxy_role": "fund_flow_reference",
+      "blocked_include": ["market"],
+      "allowed_tool": "get_fund_flow"
+    },
+    "cancelled_sale": {
+      "initial_quantity": 13700,
+      "quantity": 4700,
+      "attempt_status": "cancelled",
+      "expected_quantity": 13700
+    },
+    "invalid_followup_sale": {
+      "quantity": 7400,
+      "expected_committed_events": 0
+    },
+    "flow_metric_split": {
+      "secondary_market_order_size_net_flow_cny": -10560000000,
+      "etf_estimated_subscription_flow_cny": 13700000000,
+      "actor_attribution_supported": false
+    },
+    "volume_units": {
+      "shares": 125119900,
+      "yi_shares": 1.251199,
+      "wan_lots": 125.1199,
+      "forbidden_text": "1.25 亿手"
+    },
+    "broker_pnl": {
+      "symbol": "600036.SH",
+      "broker_reported_net_pnl": 271.64,
+      "unexplained_difference_policy": "show_unexplained_never_guess"
+    },
+    "legacy_reconciliation": {
+      "current_quantity": 10500,
+      "current_cost": 1.938,
+      "broker_quantity": 13700,
+      "broker_cost": 2.1,
+      "cancelled_attempt_prefix": "553a08a",
+      "requires_explicit_commit": true
+    }
+  }
+}

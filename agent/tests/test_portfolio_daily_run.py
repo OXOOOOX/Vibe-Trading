@@ -4,18 +4,25 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
+
+from src.portfolio.analysis_methods import METHOD_REGISTRY_VERSION
 from src.portfolio.daily.reporting import (
     aggregate_portfolio,
     render_holding_markdown,
     render_master_markdown,
 )
-from src.portfolio.daily.contracts import parse_holding_brief
+from src.portfolio.daily.contracts import BriefContractError, parse_holding_brief
 from src.portfolio.daily.service import (
     DailyPortfolioRunService,
     _compact_worker_context,
     _data_status,
+    _etf_share_context,
+    _market_data_basis,
     _symbol_decision_scopes,
+    _validate_brief_against_market_basis,
 )
 from src.portfolio.daily.store import DailyRunStore
 from src.portfolio.mandate import default_mandate, save_mandate
@@ -74,9 +81,109 @@ class MissingDataService:
         }
 
 
+class FakeETFProductProfileService:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, bool]] = []
+
+    def get_or_refresh(self, symbol: str, *, force_refresh: bool = False):
+        self.calls.append((symbol, force_refresh))
+        return {
+            "symbol": symbol,
+            "data_as_of": "2026-07-17",
+            "retrieved_at": "2026-07-18T20:00:00+08:00",
+            "refresh_status": "completed",
+            "share_history": {
+                "tracked_index_code": "000688.SH",
+                "tracked_index_name": "上证科创板50成份指数",
+                "current_units": 464_552_000,
+                "delta_1d": 42_000_000,
+                "delta_5d": 132_000_000,
+                "delta_20d": 207_000_000,
+                "estimated_net_flow_1d": 73_122_000,
+                "estimated_net_flow_semantics": (
+                    "share_delta_times_current_market_price_proxy"
+                ),
+            },
+            "peer_group": {
+                "tracked_index_code": "000688.SH",
+                "tracked_index_name": "上证科创板50成份指数",
+                "data_as_of": "2026-07-17",
+                "member_count": 20,
+                "official_index_mapping_count": 20,
+                "estimated_net_flow_1d": 8_295_924_000,
+                "inflow_member_ratio_1d": 0.8,
+                "flow_coverage_ratio": 1.0,
+                "unit_change_coverage_ratio": 1.0,
+                "members": [
+                    {
+                        "symbol": symbol,
+                        "name": "科创50ETF汇添富",
+                        "current_units": 464_552_000,
+                        "delta_1d": 42_000_000,
+                        "current_price": 1.741,
+                        "estimated_net_flow_1d": 73_122_000,
+                    }
+                ],
+            },
+        }
+
+
 class ForbiddenSessionService:
     def create_session(self, **kwargs):
         raise AssertionError("data gate must stop before creating a model Session")
+
+
+class MethodAwareSessionService:
+    def __init__(self) -> None:
+        self.prompt = ""
+        self.reply = SimpleNamespace(
+            role="assistant",
+            content=json.dumps(
+                {
+                    "schema_version": 2,
+                    "summary": "已使用冻结日线形成观察结论。",
+                    "trend": {
+                        "summary": "结构仍需继续确认。",
+                        "stage": "震荡",
+                        "direction": "横盘",
+                        "strength": "中",
+                    },
+                    "action": "observe",
+                    "confidence": "medium",
+                    "suggested_amount": None,
+                    "reasons": ["多周期结构尚未形成同向确认。"],
+                    "risks": ["结构失效后需要重新评估。"],
+                    "watch_points": ["等待已登记关键区间的后续反应。"],
+                    "condition_order_status": "not_recommended",
+                    "condition_order_summary": "当前不新增条件建议。",
+                    "condition_orders": [],
+                    "data_scopes": {},
+                    "data_limited": False,
+                    "agent_analysis": {
+                        "regime_interpretation": "市场处于等待方向确认的阶段。",
+                        "selected_methods": ["market_regime"],
+                        "selected_level_ids": [],
+                        "evidence_for": ["中期结构尚未被明显破坏。"],
+                        "counter_evidence": ["短期方向与中期结构仍有分歧。"],
+                        "cross_horizon_conclusion": "跨周期证据尚未完全收敛。",
+                        "invalidation_conditions": ["结构方向发生反转时结论失效。"],
+                        "confidence": "medium",
+                        "data_gaps": [],
+                        "critic": {"verdict": "pass", "issues": []},
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+    def create_session(self, **_kwargs):
+        return SimpleNamespace(session_id="daily-method-session")
+
+    async def execute_message(self, _session_id, prompt, **_kwargs):
+        self.prompt = prompt
+
+    def get_messages(self, _session_id, limit=20):
+        return [self.reply]
 
 
 def fake_pdf(title: str, content: str) -> bytes:
@@ -180,7 +287,29 @@ def test_compact_worker_context_is_valid_json_without_mid_string_truncation() ->
                         "symbol": "588870.SH",
                         "interval": "1D",
                         "actionability": "price_actionable",
-                        "bars": [{"bar_time": f"2026-01-{index:02d}", "close": index} for index in range(1, 100)],
+                        "bar_count": 99,
+                        "bars": [
+                            {
+                                "session_date": f"2026-01-{index:02d}",
+                                "bar_time": f"2026-01-{index:02d}T16:00:00+00:00",
+                                "open": index - 0.5,
+                                "high": index + 1,
+                                "low": index - 1,
+                                "close": index,
+                                "volume": None,
+                                "observations": [
+                                    {
+                                        "source": "tencent",
+                                        "volume": index * 1_000_000,
+                                        "raw_volume": index * 10_000,
+                                        "volume_unit": "share",
+                                        "included_in_consensus": True,
+                                        "provider_payload": "不应进入 Worker 上下文" * 1000,
+                                    }
+                                ],
+                            }
+                            for index in range(1, 100)
+                        ],
                     }
                 ],
                 "quotes": [{"symbol": "588870.SH", "last_price": 1.93}],
@@ -200,6 +329,217 @@ def test_compact_worker_context_is_valid_json_without_mid_string_truncation() ->
     assert json.loads(encoded)["symbol"] == "588870.SH"
     assert len(encoded) <= 28_000
     assert encoded.endswith("}")
+    daily_series = payload["contexts"][0]["market"]["series"][0]
+    assert len(daily_series["bars"]) >= 20
+    assert daily_series["bars"][-1]["session_date"] == "2026-01-99"
+    assert "observations" not in daily_series["bars"][-1]
+    assert daily_series["bars"][-1]["volume_status"] == "source_evidence_only"
+    assert daily_series["bars"][-1]["volume_evidence"][0]["source"] == "tencent"
+
+
+def test_market_data_basis_uses_session_date_for_non_trading_day_report() -> None:
+    contexts = [
+        {
+            "market": {
+                "series": [
+                    {
+                        "symbol": "513120.SH",
+                        "interval": "1D",
+                        "bar_count": 196,
+                        "latest": {
+                            "session_date": "2026-07-17",
+                            "bar_time": "2026-07-16T16:00:00+00:00",
+                            "close": 1.128,
+                        },
+                    }
+                ]
+            }
+        }
+    ]
+
+    basis = _market_data_basis(
+        contexts,
+        "513120.SH",
+        report_market_date="2026-07-20",
+        generated_at="2026-07-18T22:22:39+08:00",
+    )
+
+    assert basis["price_session_date"] == "2026-07-17"
+    assert basis["price_basis"] == "previous_trading_session"
+    assert basis["generation_context"] == "non_trading_day"
+    assert basis["daily_bar_count"] == 196
+    assert "非交易日生成" in basis["note"]
+    assert "上一交易日 2026-07-17" in basis["note"]
+    assert "新闻与公告采用报告生成时可得的最新信息" in basis["note"]
+
+
+def test_daily_worker_receives_and_validates_frozen_method_snapshot(tmp_path: Path) -> None:
+    symbol = "000651.SZ"
+    session_service = MethodAwareSessionService()
+    bars = []
+    start = datetime(2025, 12, 1, tzinfo=timezone.utc)
+    for index in range(140):
+        day = start + timedelta(days=index)
+        close = 35.0 + index * 0.03 + (index % 7) * 0.02
+        bars.append(
+            {
+                "session_date": day.date().isoformat(),
+                "bar_time": day.isoformat(),
+                "open": close - 0.1,
+                "high": close + 0.25,
+                "low": close - 0.25,
+                "close": close,
+                "volume": 1_000_000 + index * 1_000,
+            }
+        )
+    contexts = [
+        {
+            "status": "ok",
+            "retrieved_at": bars[-1]["bar_time"],
+            "decision_scopes": {
+                symbol: {
+                    "daily_trend": {
+                        "status": "verified",
+                        "actionability": "price_actionable",
+                    },
+                    "condition_order": {
+                        "status": "verified",
+                        "actionability": "price_actionable",
+                    },
+                }
+            },
+            "market": {
+                "status": "live",
+                "series": [
+                    {
+                        "symbol": symbol,
+                        "interval": "1D",
+                        "bar_count": len(bars),
+                        "actionability": "price_actionable",
+                        "latest": bars[-1],
+                        "bars": bars,
+                    }
+                ],
+            },
+        }
+    ]
+    service = DailyPortfolioRunService(
+        store=DailyRunStore(tmp_path / "runs"),
+        session_service=session_service,
+        structured_monitoring=False,
+        recover_incomplete=False,
+    )
+
+    brief, session_id = asyncio.run(
+        service._analyze_one(
+            "daily-method-test",
+            holding={"symbol": symbol, "name": "格力电器"},
+            assignment={},
+            contexts=contexts,
+            data_status="ok",
+        )
+    )
+
+    assert session_id == "daily-method-session"
+    assert METHOD_REGISTRY_VERSION in session_service.prompt
+    assert brief["analysis_method_snapshot"]["cutoff_policy"] == "completed_daily_bars_only"
+    assert brief["agent_analysis"]["status"] == "completed"
+    assert brief["agent_analysis"]["selected_methods"] == ["market_regime"]
+
+
+def test_worker_cannot_claim_daily_series_missing_when_twenty_bars_are_frozen() -> None:
+    basis = {"daily_bar_count": 196}
+
+    with pytest.raises(BriefContractError, match="contradicted frozen daily-series"):
+        _validate_brief_against_market_basis(
+            {
+                "summary": "冻结输入未提供可复核的日线序列。",
+                "watch_points": ["后续需补充连续日线K线。"],
+            },
+            basis,
+        )
+
+    _validate_brief_against_market_basis(
+        {
+            "summary": "已使用上一交易日的连续日线分析。",
+            "risks": ["成交量只有单一来源，量能结论需谨慎。"],
+        },
+        basis,
+    )
+
+
+def test_etf_share_profile_is_frozen_and_rendered_in_daily_report(
+    tmp_path: Path,
+) -> None:
+    etf_profiles = FakeETFProductProfileService()
+    etf_state = PortfolioState(
+        holdings=[
+            {
+                "symbol": "588870.SH",
+                "code": "588870",
+                "name": "科创50指",
+                "quantity": 10_000,
+                "cost_price": 1.7,
+                "last_price": 1.741,
+                "market_value": 17_410,
+            }
+        ],
+        cash=10_000,
+    )
+    service = DailyPortfolioRunService(
+        store=DailyRunStore(tmp_path / "runs"),
+        session_service=None,
+        data_service=FakeDataService(),
+        etf_product_profile_service=etf_profiles,
+        pdf_renderer=fake_pdf,
+        state_loader=lambda: etf_state,
+        mandate_path=tmp_path / "mandate.json",
+    )
+
+    async def exercise():
+        record = await service.start(market_date="2026-07-20", force_new=True)
+        return await service.wait(record["run_id"])
+
+    completed = asyncio.run(exercise())
+    manifest = service.store.read_json(
+        completed["run_id"], "inputs/data_manifest.json"
+    )
+    brief = service.store.read_json(
+        completed["run_id"], "outputs/holdings/588870.SH/brief.json"
+    )
+    markdown_artifact = next(
+        item
+        for item in completed["artifacts"]
+        if item["kind"] == "holding_daily_markdown"
+        and item["symbol"] == "588870.SH"
+    )
+    markdown = Path(markdown_artifact["path"]).read_text(encoding="utf-8")
+    symbol_manifest = next(
+        item for item in manifest["symbols"] if item["symbol"] == "588870.SH"
+    )
+
+    assert etf_profiles.calls == [("588870.SH", False)]
+    assert symbol_manifest["domains"]["etf_share"]["status"] == "available"
+    assert brief["etf_share_context"]["signal"] == "net_inflow"
+    assert brief["etf_share_context"]["market_scope"] == "科创板大盘成长"
+    assert "ETF份额已校核" in markdown
+    assert "## ETF 份额与宽基资金代理" in markdown
+    assert "1日 +42,000,000 份" in markdown
+    assert "估算单日净流量 +8,295,924,000 元" in markdown
+    assert "份额增加成员占比 80.0%" in markdown
+    assert "不等同于指数当日涨跌" in markdown
+
+
+def test_etf_share_context_keeps_market_proxy_boundary() -> None:
+    profile = FakeETFProductProfileService().get_or_refresh("588870.SH")
+    context = _etf_share_context(
+        [{"etf_product": {"588870.SH": profile}}], "588870.SH"
+    )
+
+    assert context is not None
+    assert context["signal"] == "net_inflow"
+    assert "科创板大盘成长" in context["interpretation"]
+    assert "不等同于指数当日涨跌" in context["boundary"]
 
 
 def test_limited_brief_clears_incompatible_exact_condition_orders() -> None:
@@ -416,6 +756,12 @@ def test_report_uses_chinese_sleeve_status_and_named_condition_table() -> None:
                 "action": "observe",
                 "confidence": "medium",
                 "summary": "守住成本线则继续观察。",
+                "market_data_basis": {
+                    "note": (
+                        "本报告在非交易日生成；日线量价采用上一交易日 2026-07-11 的已收盘数据，"
+                        "新闻与公告采用报告生成时可得的最新信息。"
+                    )
+                },
                 "condition_orders": [
                     {
                         "trigger": "跌破 37.05（成本线）",
@@ -460,6 +806,8 @@ def test_report_uses_chinese_sleeve_status_and_named_condition_table() -> None:
     )
     assert "数据状态：部分数据受限" in holding
     assert "标的：招商银行（600036.SH）" in holding
+    assert "数据口径：本报告在非交易日生成" in holding
+    assert "上一交易日 2026-07-11" in holding
     assert "| 优先级 | 触发条件 | 建议响应 |" in holding
 
 

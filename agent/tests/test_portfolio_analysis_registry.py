@@ -4,6 +4,7 @@ from src.session.service import (
     _CHANNEL_RESEARCH_TOOL_NAMES,
     _PORTFOLIO_ANALYSIS_TOOL_NAMES,
     _PORTFOLIO_DAILY_RUN_TOOL_NAMES,
+    _PORTFOLIO_WEEKLY_RUN_TOOL_NAMES,
     _research_tool_names_for_session,
 )
 
@@ -16,6 +17,7 @@ def test_portfolio_analysis_registry_excludes_order_execution_tools() -> None:
         "publish_obsidian_note",
         "get_data_context",
         "web_search",
+        "weekly_report",
     } <= allowed
     assert not {"verified_market_data", "get_market_data", "get_stock_news"} & allowed
     assert not {"trading_place_order", "trading_cancel_order", "trading_account", "run_swarm", "write_file"} & allowed
@@ -64,6 +66,15 @@ def test_portfolio_daily_run_registry_cannot_refetch_or_mutate_state() -> None:
 
     assert allowed == {"load_skill"}
     assert not {"portfolio_state", "get_data_context", "write_file", "run_swarm"} & allowed
+
+
+def test_portfolio_weekly_method_registry_is_frozen_input_only() -> None:
+    allowed = set(_PORTFOLIO_WEEKLY_RUN_TOOL_NAMES)
+
+    assert allowed == {"load_skill"}
+    assert _research_tool_names_for_session(
+        {"portfolio_weekly_run": {"research_only": True}}
+    ) == ["load_skill"]
 
 
 def test_channel_policy_wins_after_daily_report_session_is_rebound_to_feishu() -> None:

@@ -6,6 +6,11 @@ import json
 import re
 from typing import Any
 
+from src.portfolio.analysis_methods import (
+    unavailable_agent_analysis,
+    validate_agent_method_analysis,
+)
+
 
 ALLOWED_ACTIONS = {"observe", "add", "reduce", "exit"}
 ALLOWED_CONFIDENCE = {"low", "medium", "high"}
@@ -29,13 +34,44 @@ def _extract_json(text: str) -> dict[str, Any]:
     return value
 
 
-def parse_holding_brief(text: str, *, symbol: str) -> dict[str, Any]:
+def parse_holding_brief(
+    text: str,
+    *,
+    symbol: str,
+    structured_monitoring: bool = False,
+    method_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Parse and normalize a worker response without silently inventing actions."""
 
     try:
         raw = _extract_json(text)
     except (json.JSONDecodeError, TypeError) as exc:
         raise BriefContractError("worker output is not valid JSON") from exc
+
+    if structured_monitoring:
+        allowed = {
+            "schema_version",
+            "summary",
+            "trend",
+            "action",
+            "confidence",
+            "suggested_amount",
+            "reasons",
+            "risks",
+            "watch_points",
+            "condition_order_status",
+            "condition_order_summary",
+            "condition_orders",
+            "data_scopes",
+            "data_limited",
+            "monitoring_bundle",
+            "agent_analysis",
+        }
+        unknown = sorted(set(raw) - allowed)
+        if unknown:
+            raise BriefContractError(
+                f"worker output contains unsupported fields: {', '.join(unknown)}"
+            )
 
     action = str(raw.get("action") or "").strip().lower()
     if action not in ALLOWED_ACTIONS:
@@ -102,8 +138,8 @@ def parse_holding_brief(text: str, *, symbol: str) -> dict[str, Any]:
     }
     data_scopes = raw.get("data_scopes") if isinstance(raw.get("data_scopes"), dict) else {}
 
-    return {
-        "schema_version": 2,
+    result = {
+        "schema_version": 3 if structured_monitoring else 2,
         "symbol": symbol,
         "summary": str(raw.get("summary") or reasons[0]).strip(),
         "action": action,
@@ -119,13 +155,40 @@ def parse_holding_brief(text: str, *, symbol: str) -> dict[str, Any]:
         "data_scopes": data_scopes,
         "data_limited": data_limited,
     }
+    if structured_monitoring:
+        bundle = raw.get("monitoring_bundle")
+        result["monitoring_bundle_input"] = bundle if isinstance(bundle, dict) else {}
+        if not isinstance(bundle, dict):
+            result["monitoring_bundle_input_error"] = "monitoring_bundle must be an object"
+        # The legacy field is derived from the validated bundle later in the
+        # pipeline; model-provided condition_orders are never a second source.
+        result["condition_orders"] = []
+    if method_snapshot is not None:
+        raw_agent_analysis = raw.get("agent_analysis")
+        if not isinstance(raw_agent_analysis, dict):
+            raise BriefContractError("agent_analysis must be an object")
+        try:
+            result["agent_analysis"] = validate_agent_method_analysis(
+                raw_agent_analysis,
+                snapshot=method_snapshot,
+            )
+        except ValueError as exc:
+            raise BriefContractError(str(exc)) from exc
+        result["analysis_method_snapshot"] = dict(method_snapshot)
+    return result
 
 
-def fallback_brief(symbol: str, reason: str, *, data_limited: bool = True) -> dict[str, Any]:
+def fallback_brief(
+    symbol: str,
+    reason: str,
+    *,
+    data_limited: bool = True,
+    structured_monitoring: bool = False,
+) -> dict[str, Any]:
     """Return a conservative contract-valid result after a worker failure."""
 
     return {
-        "schema_version": 2,
+        "schema_version": 3 if structured_monitoring else 2,
         "symbol": symbol,
         "summary": "本次未形成可靠的主动调整结论，今日仅观察。",
         "action": "observe",
@@ -145,4 +208,6 @@ def fallback_brief(symbol: str, reason: str, *, data_limited: bool = True) -> di
         },
         "data_scopes": {},
         "data_limited": data_limited,
+        **({"monitoring_bundle_input": {}} if structured_monitoring else {}),
+        "agent_analysis": unavailable_agent_analysis(reason),
     }

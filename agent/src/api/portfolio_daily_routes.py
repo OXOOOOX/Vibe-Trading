@@ -143,7 +143,11 @@ def register_portfolio_daily_routes(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/portfolio/daily-runs/{run_id}/artifacts/{artifact_id}", dependencies=dependency)
-    async def download_daily_run_artifact(run_id: str, artifact_id: str):
+    async def download_daily_run_artifact(
+        run_id: str,
+        artifact_id: str,
+        download: bool = Query(True),
+    ):
         resolved = get_service().store.resolve_artifact(run_id, artifact_id)
         if not resolved:
             raise HTTPException(status_code=404, detail="artifact not found")
@@ -152,6 +156,7 @@ def register_portfolio_daily_routes(
             Path(path),
             media_type=str(artifact.get("media_type") or "application/octet-stream"),
             filename=str(artifact.get("filename") or path.name),
+            content_disposition_type="attachment" if download else "inline",
         )
 
     @app.get(

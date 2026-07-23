@@ -11,12 +11,13 @@ import hashlib
 import json
 import os
 import re
-import tempfile
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from src.portfolio.ledger import get_ledger
 
 
 def _now() -> str:
@@ -173,9 +174,14 @@ def parse_holdings_text(raw_text: str) -> list[dict[str, Any]]:
 class PortfolioState:
     holdings: list[dict[str, Any]] = field(default_factory=list)
     recent_trades: list[dict[str, Any]] = field(default_factory=list)
+    ledger_events: list[dict[str, Any]] = field(default_factory=list)
     cash: float | None = None
     cash_currency: str = "CNY"
     updated_at: str | None = None
+    schema_version: int = 2
+    revision: int = 0
+    provenance: dict[str, Any] = field(default_factory=dict)
+    performance: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "PortfolioState":
@@ -194,18 +200,28 @@ class PortfolioState:
         return cls(
             holdings=holdings,
             recent_trades=recent_trades,
+            ledger_events=[dict(item) for item in (payload.get("ledger_events") or [])],
             cash=_number(payload.get("cash")),
             cash_currency=str(payload.get("cash_currency") or "CNY"),
             updated_at=payload.get("updated_at"),
+            schema_version=int(payload.get("schema_version") or 2),
+            revision=int(payload.get("revision") or 0),
+            provenance=dict(payload.get("provenance") or {}),
+            performance=dict(payload.get("performance") or {}),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "holdings": self.holdings,
             "recent_trades": self.recent_trades,
+            "ledger_events": self.ledger_events,
             "cash": self.cash,
             "cash_currency": self.cash_currency,
             "updated_at": self.updated_at,
+            "schema_version": self.schema_version,
+            "revision": self.revision,
+            "provenance": self.provenance,
+            "performance": self.performance,
         }
 
 
@@ -217,22 +233,34 @@ def _legacy_trade_id(trade: dict[str, Any], index: int) -> str:
 
 
 def load_state(path: Path | None = None) -> PortfolioState:
-    path = path or state_path()
-    if not path.exists():
-        return PortfolioState(updated_at=_now())
-    return PortfolioState.from_dict(json.loads(path.read_text(encoding="utf-8")))
+    projection = path or state_path()
+    return PortfolioState.from_dict(get_ledger(projection).snapshot())
 
 
-def save_state(state: PortfolioState, path: Path | None = None) -> Path:
-    path = path or state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    state.updated_at = _now()
-    payload = json.dumps(state.to_dict(), ensure_ascii=False, indent=2, sort_keys=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-        handle.write(payload)
-        tmp_name = handle.name
-    Path(tmp_name).replace(path)
-    return path
+def save_state(
+    state: PortfolioState,
+    path: Path | None = None,
+    *,
+    event_type: str = "manual_adjustment",
+    event_payload: dict[str, Any] | None = None,
+    source: str = "direct_api",
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
+) -> Path:
+    """Commit a snapshot through the v2 ledger and refresh the JSON projection."""
+
+    projection = path or state_path()
+    committed = get_ledger(projection).replace_snapshot(
+        state.to_dict(),
+        event_type=event_type,
+        event_payload=dict(event_payload or {}),
+        source=source,
+        expected_revision=state.revision if expected_revision is None else expected_revision,
+        idempotency_key=idempotency_key,
+    )
+    refreshed = PortfolioState.from_dict(committed)
+    state.__dict__.update(refreshed.__dict__)
+    return projection
 
 
 def update_holdings(
@@ -242,8 +270,14 @@ def update_holdings(
     cash: float | None = None,
     cash_currency: str = "CNY",
     path: Path | None = None,
+    attempt_id: str | None = None,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
 ) -> PortfolioState:
-    state = load_state(path)
+    projection = path or state_path()
+    ledger = get_ledger(projection)
+    pending = ledger.pending_snapshot(attempt_id) if attempt_id else None
+    state = PortfolioState.from_dict(pending) if pending else load_state(projection)
     parsed = parse_holdings_text(raw_text or "") if raw_text else []
     supplied = []
     for item in holdings or []:
@@ -252,15 +286,53 @@ def update_holdings(
         normalized["symbol"] = normalize_symbol(str(code))
         normalized.setdefault("code", str(code).split(".")[0])
         normalized.setdefault("updated_at", _now())
-        normalized.setdefault("source", "tool_payload")
+        normalized.setdefault("source", "broker_snapshot" if raw_text else "tool_payload")
+        normalized.setdefault("cost_basis_kind", "broker_adjusted" if raw_text else "unknown")
+        normalized.setdefault("lot_completeness", "incomplete")
+        normalized.setdefault(
+            "provenance",
+            {"source": normalized["source"], "as_of": normalized["updated_at"]},
+        )
         supplied.append(normalized)
+    for row in parsed:
+        row.setdefault("cost_basis_kind", "broker_adjusted")
+        row.setdefault("lot_completeness", "incomplete")
+        row.setdefault("provenance", {"source": row.get("source"), "as_of": row.get("updated_at")})
     new_holdings = parsed + supplied
     if new_holdings:
         state.holdings = new_holdings
     if cash is not None:
         state.cash = _number(cash)
         state.cash_currency = cash_currency or state.cash_currency
-    save_state(state, path)
+    event_payload = {
+        "event_id": uuid.uuid4().hex,
+        "holding_count": len(state.holdings),
+        "cash": state.cash,
+        "cash_currency": state.cash_currency,
+        "source_label": "broker_pasted_text" if raw_text else "structured_payload",
+        "recorded_at": _now(),
+    }
+    if attempt_id:
+        staged = ledger.stage(
+            attempt_id=attempt_id,
+            action="update_holdings",
+            payload=event_payload,
+            preview=state.to_dict(),
+            expected_revision=state.revision if expected_revision is None else expected_revision,
+            idempotency_key=idempotency_key or f"{attempt_id}:update_holdings:{uuid.uuid4().hex}",
+        )
+        preview_state = PortfolioState.from_dict(staged["preview"])
+        preview_state.provenance["pending_mutation_id"] = staged["mutation_id"]
+        return preview_state
+    save_state(
+        state,
+        projection,
+        event_type="broker_snapshot",
+        event_payload=event_payload,
+        source="broker_snapshot" if raw_text else "direct_api",
+        expected_revision=expected_revision,
+        idempotency_key=idempotency_key,
+    )
     return state
 
 
@@ -282,7 +354,18 @@ def update_cash(
     state = load_state(path)
     state.cash = amount
     state.cash_currency = currency
-    save_state(state, path)
+    save_state(
+        state,
+        path,
+        event_type="manual_adjustment",
+        event_payload={
+            "field": "cash",
+            "cash": amount,
+            "cash_currency": currency,
+            "recorded_at": _now(),
+        },
+        source="user_confirmed_cash",
+    )
     return state
 
 
@@ -347,30 +430,44 @@ def edit_holding(
     holding["updated_at"] = _now()
     holding["manual_adjustment_at"] = holding["updated_at"]
     _recalculate_holding_totals(holding)
-    save_state(state, path)
+    save_state(
+        state,
+        path,
+        event_type="manual_adjustment",
+        event_payload={
+            "symbol": normalized_symbol,
+            "quantity": next_quantity,
+            "cost_price": next_cost,
+            "cost_basis_kind": "broker_adjusted" if next_cost is not None else holding.get("cost_basis_kind"),
+            "recorded_at": _now(),
+        },
+        source="user_holding_correction",
+    )
     return state
 
 
 def delete_trade(*, trade_id: str, path: Path | None = None) -> PortfolioState:
-    """Delete one journal row without reversing its already-applied holding change."""
+    """Append a reversal marker; immutable applied events are never deleted."""
     target = str(trade_id or "").strip()
     if not target:
         raise ValueError("Trade id is required.")
 
-    state = load_state(path)
-    index = next(
-        (index for index, trade in enumerate(state.recent_trades) if str(trade.get("trade_id") or "") == target),
-        None,
-    )
-    if index is None:
-        raise ValueError(f"Trade {target} was not found.")
-    state.recent_trades.pop(index)
-    save_state(state, path)
-    return state
+    projection = path or state_path()
+    return PortfolioState.from_dict(get_ledger(projection).reverse_event(target))
 
 
-def record_trade(*, trade: dict[str, Any], path: Path | None = None) -> PortfolioState:
-    state = load_state(path)
+def record_trade(
+    *,
+    trade: dict[str, Any],
+    path: Path | None = None,
+    attempt_id: str | None = None,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
+) -> PortfolioState:
+    projection = path or state_path()
+    ledger = get_ledger(projection)
+    pending = ledger.pending_snapshot(attempt_id) if attempt_id else None
+    state = PortfolioState.from_dict(pending) if pending else load_state(projection)
     entry = dict(trade)
     code = str(entry.get("code") or "").strip().upper()
     name = str(entry.get("name") or "").strip()
@@ -404,6 +501,12 @@ def record_trade(*, trade: dict[str, Any], path: Path | None = None) -> Portfoli
     entry["side"] = side
     entry["quantity"] = quantity
     entry["price"] = price
+    entry["fees"] = _number(entry.get("fees")) or 0.0
+    entry["taxes"] = _number(entry.get("taxes")) or 0.0
+    entry["broker_reported_pnl"] = _number(entry.get("broker_reported_pnl"))
+    entry["exactness"] = (
+        "broker_reported" if entry["broker_reported_pnl"] is not None else "unavailable"
+    )
     entry.setdefault("recorded_at", _now())
 
     holding_index = next(
@@ -413,6 +516,11 @@ def record_trade(*, trade: dict[str, Any], path: Path | None = None) -> Portfoli
             if normalize_symbol(str(holding.get("symbol") or holding.get("code") or "")) == normalized_symbol
         ),
         None,
+    )
+    entry["pre_trade_lot_completeness"] = (
+        str(state.holdings[holding_index].get("lot_completeness") or "incomplete")
+        if holding_index is not None
+        else "complete"
     )
 
     if side == "buy":
@@ -429,6 +537,9 @@ def record_trade(*, trade: dict[str, Any], path: Path | None = None) -> Portfoli
                 "pnl_pct": None,
                 "market_status": "unresolved",
                 "source": "recorded_trade",
+                "cost_basis_kind": "trade_lot",
+                "lot_completeness": "complete",
+                "provenance": {"source": "recorded_trade", "as_of": entry["recorded_at"]},
                 "updated_at": _now(),
             }
             state.holdings.append(holding)
@@ -447,6 +558,7 @@ def record_trade(*, trade: dict[str, Any], path: Path | None = None) -> Portfoli
                 holding["name"] = entry["name"]
             holding["updated_at"] = _now()
             holding["last_trade_at"] = entry["recorded_at"]
+            holding["lot_completeness"] = entry["pre_trade_lot_completeness"]
             _recalculate_holding_totals(holding)
     else:
         if holding_index is None:
@@ -469,12 +581,203 @@ def record_trade(*, trade: dict[str, Any], path: Path | None = None) -> Portfoli
     entry["applied_to_holdings"] = True
     state.recent_trades.insert(0, entry)
     state.recent_trades = state.recent_trades[:200]
-    save_state(state, path)
+    if attempt_id:
+        staged = ledger.stage(
+            attempt_id=attempt_id,
+            action="record_trade",
+            payload=entry,
+            preview=state.to_dict(),
+            expected_revision=state.revision if expected_revision is None else expected_revision,
+            idempotency_key=idempotency_key or f"{attempt_id}:record_trade:{entry['trade_id']}",
+        )
+        preview_state = PortfolioState.from_dict(staged["preview"])
+        preview_state.provenance["pending_mutation_id"] = staged["mutation_id"]
+        preview_state.provenance["pending_attempt_id"] = attempt_id
+        return preview_state
+    save_state(
+        state,
+        projection,
+        event_type="trade",
+        event_payload=entry,
+        source=str(entry.get("source") or "user_recorded_trade"),
+        expected_revision=expected_revision,
+        idempotency_key=idempotency_key,
+    )
     return state
 
 
-def clear_state(path: Path | None = None) -> Path:
-    path = path or state_path()
-    if path.exists():
-        path.unlink()
-    return path
+def clear_state(
+    path: Path | None = None,
+    *,
+    attempt_id: str | None = None,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
+) -> Path:
+    """Clear through an auditable adjustment instead of deleting ledger files."""
+
+    projection = path or state_path()
+    current = load_state(projection)
+    empty = PortfolioState(
+        cash_currency=current.cash_currency,
+        revision=current.revision,
+        provenance=dict(current.provenance),
+        updated_at=_now(),
+    )
+    ledger = get_ledger(projection)
+    payload = {"reason": "explicit_clear", "recorded_at": _now()}
+    if attempt_id:
+        ledger.stage(
+            attempt_id=attempt_id,
+            action="clear",
+            payload=payload,
+            preview=empty.to_dict(),
+            expected_revision=current.revision if expected_revision is None else expected_revision,
+            idempotency_key=idempotency_key or f"{attempt_id}:clear",
+        )
+        return projection
+    save_state(
+        empty,
+        projection,
+        event_type="manual_adjustment",
+        event_payload=payload,
+        source="explicit_clear",
+        expected_revision=expected_revision,
+        idempotency_key=idempotency_key,
+    )
+    return projection
+
+
+def commit_attempt_mutations(attempt_id: str, path: Path | None = None) -> PortfolioState:
+    projection = path or state_path()
+    return PortfolioState.from_dict(get_ledger(projection).commit_attempt(attempt_id))
+
+
+def discard_attempt_mutations(attempt_id: str, path: Path | None = None) -> int:
+    projection = path or state_path()
+    return get_ledger(projection).discard_attempt(attempt_id)
+
+
+def preview_reconciliation(
+    *,
+    raw_text: str | None = None,
+    holdings: list[dict[str, Any]] | None = None,
+    trades: list[dict[str, Any]] | None = None,
+    cash: float | None = None,
+    cash_currency: str = "CNY",
+    broker_reported_pnl: float | None = None,
+    source_label: str = "broker_snapshot",
+    path: Path | None = None,
+) -> dict[str, Any]:
+    """Create a read-only diff; no portfolio fact changes before commit."""
+
+    projection = path or state_path()
+    ledger = get_ledger(projection)
+    current = load_state(projection)
+    parsed = parse_holdings_text(raw_text or "") if raw_text else []
+    supplied: list[dict[str, Any]] = []
+    for item in holdings or []:
+        row = dict(item)
+        code = str(row.get("code") or row.get("symbol") or "")
+        row["symbol"] = normalize_symbol(code)
+        row.setdefault("code", code.split(".")[0])
+        row.setdefault("source", "broker_reconciliation")
+        row.setdefault("updated_at", _now())
+        supplied.append(row)
+    target_holdings = parsed + supplied
+    if not target_holdings:
+        raise ValueError("No recognizable broker holdings were supplied.")
+    for row in target_holdings:
+        row["cost_basis_kind"] = "broker_adjusted"
+        row["lot_completeness"] = "incomplete"
+        row["provenance"] = {"source": source_label, "as_of": row.get("updated_at") or _now()}
+
+    current_by_symbol = {
+        normalize_symbol(str(item.get("symbol") or item.get("code") or "")): item
+        for item in current.holdings
+    }
+    target_by_symbol = {
+        normalize_symbol(str(item.get("symbol") or item.get("code") or "")): item
+        for item in target_holdings
+    }
+    diffs: list[dict[str, Any]] = []
+    for symbol in sorted(set(current_by_symbol) | set(target_by_symbol)):
+        before = current_by_symbol.get(symbol)
+        after = target_by_symbol.get(symbol)
+        changes: dict[str, Any] = {}
+        for field_name in ("quantity", "cost_price"):
+            old = _number((before or {}).get(field_name))
+            new = _number((after or {}).get(field_name))
+            if old != new:
+                changes[field_name] = {"current": old, "broker": new}
+        if before is None or after is None or changes:
+            diffs.append(
+                {
+                    "symbol": symbol,
+                    "status": "added" if before is None else "removed" if after is None else "changed",
+                    "changes": changes,
+                }
+            )
+
+    existing_ids = {
+        str(item.get("event_id") or item.get("trade_id") or "")
+        for item in current.ledger_events
+    }
+    incoming_ids = {
+        str(item.get("event_id") or item.get("trade_id") or "")
+        for item in (trades or [])
+        if item.get("event_id") or item.get("trade_id")
+    }
+    suspicious = [
+        {
+            "event_id": str(item.get("event_id") or item.get("trade_id") or ""),
+            "reason": "known_cancelled_attempt_candidate",
+            "action": "review_only_no_auto_delete",
+        }
+        for item in current.ledger_events
+        if str(item.get("event_id") or item.get("trade_id") or "").startswith("553a08a")
+    ]
+    reported = _number(broker_reported_pnl)
+    computed = _number(current.performance.get("realized_pnl"))
+    unexplained = (reported - computed) if reported is not None and computed is not None else None
+    target_state = {
+        **current.to_dict(),
+        "holdings": target_holdings,
+        "cash": current.cash if cash is None else _number(cash),
+        "cash_currency": cash_currency or current.cash_currency,
+    }
+    preview = {
+        "base_revision": current.revision,
+        "holding_diffs": diffs,
+        "missing_ledger_event_ids": sorted(incoming_ids - existing_ids),
+        "extra_ledger_event_ids": sorted(existing_ids - incoming_ids) if incoming_ids else [],
+        "suspicious_events": suspicious,
+        "broker_reported_pnl": reported,
+        "computed_realized_pnl": computed,
+        "unexplained_pnl": unexplained,
+        "pnl_status": "broker_reported" if reported is not None else "unavailable",
+        "requires_explicit_commit": True,
+        "target_state": target_state,
+    }
+    request = {
+        "raw_text": raw_text,
+        "holdings": holdings or [],
+        "trades": trades or [],
+        "cash": cash,
+        "cash_currency": cash_currency,
+        "broker_reported_pnl": reported,
+        "source_label": source_label,
+    }
+    return ledger.create_reconciliation(request, preview)
+
+
+def commit_reconciliation(
+    reconciliation_id: str,
+    *,
+    expected_revision: int,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    projection = path or state_path()
+    return get_ledger(projection).commit_reconciliation(
+        reconciliation_id,
+        expected_revision,
+    )
