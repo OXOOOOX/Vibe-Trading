@@ -39,10 +39,13 @@ import { cn } from "@/lib/utils";
 import MarketCacheKlineDialog from "@/components/portfolio/MarketCacheKlineDialog";
 import PortfolioDailyRunPanel from "@/components/portfolio/PortfolioDailyRunPanel";
 import PortfolioMonitorPanel from "@/components/portfolio/PortfolioMonitorPanel";
+import PortfolioReconciliationPanel from "@/components/portfolio/PortfolioReconciliationPanel";
 
 const ACTIVE_REFRESH_KEY = "vibe-trading:portfolio-market-refresh:v1";
 const ANALYSIS_RUNS_STORAGE_KEY = "vibe-trading:portfolio-analysis-runs:v1";
 const MONITOR_SELECTION_STORAGE_KEY = "vibe-trading:portfolio-monitor-selection:v1";
+const MONITOR_LEVEL_STORAGE_KEY = "vibe-trading:portfolio-monitor-levels:v2";
+const MONITOR_LEVEL_APPLY_DELAY_MS = 5_000;
 const TERMINAL_REFRESH_STATUSES = new Set(["completed", "partial", "failed", "interrupted"]);
 const ACTIVE_ANALYSIS_STATUSES = new Set(["queued", "running"]);
 const ACTIVE_DAILY_RUN_STATUSES = new Set(["queued", "running", "cancelling"]);
@@ -73,6 +76,7 @@ const HOLDING_SORT_COLUMNS = [
 type HoldingSortKey = (typeof HOLDING_SORT_COLUMNS)[number]["key"];
 type HoldingSortDirection = "asc" | "desc";
 type HoldingSort = { key: HoldingSortKey; direction: HoldingSortDirection };
+type PortfolioMonitorLevel = "off" | "manual" | "autonomous";
 
 const holdingTextCollator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
 const shanghaiClockFormatter = new Intl.DateTimeFormat("en-GB", {
@@ -125,6 +129,9 @@ function createEmptyTradeForm() {
     quantity: "",
     price: "",
     trade_date: todayDateString(),
+    fees: "",
+    taxes: "",
+    broker_reported_pnl: "",
     notes: "",
   };
 }
@@ -196,40 +203,78 @@ function securityDisplayName(
   return name ? `${name}（${code || normalizedSymbol}）` : normalizedSymbol || "-";
 }
 
-type StoredMonitorSelection = {
-  selection: Set<string>;
+type StoredMonitorLevels = {
+  levels: Map<string, PortfolioMonitorLevel>;
   hasPersistedValue: boolean;
 };
 
-function loadMonitorSelection(): StoredMonitorSelection {
+const MONITOR_LEVEL_LABELS: Record<PortfolioMonitorLevel, string> = {
+  off: "未监控",
+  manual: "普通监控",
+  autonomous: "AI 自主监控",
+};
+
+function nextMonitorLevel(level: PortfolioMonitorLevel): PortfolioMonitorLevel {
+  if (level === "off") return "manual";
+  if (level === "manual") return "autonomous";
+  return "off";
+}
+
+function loadMonitorLevels(): StoredMonitorLevels {
   if (typeof window === "undefined") {
-    return { selection: new Set(), hasPersistedValue: false };
+    return { levels: new Map(), hasPersistedValue: false };
   }
   try {
-    const raw = window.localStorage.getItem(MONITOR_SELECTION_STORAGE_KEY);
-    if (raw === null) return { selection: new Set(), hasPersistedValue: false };
-    const stored = JSON.parse(raw) as { version?: unknown; symbols?: unknown };
-    if (stored.version !== 1 || !Array.isArray(stored.symbols)) {
-      return { selection: new Set(), hasPersistedValue: true };
+    const raw = window.localStorage.getItem(MONITOR_LEVEL_STORAGE_KEY);
+    if (raw !== null) {
+      const stored = JSON.parse(raw) as { version?: unknown; levels?: unknown };
+      const levels = new Map<string, PortfolioMonitorLevel>();
+      if (stored.version === 2 && stored.levels && typeof stored.levels === "object" && !Array.isArray(stored.levels)) {
+        for (const [symbol, level] of Object.entries(stored.levels)) {
+          if (level !== "manual" && level !== "autonomous") continue;
+          const normalized = symbol.trim().toUpperCase();
+          if (normalized) levels.set(normalized, level);
+        }
+      }
+      return { levels, hasPersistedValue: true };
     }
-    return {
-      selection: new Set(stored.symbols
-        .filter((symbol): symbol is string => typeof symbol === "string")
-        .map((symbol) => symbol.trim())
-        .filter(Boolean)),
-      hasPersistedValue: true,
-    };
+
+    const legacyRaw = window.localStorage.getItem(MONITOR_SELECTION_STORAGE_KEY);
+    if (legacyRaw === null) return { levels: new Map(), hasPersistedValue: false };
+    const legacy = JSON.parse(legacyRaw) as { version?: unknown; symbols?: unknown };
+    const levels = new Map<string, PortfolioMonitorLevel>();
+    if (legacy.version === 1 && Array.isArray(legacy.symbols)) {
+      for (const value of legacy.symbols) {
+        if (typeof value !== "string") continue;
+        const symbol = value.trim().toUpperCase();
+        if (symbol) levels.set(symbol, "autonomous");
+      }
+    }
+    return { levels, hasPersistedValue: true };
   } catch {
-    return { selection: new Set(), hasPersistedValue: true };
+    return { levels: new Map(), hasPersistedValue: true };
   }
 }
 
-function persistMonitorSelection(selection: Set<string>): void {
+function persistMonitorLevels(levels: ReadonlyMap<string, PortfolioMonitorLevel>): void {
   if (typeof window === "undefined") return;
   try {
+    const activeLevels = Object.fromEntries(
+      Array.from(levels.entries())
+        .filter(([, level]) => level !== "off")
+        .sort(([left], [right]) => left.localeCompare(right)),
+    );
+    window.localStorage.setItem(MONITOR_LEVEL_STORAGE_KEY, JSON.stringify({
+      version: 2,
+      levels: activeLevels,
+    }));
+    const autonomousSymbols = Array.from(levels.entries())
+      .filter(([, level]) => level === "autonomous")
+      .map(([symbol]) => symbol)
+      .sort();
     window.localStorage.setItem(MONITOR_SELECTION_STORAGE_KEY, JSON.stringify({
       version: 1,
-      symbols: Array.from(selection).sort(),
+      symbols: autonomousSymbols,
     }));
   } catch {
     // A blocked or full localStorage must not make the portfolio page unusable.
@@ -326,7 +371,7 @@ function isActiveAnalysis(run: PortfolioAnalysisSession | undefined): boolean {
 
 export function Portfolio() {
   const navigate = useNavigate();
-  const [initialMonitorSelection] = useState<StoredMonitorSelection>(loadMonitorSelection);
+  const [initialMonitorLevels] = useState<StoredMonitorLevels>(loadMonitorLevels);
   const [review, setReview] = useState<PortfolioReview | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -349,12 +394,16 @@ export function Portfolio() {
   const [savingMandate, setSavingMandate] = useState(false);
   const [savingCash, setSavingCash] = useState(false);
   const [startingDailyRun, setStartingDailyRun] = useState(false);
-  const [monitorSelection, setMonitorSelection] = useState<Set<string>>(
-    () => initialMonitorSelection.selection,
+  const [appliedMonitorLevels, setAppliedMonitorLevels] = useState<Map<string, PortfolioMonitorLevel>>(
+    () => new Map(initialMonitorLevels.levels),
   );
+  const [draftMonitorLevels, setDraftMonitorLevels] = useState<Map<string, PortfolioMonitorLevel>>(
+    () => new Map(initialMonitorLevels.levels),
+  );
+  const [monitorLevelApplyAt, setMonitorLevelApplyAt] = useState<number | null>(null);
   const [monitorSelectionRevision, setMonitorSelectionRevision] = useState(0);
   const [monitorSelectionHydrationPending, setMonitorSelectionHydrationPending] = useState(
-    () => !initialMonitorSelection.hasPersistedValue,
+    () => !initialMonitorLevels.hasPersistedValue,
   );
   const completedRefreshRef = useRef<string | null>(null);
   const holdingNameByIdentifier = useMemo(() => {
@@ -370,23 +419,74 @@ export function Portfolio() {
     return names;
   }, [monitorSelectionHydrationPending, review?.portfolio_state.holdings]);
 
+  const appliedMonitorSymbols = useMemo(
+    () => new Set(Array.from(appliedMonitorLevels.entries())
+      .filter(([, level]) => level !== "off")
+      .map(([symbol]) => symbol)),
+    [appliedMonitorLevels],
+  );
+  const appliedManualMonitorSymbols = useMemo(
+    () => new Set(Array.from(appliedMonitorLevels.entries())
+      .filter(([, level]) => level === "manual")
+      .map(([symbol]) => symbol)),
+    [appliedMonitorLevels],
+  );
+  const appliedAutonomousMonitorSymbols = useMemo(
+    () => new Set(Array.from(appliedMonitorLevels.entries())
+      .filter(([, level]) => level === "autonomous")
+      .map(([symbol]) => symbol)),
+    [appliedMonitorLevels],
+  );
+  const pendingMonitorSymbols = useMemo(() => {
+    const symbols = new Set([...draftMonitorLevels.keys(), ...appliedMonitorLevels.keys()]);
+    return new Set(Array.from(symbols).filter((symbol) => (
+      (draftMonitorLevels.get(symbol) || "off") !== (appliedMonitorLevels.get(symbol) || "off")
+    )));
+  }, [appliedMonitorLevels, draftMonitorLevels]);
+
   useEffect(() => {
     if (monitorSelectionHydrationPending) return;
-    persistMonitorSelection(monitorSelection);
-  }, [monitorSelection, monitorSelectionHydrationPending]);
+    persistMonitorLevels(appliedMonitorLevels);
+  }, [appliedMonitorLevels, monitorSelectionHydrationPending]);
+
+  useEffect(() => {
+    if (monitorLevelApplyAt === null) return;
+    const timer = window.setTimeout(() => {
+      setAppliedMonitorLevels(new Map(draftMonitorLevels));
+      setMonitorSelectionRevision((current) => current + 1);
+      setMonitorLevelApplyAt(null);
+    }, Math.max(0, monitorLevelApplyAt - Date.now()));
+    return () => window.clearTimeout(timer);
+  }, [draftMonitorLevels, monitorLevelApplyAt]);
 
   useEffect(() => {
     const holdings = review?.portfolio_state.holdings;
     if (!holdings) return;
     const validSymbols = new Set(holdings.map(holdingSymbol).filter(Boolean));
-    setMonitorSelection((current) => {
-      const next = new Set(Array.from(current).filter((symbol) => validSymbols.has(symbol)));
-      if (next.size === current.size && Array.from(next).every((symbol) => current.has(symbol))) {
-        return current;
-      }
-      return next;
-    });
+    const pruneLevels = (current: Map<string, PortfolioMonitorLevel>) => {
+      const next = new Map(Array.from(current.entries()).filter(([symbol]) => validSymbols.has(symbol)));
+      return next.size === current.size ? current : next;
+    };
+    setAppliedMonitorLevels(pruneLevels);
+    setDraftMonitorLevels(pruneLevels);
   }, [review?.portfolio_state.holdings]);
+
+  const queueMonitorLevels = (symbols: string[], level: PortfolioMonitorLevel) => {
+    setMonitorSelectionHydrationPending(false);
+    const next = new Map(draftMonitorLevels);
+    for (const rawSymbol of symbols) {
+      const symbol = rawSymbol.trim().toUpperCase();
+      if (!symbol) continue;
+      if (level === "off") next.delete(symbol);
+      else next.set(symbol, level);
+    }
+    setDraftMonitorLevels(next);
+    const allSymbols = new Set([...next.keys(), ...appliedMonitorLevels.keys()]);
+    const changed = Array.from(allSymbols).some((symbol) => (
+      (next.get(symbol) || "off") !== (appliedMonitorLevels.get(symbol) || "off")
+    ));
+    setMonitorLevelApplyAt(changed ? Date.now() + MONITOR_LEVEL_APPLY_DELAY_MS : null);
+  };
 
   const loadReview = useCallback(async (mode: "initial" | "refresh" = "refresh") => {
     if (mode === "initial") setLoading(true);
@@ -885,6 +985,12 @@ export function Portfolio() {
         quantity,
         price,
         trade_date: tradeForm.trade_date.trim() || undefined,
+        fees: tradeForm.fees.trim() ? Number(tradeForm.fees) : undefined,
+        taxes: tradeForm.taxes.trim() ? Number(tradeForm.taxes) : undefined,
+        broker_reported_pnl: tradeForm.broker_reported_pnl.trim()
+          ? Number(tradeForm.broker_reported_pnl)
+          : undefined,
+        idempotency_key: crypto.randomUUID(),
         notes: tradeForm.notes.trim() || undefined,
       });
       setReview(payload);
@@ -913,22 +1019,22 @@ export function Portfolio() {
   const removeTrade = async (trade: PortfolioTrade) => {
     const tradeId = String(trade.trade_id || "");
     if (!tradeId) {
-      toast.error("该交易记录缺少标识，无法删除。");
+      toast.error("该交易事件缺少标识，无法追加冲销标记。");
       return;
     }
     const symbol = String(trade.symbol || trade.code || "");
     const displayName = symbol
       ? securityDisplayName(symbol, holdingNameByIdentifier, trade.name)
       : "该证券";
-    if (!window.confirm(`确认删除 ${displayName} 的这条交易记录？\n\n只删除记录，不会撤销它已经造成的持仓变化。`)) return;
+    if (!window.confirm(`确认给 ${displayName} 的这条交易追加冲销标记？\n\n历史事件不会删除；持仓调整仍需通过券商对账明确确认。`)) return;
 
     setDeletingTradeId(tradeId);
     try {
-      const payload = await api.deletePortfolioTrade(tradeId);
+      const payload = await api.reversePortfolioTrade(tradeId);
       setReview(payload);
-      toast.success("交易记录已删除，持仓未回滚。");
+      toast.success("冲销标记已追加；历史事件和持仓审计轨迹均已保留。");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "删除交易记录失败");
+      toast.error(error instanceof Error ? error.message : "追加冲销标记失败");
     } finally {
       setDeletingTradeId(null);
     }
@@ -1016,11 +1122,18 @@ export function Portfolio() {
 
         <PortfolioMonitorPanel
           holdings={review?.portfolio_state.holdings || []}
-          selectedSymbols={monitorSelection}
+          selectedSymbols={appliedMonitorSymbols}
+          manualSymbols={appliedManualMonitorSymbols}
+          autonomousSymbols={appliedAutonomousMonitorSymbols}
           selectionRevision={monitorSelectionRevision}
           selectionHydrationPending={monitorSelectionHydrationPending}
-          onHydrateSelection={(symbols) => {
-            setMonitorSelection(new Set(symbols));
+          onHydrateSelection={({ manual, autonomous }) => {
+            const hydrated = new Map<string, PortfolioMonitorLevel>();
+            manual.forEach((symbol) => hydrated.set(symbol, "manual"));
+            autonomous.forEach((symbol) => hydrated.set(symbol, "autonomous"));
+            setAppliedMonitorLevels(hydrated);
+            setDraftMonitorLevels(new Map(hydrated));
+            setMonitorLevelApplyAt(null);
             setMonitorSelectionHydrationPending(false);
           }}
         />
@@ -1046,6 +1159,13 @@ export function Portfolio() {
               <SummaryTile label="来源延迟" value={String(summary.lagCount)} />
               <SummaryTile label="盘中旧值" value={String(summary.provisionalCount)} />
               <SummaryTile label="口径不符" value={String(summary.basisMismatchCount)} />
+            </section>
+            <section className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+              <span>账本版本：{review?.portfolio_state.revision ?? 0}</span>
+              <span>权威存储：{String(review?.portfolio_state.provenance?.authoritative_store || "sqlite")}</span>
+              <span>收益口径：{review?.portfolio_state.performance?.status || "unavailable"}</span>
+              <span>券商报告盈亏：{fmtNumber(review?.portfolio_state.performance?.broker_reported_pnl, 2)}</span>
+              <span>费用与税费：{fmtNumber(review?.portfolio_state.performance?.fees_and_taxes, 2)}</span>
             </section>
 
             <section className="grid gap-4 lg:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
@@ -1148,6 +1268,11 @@ export function Portfolio() {
                     <input className="rounded-md border bg-background px-3 py-2 text-sm" type="number" min="0" step="any" required inputMode="decimal" placeholder="数量" value={tradeForm.quantity} onChange={(e) => setTradeForm((s) => ({ ...s, quantity: e.target.value }))} />
                     <input className="rounded-md border bg-background px-3 py-2 text-sm" type="number" min="0" step="any" required inputMode="decimal" placeholder="价格" value={tradeForm.price} onChange={(e) => setTradeForm((s) => ({ ...s, price: e.target.value }))} />
                   </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    <input className="rounded-md border bg-background px-3 py-2 text-sm" type="number" min="0" step="any" placeholder="手续费（可选）" value={tradeForm.fees} onChange={(e) => setTradeForm((s) => ({ ...s, fees: e.target.value }))} />
+                    <input className="rounded-md border bg-background px-3 py-2 text-sm" type="number" min="0" step="any" placeholder="税费（可选）" value={tradeForm.taxes} onChange={(e) => setTradeForm((s) => ({ ...s, taxes: e.target.value }))} />
+                    <input className="rounded-md border bg-background px-3 py-2 text-sm" type="number" step="any" placeholder="券商净盈亏（可选）" value={tradeForm.broker_reported_pnl} onChange={(e) => setTradeForm((s) => ({ ...s, broker_reported_pnl: e.target.value }))} />
+                  </div>
                   <div className="grid grid-cols-[1fr_auto] gap-2">
                     <input
                       className="rounded-md border bg-background px-3 py-2 text-sm"
@@ -1184,28 +1309,20 @@ export function Portfolio() {
               </form>
             </section>
 
+            <PortfolioReconciliationPanel
+              currentRevision={review?.portfolio_state.revision || 0}
+              onCommitted={() => loadReview("refresh")}
+            />
+
             <HoldingsTable
               review={review}
-              selectedSymbols={monitorSelection}
-              onToggleSelection={(symbol, selected) => {
-                setMonitorSelectionHydrationPending(false);
-                setMonitorSelectionRevision((current) => current + 1);
-                setMonitorSelection((current) => {
-                  const next = new Set(current);
-                  if (selected) next.add(symbol);
-                  else next.delete(symbol);
-                  return next;
-                });
-              }}
-              onToggleAll={(symbols, selected) => {
-                setMonitorSelectionHydrationPending(false);
-                setMonitorSelectionRevision((current) => current + 1);
-                setMonitorSelection((current) => {
-                  const next = new Set(current);
-                  symbols.forEach((symbol) => selected ? next.add(symbol) : next.delete(symbol));
-                  return next;
-                });
-              }}
+              monitorLevels={draftMonitorLevels}
+              pendingMonitorSymbols={pendingMonitorSymbols}
+              onCycleMonitorLevel={(symbol) => queueMonitorLevels(
+                [symbol],
+                nextMonitorLevel(draftMonitorLevels.get(symbol) || "off"),
+              )}
+              onSetAllMonitorLevels={queueMonitorLevels}
               analysisRuns={analysisRuns}
               startingAnalysisKey={startingAnalysisKey}
               onStart={(holding) => void startAnalysis("holding", holding)}
@@ -1346,9 +1463,10 @@ function RefreshProgress({
 
 function HoldingsTable({
   review,
-  selectedSymbols,
-  onToggleSelection,
-  onToggleAll,
+  monitorLevels,
+  pendingMonitorSymbols,
+  onCycleMonitorLevel,
+  onSetAllMonitorLevels,
   analysisRuns,
   startingAnalysisKey,
   onStart,
@@ -1356,9 +1474,10 @@ function HoldingsTable({
   onUpdate,
 }: {
   review: PortfolioReview | null;
-  selectedSymbols: Set<string>;
-  onToggleSelection: (symbol: string, selected: boolean) => void;
-  onToggleAll: (symbols: string[], selected: boolean) => void;
+  monitorLevels: ReadonlyMap<string, PortfolioMonitorLevel>;
+  pendingMonitorSymbols: ReadonlySet<string>;
+  onCycleMonitorLevel: (symbol: string) => void;
+  onSetAllMonitorLevels: (symbols: string[], level: PortfolioMonitorLevel) => void;
   analysisRuns: Record<string, PortfolioAnalysisSession>;
   startingAnalysisKey: string | null;
   onStart: (holding: PortfolioHolding) => void;
@@ -1379,7 +1498,14 @@ function HoldingsTable({
       .map(({ row }) => row);
   }, [holdings, sort]);
   const selectableSymbols = useMemo(() => holdings.map(holdingSymbol).filter(Boolean), [holdings]);
-  const allSelected = selectableSymbols.length > 0 && selectableSymbols.every((symbol) => selectedSymbols.has(symbol));
+  const batchMonitorLevel = useMemo<PortfolioMonitorLevel | "mixed">(() => {
+    if (!selectableSymbols.length) return "off";
+    const levels = new Set(selectableSymbols.map((symbol) => monitorLevels.get(symbol) || "off"));
+    return levels.size === 1 ? Array.from(levels)[0] : "mixed";
+  }, [monitorLevels, selectableSymbols]);
+  const nextBatchMonitorLevel = batchMonitorLevel === "manual"
+    ? "autonomous"
+    : batchMonitorLevel === "autonomous" ? "off" : "manual";
 
   const toggleSort = (key: HoldingSortKey) => {
     setSort((current) => {
@@ -1423,7 +1549,15 @@ function HoldingsTable({
 
   return (
     <section id="portfolio-holdings" className="grid scroll-mt-6 gap-2">
-      <h2 className="text-sm font-semibold">持仓矩阵</h2>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-sm font-semibold">持仓矩阵</h2>
+        <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground" aria-label="监控等级颜色说明">
+          <span><i className="mr-1 inline-block h-2 w-2 rounded-full bg-muted-foreground/50" />灰色 · 未监控</span>
+          <span><i className="mr-1 inline-block h-2 w-2 rounded-full bg-blue-500" />蓝色 · 普通监控</span>
+          <span><i className="mr-1 inline-block h-2 w-2 rounded-full bg-violet-500 shadow-sm shadow-violet-500" />紫色 · AI 自主</span>
+          <span>连续点击循环切换，停止操作 5 秒后应用</span>
+        </div>
+      </div>
       <div className="overflow-auto rounded-md border">
         <table aria-label="持仓矩阵" className="w-full min-w-[1090px] text-left text-xs">
           <thead className="bg-muted/50 text-[11px] uppercase text-muted-foreground">
@@ -1434,9 +1568,10 @@ function HoldingsTable({
                   column={column}
                   sort={sort}
                   onSort={toggleSort}
-                  selectAll={column.key === "name" ? {
-                    checked: allSelected,
-                    onChange: (selected) => onToggleAll(selectableSymbols, selected),
+                  monitorLevelControl={column.key === "name" ? {
+                    level: batchMonitorLevel,
+                    nextLevel: nextBatchMonitorLevel,
+                    onChange: () => onSetAllMonitorLevels(selectableSymbols, nextBatchMonitorLevel),
                   } : undefined}
                 />
               ))}
@@ -1450,28 +1585,55 @@ function HoldingsTable({
               sortedHoldings.map((row, index) => {
                 const symbol = holdingSymbol(row);
                 const isEditing = editingSymbol === symbol;
+                const monitorLevel = monitorLevels.get(symbol) || "off";
+                const nextLevel = nextMonitorLevel(monitorLevel);
+                const monitorLevelPending = pendingMonitorSymbols.has(symbol);
                 return (
                 <tr key={`${row.symbol || row.code || index}`} className={cn("border-t", isEditing && "bg-muted/20")}>
                   <td className="px-3 py-2 font-medium">
-                    <div className="flex items-center gap-2">
+                    <div className="relative flex items-center gap-2">
                     <button
                       type="button"
-                      aria-label={`${selectedSymbols.has(symbol) ? "取消选择" : "选择"} ${symbol || fmtText(row.name)} 用于 AI 监控`}
-                      aria-pressed={selectedSymbols.has(symbol)}
+                      aria-label={`${symbol || fmtText(row.name)} 监控等级：${MONITOR_LEVEL_LABELS[monitorLevel]}；点击切换为${MONITOR_LEVEL_LABELS[nextLevel]}`}
                       disabled={!symbol}
-                      title={selectedSymbols.has(symbol) ? "已加入 AI 监控选择" : "加入 AI 监控选择"}
-                      onClick={() => onToggleSelection(symbol, !selectedSymbols.has(symbol))}
-                      data-monitor-selected={selectedSymbols.has(symbol) ? "true" : "false"}
+                      title={`${MONITOR_LEVEL_LABELS[monitorLevel]}；点击切换为${MONITOR_LEVEL_LABELS[nextLevel]}`}
+                      onClick={() => onCycleMonitorLevel(symbol)}
+                      data-monitor-mode={monitorLevel}
+                      data-monitor-pending={monitorLevelPending ? "true" : "false"}
                       className={cn(
-                        "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full border transition-all disabled:cursor-not-allowed disabled:opacity-40",
-                        selectedSymbols.has(symbol)
-                          ? "border-cyan-500/60 bg-cyan-500/15 text-cyan-600 shadow-sm shadow-cyan-500/30 dark:text-cyan-300"
-                          : "border-muted-foreground/25 text-muted-foreground hover:border-cyan-500/40 hover:bg-cyan-500/5 hover:text-cyan-600",
+                        "relative inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full border transition-all disabled:cursor-not-allowed disabled:opacity-40",
+                        monitorLevel === "manual"
+                          ? "border-blue-500/70 bg-blue-500/15 text-blue-600 shadow-sm shadow-blue-500/30 dark:text-blue-300"
+                          : monitorLevel === "autonomous"
+                            ? "border-violet-400/80 bg-violet-500/20 text-violet-600 shadow-md shadow-violet-500/40 dark:text-violet-300"
+                            : "border-muted-foreground/25 text-muted-foreground hover:border-blue-500/40 hover:bg-blue-500/5 hover:text-blue-600",
                       )}
                     >
                       <Radar aria-hidden="true" className="h-4 w-4" />
+                      {monitorLevel === "autonomous" ? (
+                        <span aria-hidden="true" className="pointer-events-none absolute inset-0">
+                          <i className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 animate-ping rounded-full bg-fuchsia-400" />
+                          <i className="absolute -bottom-1 left-0 h-1 w-1 animate-pulse rounded-full bg-violet-300" />
+                          <i className="absolute -left-1 top-1 h-1 w-1 animate-pulse rounded-full bg-purple-400 [animation-delay:250ms]" />
+                        </span>
+                      ) : null}
                     </button>
                     <span>{fmtText(row.name)}</span>
+                    {monitorLevelPending ? (
+                      <span
+                        role="status"
+                        className={cn(
+                          "pointer-events-none absolute bottom-[calc(100%+0.25rem)] left-0 z-30 whitespace-nowrap rounded border px-2 py-1 text-[10px] font-medium shadow-lg backdrop-blur-sm",
+                          monitorLevel === "autonomous"
+                            ? "border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-200"
+                            : monitorLevel === "manual"
+                              ? "border-blue-500/40 bg-blue-500/10 text-blue-700 dark:text-blue-200"
+                              : "border-muted bg-background text-muted-foreground",
+                        )}
+                      >
+                        已切换到{MONITOR_LEVEL_LABELS[monitorLevel]} · 5 秒后应用
+                      </span>
+                    ) : null}
                     </div>
                   </td>
                   <td className="px-3 py-2 font-mono">{fmtText(row.symbol || row.code)}</td>
@@ -1574,12 +1736,16 @@ function SortableHoldingHeader({
   column,
   sort,
   onSort,
-  selectAll,
+  monitorLevelControl,
 }: {
   column: (typeof HOLDING_SORT_COLUMNS)[number];
   sort: HoldingSort | null;
   onSort: (key: HoldingSortKey) => void;
-  selectAll?: { checked: boolean; onChange: (selected: boolean) => void };
+  monitorLevelControl?: {
+    level: PortfolioMonitorLevel | "mixed";
+    nextLevel: PortfolioMonitorLevel;
+    onChange: () => void;
+  };
 }) {
   const isActive = sort?.key === column.key;
   const direction = isActive ? sort.direction : null;
@@ -1593,21 +1759,26 @@ function SortableHoldingHeader({
       className={cn("px-3 py-2 font-medium", alignRight && "text-right")}
     >
       <div className={cn("flex items-center gap-2", alignRight && "justify-end")}>
-        {selectAll ? (
+        {monitorLevelControl ? (
           <button
             type="button"
-            aria-label={selectAll.checked ? "取消选择全部持仓用于 AI 监控" : "选择全部持仓用于 AI 监控"}
-            aria-pressed={selectAll.checked}
-            title={selectAll.checked ? "取消全部监控选择" : "选择全部持仓用于 AI 监控"}
-            onClick={() => selectAll.onChange(!selectAll.checked)}
+            aria-label={`批量监控等级：${monitorLevelControl.level === "mixed" ? "混合" : MONITOR_LEVEL_LABELS[monitorLevelControl.level]}；点击全部切换为${MONITOR_LEVEL_LABELS[monitorLevelControl.nextLevel]}`}
+            title={`全部切换为${MONITOR_LEVEL_LABELS[monitorLevelControl.nextLevel]}，5 秒后应用`}
+            onClick={monitorLevelControl.onChange}
+            data-monitor-mode={monitorLevelControl.level}
             className={cn(
-              "inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full border transition",
-              selectAll.checked
-                ? "border-cyan-500/60 bg-cyan-500/15 text-cyan-600 dark:text-cyan-300"
-                : "border-muted-foreground/25 text-muted-foreground hover:border-cyan-500/40 hover:text-cyan-600",
+              "relative inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full border transition",
+              monitorLevelControl.level === "manual"
+                ? "border-blue-500/70 bg-blue-500/15 text-blue-600 dark:text-blue-300"
+                : monitorLevelControl.level === "autonomous"
+                  ? "border-violet-400/80 bg-violet-500/20 text-violet-600 shadow-sm shadow-violet-500/40 dark:text-violet-300"
+                  : "border-muted-foreground/25 text-muted-foreground hover:border-blue-500/40 hover:text-blue-600",
             )}
           >
             <Radar aria-hidden="true" className="h-3.5 w-3.5" />
+            {monitorLevelControl.level === "autonomous" ? (
+              <i aria-hidden="true" className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 animate-ping rounded-full bg-fuchsia-400" />
+            ) : null}
           </button>
         ) : null}
         <button

@@ -352,7 +352,7 @@ def test_edit_portfolio_holding_updates_quantity_cost_and_derived_values(tmp_pat
     assert round(holding["pnl"], 2) == 25.0
 
 
-def test_delete_portfolio_trade_does_not_reverse_holding_change(tmp_path, monkeypatch) -> None:
+def test_deprecated_delete_route_appends_reversal_without_holding_change(tmp_path, monkeypatch) -> None:
     client = _client(tmp_path, monkeypatch)
     assert client.post("/portfolio/holdings", json={"raw_text": "科创50指 588870 100 1.975"}).status_code == 200
     recorded = client.post(
@@ -366,11 +366,14 @@ def test_delete_portfolio_trade_does_not_reverse_holding_change(tmp_path, monkey
 
     assert deleted.status_code == 200
     state = deleted.json()["portfolio_state"]
-    assert state["recent_trades"] == []
+    assert state["recent_trades"][0]["trade_id"] == trade_id
+    assert state["recent_trades"][0]["event_status"] == "reversed"
+    assert state["ledger_events"][0]["event_type"] == "reversal"
+    assert state["ledger_events"][0]["reverses_event_id"] == trade_id
     assert state["holdings"][0]["quantity"] == 150
 
 
-def test_delete_legacy_trade_without_stored_id(tmp_path, monkeypatch) -> None:
+def test_legacy_trade_can_be_marked_reversed_without_deletion(tmp_path, monkeypatch) -> None:
     state_path = tmp_path / "portfolio_state.json"
     state_path.write_text(json.dumps({
         "holdings": [{"code": "588870", "symbol": "588870.SH", "name": "科创50指", "quantity": 150, "cost_price": 2.0}],
@@ -384,8 +387,47 @@ def test_delete_legacy_trade_without_stored_id(tmp_path, monkeypatch) -> None:
     deleted = client.delete(f"/portfolio/trades/{trade_id}")
 
     assert deleted.status_code == 200
-    assert deleted.json()["portfolio_state"]["recent_trades"] == []
-    assert deleted.json()["portfolio_state"]["holdings"][0]["quantity"] == 150
+    state = deleted.json()["portfolio_state"]
+    assert state["recent_trades"][0]["trade_id"] == trade_id
+    assert state["recent_trades"][0]["event_status"] == "reversed"
+    assert state["ledger_events"][0]["event_type"] == "reversal"
+    assert state["ledger_events"][0]["reverses_event_id"] == trade_id
+    assert state["holdings"][0]["quantity"] == 150
+
+
+def test_portfolio_reconciliation_requires_preview_then_explicit_commit(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    seeded = client.post(
+        "/portfolio/holdings",
+        json={"raw_text": "科创50ETF汇添富 588870 10500 1.938"},
+    )
+    assert seeded.status_code == 200
+    revision = seeded.json()["portfolio_state"]["revision"]
+
+    preview = client.post(
+        "/portfolio/reconciliation/preview",
+        json={
+            "raw_text": "科创50ETF汇添富 588870 13700 2.100",
+            "broker_reported_pnl": 271.64,
+            "source_label": "broker-test",
+        },
+    )
+    assert preview.status_code == 200
+    record = preview.json()
+    assert record["base_revision"] == revision
+    assert record["preview"]["holding_diffs"][0]["changes"]["quantity"] == {
+        "current": 10500.0,
+        "broker": 13700.0,
+    }
+    assert client.get("/portfolio/review").json()["portfolio_state"]["holdings"][0]["quantity"] == 10500
+
+    committed = client.post(
+        f"/portfolio/reconciliation/{record['reconciliation_id']}/commit",
+        json={"expected_revision": revision},
+    )
+    assert committed.status_code == 200
+    assert committed.json()["state"]["holdings"][0]["quantity"] == 13700
+    assert committed.json()["state"]["holdings"][0]["cost_basis_kind"] == "broker_adjusted"
 
 
 def test_refresh_portfolio_market_data_updates_holdings_and_cache(tmp_path, monkeypatch) -> None:

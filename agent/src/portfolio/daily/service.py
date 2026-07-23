@@ -15,7 +15,12 @@ from zoneinfo import ZoneInfo
 
 from src.channels.research_sessions import resolve_premarket_target_date
 from src.data_layer import get_unified_data_service
+from src.portfolio.analysis_methods import (
+    market_analysis_snapshot_from_contexts,
+    unavailable_agent_analysis,
+)
 from src.portfolio.daily.contracts import BriefContractError, fallback_brief, parse_holding_brief
+from src.portfolio.daily.monitoring import build_monitoring_bundle, structured_monitoring_enabled
 from src.portfolio.daily.reporting import aggregate_portfolio, render_holding_markdown, render_master_markdown
 from src.portfolio.daily.store import DailyRunStore, TERMINAL_STATUSES
 from src.portfolio.mandate import ensure_assignments, load_mandate, suggest_classifications
@@ -238,6 +243,19 @@ def _contexts_for_symbol(
             item["research"] = research_item
         else:
             item["research"] = research
+
+        profiles = context.get("etf_product")
+        if isinstance(profiles, dict):
+            item["etf_product"] = (
+                {symbol: profiles[symbol]} if symbol in profiles else {}
+            )
+        profile_errors = context.get("etf_product_errors")
+        if isinstance(profile_errors, dict):
+            item["etf_product_errors"] = (
+                {symbol: profile_errors[symbol]}
+                if symbol in profile_errors
+                else {}
+            )
         projected.append(item)
     return projected
 
@@ -325,6 +343,282 @@ def _compact_value(value: Any, *, depth: int = 0) -> Any:
     return value
 
 
+def _compact_market_bar(value: Any) -> dict[str, Any]:
+    """Keep decision-useful OHLCV fields without provider payload bloat."""
+
+    if not isinstance(value, dict):
+        return {}
+    bar = {
+        key: _compact_value(value.get(key))
+        for key in (
+            "session_date",
+            "bar_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "raw_volume",
+            "volume_unit",
+            "amount",
+            "vwap",
+            "status",
+            "source_count",
+            "sources",
+            "adjustment",
+            "interval",
+            "quality_flags",
+            "verified_at",
+        )
+        if value.get(key) is not None
+    }
+    if value.get("volume") is not None and not bar.get("volume_unit"):
+        evidence = next(
+            (
+                observation
+                for observation in (value.get("observations") or [])
+                if isinstance(observation, dict)
+                and observation.get("included_in_consensus") is not False
+                and observation.get("volume_unit")
+            ),
+            None,
+        )
+        if evidence:
+            bar["volume_unit"] = evidence.get("volume_unit")
+            if evidence.get("raw_volume") is not None:
+                bar["raw_volume"] = evidence.get("raw_volume")
+    if bar.get("volume") is not None and bar.get("volume_unit") == "share":
+        shares = float(bar["volume"])
+        bar["volume_display"] = {
+            "shares": shares,
+            "yi_shares": round(shares / 100_000_000, 4),
+            "wan_lots": round(shares / 100 / 10_000, 4),
+            "allowed_labels": ["亿股", "万手"],
+            "lot_size_shares": 100,
+        }
+    if value.get("volume") is None:
+        volume_evidence = []
+        for observation in value.get("observations") or []:
+            if not isinstance(observation, dict) or observation.get("volume") is None:
+                continue
+            volume_evidence.append(
+                {
+                    key: observation.get(key)
+                    for key in (
+                        "source",
+                        "volume",
+                        "raw_volume",
+                        "volume_unit",
+                        "included_in_consensus",
+                    )
+                    if observation.get(key) is not None
+                }
+            )
+        if volume_evidence:
+            bar["volume_evidence"] = volume_evidence[:3]
+            bar["volume_status"] = "source_evidence_only"
+    return bar
+
+
+def _compact_market_series(
+    series: dict[str, Any], *, symbol: str, bar_limit: int, lean: bool
+) -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "interval": str(series.get("interval") or ""),
+        "adjustment": series.get("adjustment"),
+        "bar_count": series.get("bar_count"),
+        "coverage": series.get("coverage"),
+        "latest": _compact_market_bar(series.get("latest")),
+        "decision_status": series.get("decision_status"),
+        "actionability": series.get("actionability"),
+        "selected_quote": series.get("selected_quote"),
+        "blocked_reasons": list(series.get("blocked_reasons") or []),
+        "freshness": series.get("freshness"),
+        "retrieval": series.get("retrieval"),
+        "source_attempts": [
+            _compact_value(item)
+            for item in (series.get("source_attempts") or [])[-(3 if lean else 6) :]
+        ],
+        "bars": [
+            _compact_market_bar(item)
+            for item in (series.get("bars") or [])[-bar_limit:]
+        ],
+    }
+
+
+def _compact_etf_product_profile(
+    profile: Any, *, member_limit: int = 12
+) -> dict[str, Any]:
+    """Project the Reports-area ETF profile into a bounded daily input."""
+
+    if not isinstance(profile, dict):
+        return {}
+    share = profile.get("share_history")
+    peer = profile.get("peer_group")
+    share = share if isinstance(share, dict) else {}
+    peer = peer if isinstance(peer, dict) else {}
+    members = []
+    for raw in (peer.get("members") or [])[:member_limit]:
+        if not isinstance(raw, dict):
+            continue
+        members.append(
+            {
+                key: raw.get(key)
+                for key in (
+                    "symbol",
+                    "name",
+                    "manager",
+                    "mapping_status",
+                    "data_as_of",
+                    "current_units",
+                    "delta_1d",
+                    "delta_5d",
+                    "delta_20d",
+                    "current_price",
+                    "estimated_net_flow_1d",
+                )
+                if raw.get(key) is not None
+            }
+        )
+    return {
+        "symbol": str(profile.get("symbol") or "").upper(),
+        "data_as_of": profile.get("data_as_of"),
+        "retrieved_at": profile.get("retrieved_at"),
+        "refresh_status": profile.get("refresh_status"),
+        "share_history": {
+            key: share.get(key)
+            for key in (
+                "tracked_index_code",
+                "tracked_index_name",
+                "current_units",
+                "delta_1d",
+                "delta_5d",
+                "delta_20d",
+                "estimated_net_flow_1d",
+                "estimated_net_flow_semantics",
+            )
+            if share.get(key) is not None
+        },
+        "peer_group": {
+            **{
+                key: peer.get(key)
+                for key in (
+                    "tracked_index_code",
+                    "tracked_index_name",
+                    "data_as_of",
+                    "member_count",
+                    "official_index_mapping_count",
+                    "name_mapped_count",
+                    "estimated_net_flow_1d",
+                    "inflow_member_ratio_1d",
+                    "flow_coverage_ratio",
+                    "unit_change_coverage_ratio",
+                    "warnings",
+                )
+                if peer.get(key) is not None
+            },
+            "members": members,
+        },
+    }
+
+
+def _etf_profile_from_contexts(
+    contexts: list[dict[str, Any]], symbol: str
+) -> dict[str, Any]:
+    normalized = normalize_symbol(symbol).upper()
+    for context in reversed(contexts):
+        profiles = context.get("etf_product") if isinstance(context, dict) else None
+        if not isinstance(profiles, dict):
+            continue
+        candidate = profiles.get(normalized)
+        if isinstance(candidate, dict):
+            return candidate
+    return {}
+
+
+_BROAD_INDEX_LABELS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("科创50", "科创板50", "000688"), "科创板大盘成长"),
+    (("沪深300", "000300"), "沪深大盘核心"),
+    (("中证500", "000905"), "A股中盘"),
+    (("中证1000", "000852"), "A股小盘"),
+    (("中证A500", "A500", "000510"), "A股宽基核心"),
+)
+
+
+def _etf_share_context(
+    contexts: list[dict[str, Any]], symbol: str
+) -> dict[str, Any] | None:
+    profile = _etf_profile_from_contexts(contexts, symbol)
+    if not profile:
+        return None
+    compact = _compact_etf_product_profile(profile, member_limit=20)
+    share = compact.get("share_history") or {}
+    peer = compact.get("peer_group") or {}
+    index_code = str(
+        peer.get("tracked_index_code") or share.get("tracked_index_code") or ""
+    )
+    index_name = str(
+        peer.get("tracked_index_name") or share.get("tracked_index_name") or ""
+    )
+    index_identity = f"{index_name} {index_code}".strip()
+    market_scope = next(
+        (
+            label
+            for aliases, label in _BROAD_INDEX_LABELS
+            if any(alias.upper() in index_identity.upper() for alias in aliases)
+        ),
+        "指数板块",
+    )
+    peer_flow = peer.get("estimated_net_flow_1d")
+    peer_ratio = peer.get("inflow_member_ratio_1d")
+    coverage = float(peer.get("unit_change_coverage_ratio") or 0.0)
+    if peer_flow is not None and coverage >= 0.6:
+        direction = (
+            "net_inflow"
+            if float(peer_flow) > 0
+            else "net_outflow" if float(peer_flow) < 0 else "flat"
+        )
+        direction_text = {
+            "net_inflow": "净流入",
+            "net_outflow": "净流出",
+            "flat": "基本持平",
+        }[direction]
+        interpretation = (
+            f"同指数 ETF 组份额代理显示{direction_text}，可作为{market_scope}资金参与度与风险偏好代理。"
+        )
+    else:
+        direction = "insufficient"
+        interpretation = "同指数 ETF 组份额变化覆盖不足，仅展示本基金份额事实。"
+    return {
+        **compact,
+        "market_scope": market_scope,
+        "signal": direction,
+        "interpretation": interpretation,
+        "boundary": (
+            "份额增加/减少反映申购赎回与资金参与度，不等同于指数当日涨跌；"
+            "必须结合上一交易日价格、成交量及同指数 ETF 组覆盖共同判断。"
+        ),
+        "peer_inflow_member_ratio_1d": peer_ratio,
+    }
+
+
+def _is_etf_holding(holding: dict[str, Any]) -> bool:
+    symbol = normalize_symbol(
+        str(holding.get("symbol") or holding.get("code") or "")
+    ).upper()
+    name = str(holding.get("name") or "").upper()
+    kind = str(
+        holding.get("asset_type") or holding.get("security_type") or ""
+    ).lower()
+    if "ETF" in name or kind == "etf":
+        return True
+    code, _, market = symbol.partition(".")
+    return (market == "SH" and code.startswith("5")) or (
+        market == "SZ" and code.startswith(("15", "16"))
+    )
+
+
 def _compact_worker_context(
     contexts: list[dict[str, Any]], symbol: str, *, max_chars: int = _WORKER_CONTEXT_MAX_CHARS
 ) -> dict[str, Any]:
@@ -343,28 +637,12 @@ def _compact_worker_context(
                 interval = str(series.get("interval") or "")
                 bar_limit = 20 if lean else (60 if interval == "1D" else 30)
                 compact_series.append(
-                    {
-                        "symbol": normalized,
-                        "interval": interval,
-                        "adjustment": series.get("adjustment"),
-                        "bar_count": series.get("bar_count"),
-                        "coverage": series.get("coverage"),
-                        "latest": _compact_value(series.get("latest")),
-                        "decision_status": series.get("decision_status"),
-                        "actionability": series.get("actionability"),
-                        "selected_quote": series.get("selected_quote"),
-                        "blocked_reasons": list(series.get("blocked_reasons") or []),
-                        "freshness": series.get("freshness"),
-                        "retrieval": series.get("retrieval"),
-                        "source_attempts": [
-                            _compact_value(item)
-                            for item in (series.get("source_attempts") or [])[-(3 if lean else 6) :]
-                        ],
-                        "bars": [
-                            _compact_value(item)
-                            for item in (series.get("bars") or [])[-bar_limit:]
-                        ],
-                    }
+                    _compact_market_series(
+                        series,
+                        symbol=normalized,
+                        bar_limit=bar_limit,
+                        lean=lean,
+                    )
                 )
 
             compact_research: dict[str, Any] = {}
@@ -421,27 +699,47 @@ def _compact_worker_context(
                 for row in (context.get("provider_health") or [])[: (10 if lean else 20)]
                 if isinstance(row, dict)
             ]
-            output.append(
-                {
-                    "request_id": context.get("request_id"),
-                    "status": context.get("status"),
-                    "purpose": context.get("purpose"),
-                    "retrieved_at": context.get("retrieved_at"),
-                    "symbol": normalized,
-                    "decision_scopes": scopes.get(normalized) if isinstance(scopes, dict) else {},
-                    "market": {
-                        "status": market.get("status"),
-                        "series": compact_series,
-                        "quotes": [
-                            _compact_value(item)
-                            for item in market.get("quotes") or []
-                            if _context_symbol(item) == normalized
-                        ][:2],
-                    },
-                    "research": compact_research,
-                    "provider_health": provider_health,
-                }
+            profiles = (
+                context.get("etf_product")
+                if isinstance(context.get("etf_product"), dict)
+                else {}
             )
+            etf_product = _compact_etf_product_profile(
+                profiles.get(normalized), member_limit=8 if lean else 20
+            )
+            profile_errors = (
+                context.get("etf_product_errors")
+                if isinstance(context.get("etf_product_errors"), dict)
+                else {}
+            )
+            context_item = {
+                "request_id": context.get("request_id"),
+                "status": context.get("status"),
+                "purpose": context.get("purpose"),
+                "retrieved_at": context.get("retrieved_at"),
+                "symbol": normalized,
+                "decision_scopes": (
+                    scopes.get(normalized) if isinstance(scopes, dict) else {}
+                ),
+                "market": {
+                    "status": market.get("status"),
+                    "series": compact_series,
+                    "quotes": [
+                        _compact_value(item)
+                        for item in market.get("quotes") or []
+                        if _context_symbol(item) == normalized
+                    ][:2],
+                },
+                "research": compact_research,
+                "provider_health": provider_health,
+            }
+            if etf_product:
+                context_item["etf_product"] = etf_product
+            if profile_errors.get(normalized):
+                context_item["etf_product_error"] = str(
+                    profile_errors[normalized]
+                )[:240]
+            output.append(context_item)
         return {"schema_version": 2, "symbol": normalized, "contexts": output}
 
     full = build(lean=False)
@@ -450,7 +748,9 @@ def _compact_worker_context(
     lean = build(lean=True)
     if len(json.dumps(lean, ensure_ascii=False, default=str)) <= max_chars:
         return lean
-    # The final fallback contains only the safety contract and latest quotes.
+    # Market structure is higher-priority than long research text. Even the
+    # last-resort payload must retain recent completed bars so a non-trading-day
+    # report cannot falsely claim that continuous daily data is missing.
     return {
         "schema_version": 2,
         "symbol": normalized,
@@ -462,16 +762,191 @@ def _compact_worker_context(
                 "retrieved_at": item.get("retrieved_at"),
                 "decision_scopes": _symbol_decision_scopes([item], normalized),
                 "market": {
+                    "series": [
+                        _compact_market_series(
+                            series,
+                            symbol=normalized,
+                            bar_limit=20,
+                            lean=True,
+                        )
+                        for series in ((item.get("market") or {}).get("series") or [])
+                        if _context_symbol(series) == normalized
+                    ],
                     "quotes": [
                         _compact_value(quote)
                         for quote in ((item.get("market") or {}).get("quotes") or [])
                         if _context_symbol(quote) == normalized
                     ][:1]
                 },
+                **(
+                    {
+                        "etf_product": _compact_etf_product_profile(
+                            ((item.get("etf_product") or {}).get(normalized)),
+                            member_limit=4,
+                        )
+                    }
+                    if isinstance(item.get("etf_product"), dict)
+                    and isinstance((item.get("etf_product") or {}).get(normalized), dict)
+                    else {}
+                ),
             }
             for item in contexts[-2:]
         ],
     }
+
+
+def _market_data_basis(
+    contexts: list[dict[str, Any]],
+    symbol: str,
+    *,
+    report_market_date: str | None,
+    generated_at: str | None,
+) -> dict[str, Any]:
+    """Describe the independent time bases used by price/volume and news."""
+
+    normalized = normalize_symbol(symbol).upper()
+    daily_series = [
+        series
+        for context in contexts
+        for series in ((context.get("market") or {}).get("series") or [])
+        if _context_symbol(series) == normalized
+        and str(series.get("interval") or "1D") == "1D"
+    ]
+    chosen = daily_series[-1] if daily_series else {}
+    latest = chosen.get("latest") if isinstance(chosen.get("latest"), dict) else {}
+    bars = [item for item in chosen.get("bars") or [] if isinstance(item, dict)]
+    if not latest and bars:
+        latest = bars[-1]
+    price_session_date = str(latest.get("session_date") or "").strip() or None
+    if price_session_date is None:
+        price_session_date = str(latest.get("bar_time") or "")[:10] or None
+
+    report_date = str(report_market_date or "").strip() or None
+    generated_day = None
+    if generated_at:
+        try:
+            generated_day = datetime.fromisoformat(str(generated_at)).date()
+        except ValueError:
+            generated_day = None
+    generation_context = "report_time_unknown"
+    if generated_day is not None and generated_day.weekday() >= 5:
+        generation_context = "non_trading_day"
+    elif report_date and generated_day and generated_day.isoformat() < report_date:
+        generation_context = "before_report_market_date"
+    elif price_session_date and report_date and price_session_date < report_date:
+        generation_context = "premarket_or_non_trading_session"
+    elif price_session_date and report_date and price_session_date == report_date:
+        generation_context = "same_market_date"
+
+    previous_session = bool(
+        price_session_date and report_date and price_session_date < report_date
+    )
+    volume = latest.get("volume")
+    volume_unit = latest.get("volume_unit")
+    if volume is not None and not volume_unit:
+        volume_observation = next(
+            (
+                item
+                for item in (latest.get("observations") or [])
+                if isinstance(item, dict)
+                and item.get("included_in_consensus") is not False
+                and item.get("volume_unit")
+            ),
+            None,
+        )
+        if volume_observation:
+            volume_unit = volume_observation.get("volume_unit")
+    if previous_session:
+        prefix = (
+            "本报告在非交易日生成"
+            if generation_context == "non_trading_day"
+            else f"本报告面向 {report_date} 盘前"
+        )
+        note = (
+            f"{prefix}；日线量价采用上一交易日 {price_session_date} 的已收盘数据，"
+            "新闻与公告采用报告生成时可得的最新信息。"
+        )
+    elif price_session_date:
+        note = (
+            f"日线量价采用交易日 {price_session_date} 的最新已收盘数据，"
+            "新闻与公告采用报告生成时可得的最新信息。"
+        )
+    else:
+        note = "日线量价尚无可用已收盘交易日；新闻与公告采用报告生成时可得的最新信息。"
+
+    return {
+        "report_market_date": report_date,
+        "price_session_date": price_session_date,
+        "price_as_of": latest.get("bar_time"),
+        "daily_bar_count": int(chosen.get("bar_count") or len(bars) or 0),
+        "volume": volume,
+        "volume_unit": volume_unit,
+        "volume_display": (
+            {
+                "yi_shares": round(float(volume) / 100_000_000, 4),
+                "wan_lots": round(float(volume) / 100 / 10_000, 4),
+                "lot_size_shares": 100,
+            }
+            if volume is not None and volume_unit == "share"
+            else None
+        ),
+        "price_basis": (
+            "previous_trading_session"
+            if previous_session
+            else "latest_completed_session" if price_session_date else "unavailable"
+        ),
+        "news_basis": "latest_available_at_generation",
+        "generation_context": generation_context,
+        "note": note,
+    }
+
+
+_FALSE_DAILY_GAP_PATTERN = re.compile(
+    r"(?:缺少|未提供|需补充).{0,16}"
+    r"(?:连续日线(?:K线|数据|序列|结构)|日线序列|连续K线)"
+    r"|仅(?:包含|提供).{0,16}(?:单个|一个).{0,16}(?:日线价格|价格)"
+)
+
+
+def _validate_brief_against_market_basis(
+    brief: dict[str, Any], market_data_basis: dict[str, Any]
+) -> None:
+    """Reject model claims that contradict the frozen daily-series evidence."""
+
+    if int(market_data_basis.get("daily_bar_count") or 0) < 20:
+        return
+    trend = brief.get("trend") if isinstance(brief.get("trend"), dict) else {}
+    statements = [
+        brief.get("summary"),
+        trend.get("summary"),
+        brief.get("condition_order_summary"),
+        *(brief.get("reasons") or []),
+        *(brief.get("risks") or []),
+        *(brief.get("watch_points") or []),
+    ]
+    contradiction = next(
+        (
+            str(statement)
+            for statement in statements
+            if statement and _FALSE_DAILY_GAP_PATTERN.search(str(statement))
+        ),
+        None,
+    )
+    if contradiction:
+        raise BriefContractError(
+            "worker contradicted frozen daily-series evidence: " + contradiction[:160]
+        )
+    volume = market_data_basis.get("volume")
+    if volume is not None and market_data_basis.get("volume_unit") == "share":
+        joined = "\n".join(str(item) for item in statements if item)
+        for match in re.finditer(r"(\d+(?:\.\d+)?)\s*亿(股|手)", joined):
+            claimed = float(match.group(1))
+            expected = float(volume) / (100_000_000 if match.group(2) == "股" else 10_000_000_000)
+            tolerance = max(abs(expected) * 0.05, 0.0001)
+            if abs(claimed - expected) > tolerance:
+                raise BriefContractError(
+                    "worker volume unit contradicts frozen share volume: " + match.group(0)
+                )
 
 
 def _latest_timestamp(value: Any) -> str | None:
@@ -497,6 +972,63 @@ def _latest_timestamp(value: Any) -> str | None:
 
     visit(value)
     return max(candidates, default=None)
+
+
+def _price_volume_source_context(
+    contexts: list[dict[str, Any]], symbol: str
+) -> dict[str, Any]:
+    """Conservatively summarize quote provenance for bundle warning state."""
+
+    normalized = normalize_symbol(symbol).upper()
+    sources: set[str] = set()
+    explicit_source_count = 0
+    statuses: set[str] = set()
+    for context in contexts:
+        market = context.get("market") if isinstance(context, dict) else None
+        if not isinstance(market, dict):
+            continue
+        for collection_name in ("series", "quotes"):
+            collection = market.get(collection_name) or []
+            if isinstance(collection, dict):
+                collection = list(collection.values())
+            if not isinstance(collection, list):
+                continue
+            for raw in collection:
+                if not isinstance(raw, dict):
+                    continue
+                item_symbol = normalize_symbol(str(raw.get("symbol") or "")).upper()
+                if item_symbol and item_symbol != normalized:
+                    continue
+                statuses.add(str(raw.get("status") or raw.get("data_status") or ""))
+                try:
+                    explicit_source_count = max(
+                        explicit_source_count, int(raw.get("source_count") or 0)
+                    )
+                except (TypeError, ValueError):
+                    pass
+                raw_sources = raw.get("sources") or []
+                if isinstance(raw_sources, str):
+                    raw_sources = [raw_sources]
+                if isinstance(raw_sources, list):
+                    sources.update(
+                        str(item).strip() for item in raw_sources if str(item).strip()
+                    )
+                if raw.get("source"):
+                    sources.add(str(raw["source"]).strip())
+    source_count = max(explicit_source_count, len(sources))
+    single_source = source_count == 1 or "single_source" in statuses
+    return {
+        "data_mode": "single_source" if single_source else "verified",
+        "source_count": source_count,
+        "sources": sorted(sources),
+        "single_source_authorized": False,
+        "warnings": (
+            ["当前价格仅有单一数据源；日报未授予提升为 action_ready 的权限。"]
+            if single_source
+            else []
+        ),
+        "refresh_attempted": True,
+    }
 
 
 def _manifest_symbol_entries(
@@ -580,6 +1112,46 @@ def _manifest_symbol_entries(
                             else None
                         ),
                     })
+            profiles = context.get("etf_product")
+            profile = profiles.get(symbol) if isinstance(profiles, dict) else None
+            if isinstance(profile, dict):
+                share = profile.get("share_history") or {}
+                peer = profile.get("peer_group") or {}
+                present = bool(share or peer)
+                merge_domain(
+                    "etf_share",
+                    {
+                        "status": "available" if present else "missing",
+                        "as_of": (
+                            peer.get("data_as_of")
+                            or profile.get("data_as_of")
+                            or profile.get("retrieved_at")
+                        ),
+                        "source": "report_library_etf_product_profile",
+                        "cache_status": profile.get("refresh_status") or "cache_only",
+                        "conflict_status": None,
+                        "error": None,
+                    },
+                )
+            else:
+                profile_errors = context.get("etf_product_errors")
+                profile_error = (
+                    profile_errors.get(symbol)
+                    if isinstance(profile_errors, dict)
+                    else None
+                )
+                if profile_error:
+                    merge_domain(
+                        "etf_share",
+                        {
+                            "status": "missing",
+                            "as_of": context.get("retrieved_at"),
+                            "source": "report_library_etf_product_profile",
+                            "cache_status": "unavailable",
+                            "conflict_status": None,
+                            "error": str(profile_error),
+                        },
+                    )
         entries.append({"symbol": symbol, "domains": domains})
     return entries
 
@@ -596,6 +1168,8 @@ class DailyPortfolioRunService:
         mandate_path: Path | None = None,
         max_workers: int = 3,
         recover_incomplete: bool = True,
+        structured_monitoring: bool | None = None,
+        etf_product_profile_service: Any | None = None,
     ) -> None:
         self.store = store or DailyRunStore()
         self.session_service = session_service
@@ -604,6 +1178,12 @@ class DailyPortfolioRunService:
         self.state_loader = state_loader
         self.mandate_path = mandate_path
         self.max_workers = max(1, min(int(max_workers), 4))
+        self.etf_product_profile_service = etf_product_profile_service
+        self.structured_monitoring = (
+            structured_monitoring_enabled()
+            if structured_monitoring is None
+            else bool(structured_monitoring)
+        )
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._cancel: dict[str, asyncio.Event] = {}
         self._worker_sessions: dict[str, set[str]] = {}
@@ -856,6 +1436,11 @@ class DailyPortfolioRunService:
                     portfolio.get("holdings") or [],
                     refresh_policy=str(record["refresh_policy"]),
                 )
+                contexts.extend(
+                    await self._load_etf_product_contexts(
+                        portfolio.get("holdings") or []
+                    )
+                )
                 data_batch_id = f"batch_{run_id}"
                 reused_data_batch = False
             status = _data_status(contexts)
@@ -880,6 +1465,18 @@ class DailyPortfolioRunService:
                 "created_at": _now_local(),
             }
             self.store.write_json(run_id, "inputs/data_manifest.json", manifest)
+            try:
+                from src.research import get_source_ingestion_service, knowledge_enabled
+
+                if knowledge_enabled():
+                    get_source_ingestion_service().ingest_data_manifest(
+                        manifest,
+                        origin_type="daily_run",
+                        origin_id=run_id,
+                    )
+            except Exception:
+                # The immutable run manifest remains replayable if shadow indexing fails.
+                pass
             record.update(
                 {
                     "data_batch_id": data_batch_id,
@@ -1001,7 +1598,10 @@ class DailyPortfolioRunService:
                     "completed_at": _now_local(),
                 }
             )
-            self.store.save(record)
+            record = self.store.save(record)
+            from src.reports.catalog import register_daily_run_safely
+
+            await asyncio.to_thread(register_daily_run_safely, record, aggregate)
             if retry_from_run_id:
                 self.store.supersede_artifacts(
                     retry_from_run_id, replacement_run_id=run_id
@@ -1056,6 +1656,61 @@ class DailyPortfolioRunService:
             )
         return list(await asyncio.gather(*tasks))
 
+    async def _load_etf_product_contexts(
+        self, holdings: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        candidates = [holding for holding in holdings if _is_etf_holding(holding)]
+        if not candidates:
+            return []
+        service = self.etf_product_profile_service
+        if service is None:
+            from src.reports.etf_product_profile import (
+                get_etf_product_profile_service,
+            )
+
+            service = get_etf_product_profile_service()
+            self.etf_product_profile_service = service
+        semaphore = asyncio.Semaphore(3)
+
+        async def load_one(holding: dict[str, Any]) -> dict[str, Any]:
+            symbol = normalize_symbol(
+                str(holding.get("symbol") or holding.get("code") or "")
+            ).upper()
+            async with semaphore:
+                try:
+                    profile = await asyncio.to_thread(
+                        service.get_or_refresh,
+                        symbol,
+                        force_refresh=False,
+                    )
+                except Exception as exc:  # noqa: BLE001 - optional enrichment
+                    return {
+                        "request_id": f"etf_product_{_stable_hash(symbol)[:16]}",
+                        "status": "partial",
+                        "purpose": "portfolio_daily_etf_share",
+                        "retrieved_at": _now_local(),
+                        "symbols": [symbol],
+                        "etf_product": {},
+                        "etf_product_errors": {symbol: str(exc)[:240]},
+                    }
+            compact = _compact_etf_product_profile(profile, member_limit=30)
+            available = bool(
+                compact.get("share_history") or compact.get("peer_group")
+            )
+            return {
+                "request_id": f"etf_product_{_stable_hash(compact)[:16]}",
+                "status": "ok" if available else "partial",
+                "purpose": "portfolio_daily_etf_share",
+                "retrieved_at": compact.get("retrieved_at") or _now_local(),
+                "symbols": [symbol],
+                "etf_product": {symbol: compact} if available else {},
+                "etf_product_errors": (
+                    {} if available else {symbol: "ETF share profile unavailable"}
+                ),
+            }
+
+        return list(await asyncio.gather(*(load_one(item) for item in candidates)))
+
     async def _analyze_holdings(
         self,
         run_id: str,
@@ -1082,6 +1737,7 @@ class DailyPortfolioRunService:
                 "session_id": None,
                 "error": None,
                 "attempts": 0,
+                "attempt_history": [],
             }
             async with semaphore:
                 if cancel_event.is_set():
@@ -1101,6 +1757,7 @@ class DailyPortfolioRunService:
                     brief = fallback_brief(
                         symbol,
                         "关键数据覆盖不足，已跳过模型分析以避免无效 token 消耗。",
+                        structured_monitoring=self.structured_monitoring,
                     )
                     worker.update({"status": "skipped_data_unavailable"})
                 else:
@@ -1109,6 +1766,13 @@ class DailyPortfolioRunService:
                     last_error: Exception | None = None
                     for attempt in (1, 2):
                         worker["attempts"] = attempt
+                        retry_of = f"{symbol}:attempt:1" if attempt > 1 else None
+                        attempt_meta = {
+                            "attempt_number": attempt,
+                            "retry_of": retry_of,
+                            "status": "running",
+                        }
+                        worker["attempt_history"].append(attempt_meta)
                         try:
                             brief, session_id = await self._analyze_one(
                                 run_id,
@@ -1124,14 +1788,22 @@ class DailyPortfolioRunService:
                                     "error": None if session_id else "Session 服务未启用",
                                 }
                             )
+                            attempt_meta.update(
+                                {
+                                    "status": "completed" if session_id else "degraded",
+                                    "session_id": session_id,
+                                }
+                            )
                             break
                         except Exception as exc:  # noqa: BLE001 - bounded repair retry
                             last_error = exc
+                            attempt_meta.update({"status": "failed", "error": str(exc)})
                     else:
                         assert last_error is not None
                         brief = fallback_brief(
                             symbol,
                             f"个股分析连续两次失败：{type(last_error).__name__}: {last_error}",
+                            structured_monitoring=self.structured_monitoring,
                         )
                         worker.update({"status": "degraded", "error": str(last_error)})
                 brief = self._decorate_brief(
@@ -1162,6 +1834,34 @@ class DailyPortfolioRunService:
 
         pairs = await asyncio.gather(*(run_one(holding) for holding in holdings))
         return [item[0] for item in pairs], [item[1] for item in pairs]
+
+    def _previous_monitoring_bundle(
+        self, symbol: str, *, excluding_run_id: str
+    ) -> dict[str, Any] | None:
+        for record in self.store.list(limit=120):
+            if (
+                str(record.get("run_id") or "") == excluding_run_id
+                or str(record.get("status") or "")
+                not in {"completed", "completed_with_warnings"}
+            ):
+                continue
+            for artifact in record.get("artifacts") or []:
+                if (
+                    not isinstance(artifact, dict)
+                    or str(artifact.get("kind") or "") != "holding_daily_json"
+                    or str(artifact.get("symbol") or "").upper() != symbol
+                    or artifact.get("expired")
+                ):
+                    continue
+                path = Path(str(artifact.get("path") or ""))
+                try:
+                    brief = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError, TypeError):
+                    continue
+                bundle = brief.get("monitoring_bundle") if isinstance(brief, dict) else None
+                if isinstance(bundle, dict):
+                    return bundle
+        return None
 
     def _decorate_brief(
         self,
@@ -1233,6 +1933,31 @@ class DailyPortfolioRunService:
             "observe": "observe",
         }.get(str(result.get("action") or "observe"), "observe")
         record = self.store.get(run_id) or {}
+        generated_at = _now_local()
+        market_data_basis = _market_data_basis(
+            contexts,
+            symbol,
+            report_market_date=str(record.get("market_date") or "") or None,
+            generated_at=generated_at,
+        )
+        etf_share_context = _etf_share_context(contexts, symbol)
+        method_snapshot = (
+            result.get("analysis_method_snapshot")
+            if isinstance(result.get("analysis_method_snapshot"), dict)
+            else market_analysis_snapshot_from_contexts(
+                contexts,
+                symbol=symbol,
+                through=market_data_basis.get("price_session_date"),
+                instrument_type="etf" if _is_etf_holding(holding) else "company_equity",
+            )
+        )
+        agent_analysis = (
+            result.get("agent_analysis")
+            if isinstance(result.get("agent_analysis"), dict)
+            else unavailable_agent_analysis(
+                "日报 Worker 未完成方法分析；保留确定性方法结果。"
+            )
+        )
         result.update(
             {
                 "run_id": run_id,
@@ -1266,9 +1991,78 @@ class DailyPortfolioRunService:
                 },
                 "conditional_observations": list(result.get("condition_orders") or []),
                 "source_refs": [],
-                "generated_at": _now_local(),
+                "generated_at": generated_at,
+                "market_data_basis": market_data_basis,
+                "etf_share_context": etf_share_context,
+                "analysis_method_snapshot": method_snapshot,
+                "agent_analysis": agent_analysis,
             }
         )
+        if etf_share_context:
+            public_scopes = dict(result.get("data_scopes") or {})
+            public_scopes["etf_share"] = {
+                "status": "verified",
+                "actionability": "analysis_only",
+                "as_of": (
+                    (etf_share_context.get("peer_group") or {}).get("data_as_of")
+                    or etf_share_context.get("data_as_of")
+                ),
+            }
+            result["data_scopes"] = public_scopes
+        if self.structured_monitoring:
+            scopes = _symbol_decision_scopes(contexts, symbol)
+            daily_scope = scopes.get("daily_trend") if isinstance(scopes, dict) else {}
+            condition_scope = scopes.get("condition_order") if isinstance(scopes, dict) else {}
+            daily_actionable = (
+                isinstance(daily_scope, dict)
+                and daily_scope.get("status") == "verified"
+                and daily_scope.get("actionability") == "price_actionable"
+            )
+            condition_actionable = (
+                isinstance(condition_scope, dict)
+                and condition_scope.get("status") == "verified"
+                and condition_scope.get("actionability") == "price_actionable"
+            )
+            # A successfully parsed worker brief may already carry the normalized
+            # public data scopes. Prefer those when legacy contexts lack the newer
+            # decision_scopes projection.
+            if not daily_actionable:
+                public_daily = (result.get("data_scopes") or {}).get("daily")
+                daily_actionable = (
+                    isinstance(public_daily, dict)
+                    and public_daily.get("status") == "verified"
+                    and public_daily.get("actionability") == "price_actionable"
+                )
+            daily_actionable = daily_actionable and not bool(result.get("data_limited"))
+            raw_bundle = result.pop("monitoring_bundle_input", {})
+            input_error = str(result.pop("monitoring_bundle_input_error", "") or "")
+            source_context = _price_volume_source_context(contexts, symbol)
+            source_context["refresh_succeeded"] = daily_actionable
+            bundle, monitoring_claims, legacy_conditions = build_monitoring_bundle(
+                run_id=run_id,
+                revision=int(record.get("artifact_revision") or record.get("revision") or 1),
+                symbol=symbol,
+                raw_bundle=raw_bundle,
+                generated_at=generated_at,
+                data_as_of=result.get("data_as_of") or record.get("market_date") or generated_at,
+                daily_actionable=daily_actionable,
+                condition_actionable=condition_actionable,
+                price_volume_context=source_context,
+                previous_bundle=self._previous_monitoring_bundle(
+                    symbol, excluding_run_id=run_id
+                ),
+            )
+            if input_error:
+                bundle["validation_errors"].append(input_error)
+                bundle["price_volume_context"]["warnings"].append(input_error)
+            result.update(
+                schema_version=3,
+                monitoring_bundle=bundle,
+                monitoring_claims=monitoring_claims,
+                condition_orders=legacy_conditions,
+                conditional_observations=legacy_conditions,
+                condition_order_status=bundle["monitoring_status"],
+            )
         return result
 
     async def _analyze_one(
@@ -1282,14 +2076,180 @@ class DailyPortfolioRunService:
     ) -> tuple[dict[str, Any], str | None]:
         symbol = normalize_symbol(str(holding.get("symbol") or holding.get("code") or "")).upper()
         if self.session_service is None:
-            return fallback_brief(symbol, "Session 服务未启用，保守降级为观察。"), None
+            return fallback_brief(
+                symbol,
+                "Session 服务未启用，保守降级为观察。",
+                structured_monitoring=self.structured_monitoring,
+            ), None
         scoped_quality = _symbol_decision_scopes(contexts, symbol)
+        record = self.store.get(run_id) or {}
+        market_data_basis = _market_data_basis(
+            contexts,
+            symbol,
+            report_market_date=str(record.get("market_date") or "") or None,
+            generated_at=str(
+                record.get("started_at") or record.get("created_at") or _now_local()
+            ),
+        )
+        method_snapshot = market_analysis_snapshot_from_contexts(
+            contexts,
+            symbol=symbol,
+            through=market_data_basis.get("price_session_date"),
+            instrument_type="etf" if _is_etf_holding(holding) else "company_equity",
+        )
+        etf_share_context = _etf_share_context(contexts, symbol)
         compact_context = json.dumps(
             _compact_worker_context(contexts, symbol),
             ensure_ascii=False,
             default=str,
         )
+        output_contract: dict[str, Any] = {
+            "schema_version": 3 if self.structured_monitoring else 2,
+            "summary": "一句话",
+            "trend": {
+                "summary": "一句话",
+                "stage": "上升|下降|震荡|筑底|待确认",
+                "direction": "向上|向下|横盘|待确认",
+                "strength": "强|中|弱|待确认",
+            },
+            "action": "observe|add|reduce|exit",
+            "confidence": "low|medium|high",
+            "suggested_amount": None,
+            "reasons": ["..."],
+            "risks": ["..."],
+            "watch_points": ["..."],
+            "condition_order_status": "available|not_recommended|data_insufficient",
+            "condition_order_summary": "一句话",
+            "condition_orders": [],
+            "data_scopes": scoped_quality,
+            "data_limited": False,
+            "agent_analysis": {
+                "regime_interpretation": "不含任何数字的市场状态解释",
+                "selected_methods": ["快照中可用的方法编号"],
+                "selected_level_ids": ["快照中的候选区间编号，不得输出价格"],
+                "evidence_for": ["支持证据，不含任何数字"],
+                "counter_evidence": ["反对证据，不含任何数字"],
+                "cross_horizon_conclusion": "跨周期结论，不含任何数字",
+                "invalidation_conditions": ["结论失效条件，不含任何数字"],
+                "confidence": "low|medium|high",
+                "data_gaps": ["局部缺口"],
+                "critic": {
+                    "verdict": "pass|revise|insufficient",
+                    "issues": ["反证审查问题"],
+                },
+            },
+        }
+        structured_rules = ""
+        if self.structured_monitoring:
+            condition_contract = {
+                "condition_id": "本场景内稳定短ID",
+                "source_condition_id": "必须对应source_conditions.condition_id",
+                "kind": "price_compare|price_zone|bar_direction|price_reclaim|session_range|session_amplitude_bps|volume_ratio|cumulative_volume|cumulative_turnover|fund_flow|sector_state",
+                "operator": "gte|lte|gt|lt|between|positive|negative|equals",
+                "value": 1.0,
+                "lower": 1.0,
+                "upper": 1.1,
+                "unit": "CNY|ratio|shares|lots",
+                "interval": "1m|5m|30m|1d",
+                "consecutive": 1,
+                "lookback_bars": 1,
+                "freshness_seconds": 900,
+                "metric": "仅量价/资金/板块条件需要",
+                "direction": "bullish|bearish|above|below",
+            }
+            output_contract["monitoring_bundle"] = {
+                "candidates": [
+                    {
+                        "label": "稳定的场景名称，不含日期和点位",
+                        "intent": "buy_point|add_position|stop_loss|take_profit|watch|breakout",
+                        "priority": "normal|high",
+                        "original_level": {
+                            "kind": "price|zone",
+                            "value": 1.0,
+                            "lower": 1.0,
+                            "upper": 1.1,
+                            "unit": "CNY",
+                            "adjustment": "raw",
+                            "source_text": "报告原始点位表述",
+                        },
+                        "calculation_basis": {
+                            "method": "swing_low|swing_high|range_boundary|other",
+                            "method_label": "点位依据名称",
+                            "formula": "可复核的确定方式",
+                            "summary": "点位依据说明",
+                            "recommended_value": 1.0,
+                            "references": [{"label": "参考事实", "value": 1.0, "date": "YYYY-MM-DD"}],
+                        },
+                        "source_conditions": [
+                            {
+                                "condition_id": "稳定短ID",
+                                "source_text": "必要条件原文，不得改写周期或单位",
+                                "role": "required|supportive|invalidation",
+                                "coverage_status": "mapped|awaiting_data|ambiguous|unsupported",
+                                "reason": "无法映射时说明原因",
+                                "evidence_refs": ["冻结上下文中的事实路径"],
+                            }
+                        ],
+                        "trigger": {
+                            "kind": "price_cross_above|price_cross_below|price_zone_enter|price_zone_exit",
+                            "threshold": 1.0,
+                            "lower": 1.0,
+                            "upper": 1.1,
+                            "interval": "1m|5m",
+                            "confirmation_count": 2,
+                        },
+                        "approach_policy": {"distance_bps": 100, "source": "report|atr20_default|user", "check_interval": "1m"},
+                        "volume_confirmation": {
+                            "metric": "same_bucket_5m_volume_ratio|same_clock_cumulative_volume_ratio|absolute_cumulative_volume",
+                            "comparator": "gte|lte",
+                            "threshold": 1.5,
+                            "min_samples": 5,
+                            "unit": "ratio|shares|lots",
+                            "mode": "classify_only",
+                        },
+                        "entry_conditions": {
+                            "operator": "all|any",
+                            "conditions": [dict(condition_contract)],
+                        },
+                        "confirmation_conditions": {"operator": "all|any", "conditions": [dict(condition_contract)]},
+                        "invalidation_conditions": {"operator": "all|any", "conditions": [dict(condition_contract)]},
+                        "sequence_policy": {"enabled": True, "max_wait_bars": 6, "reset_on_invalidation": True},
+                        "invalidation": {"kind": "price_cross_above|price_cross_below", "level": 1.0},
+                        "resolution_policy": {"rejection_hysteresis_bps": 30, "max_observation_bars": 6, "close_action": "unresolved"},
+                        "action_template": {
+                            "action": "observe|add|reduce|exit",
+                            "sizing": {"kind": "default_policy|position_fraction", "value": 0.2, "unit": "ratio", "source": "report|system_default"},
+                            "confidence_floor": "low|medium|high",
+                        },
+                        "rationale": "场景依据",
+                        "interpretation": {
+                            "price_only": "价格已触发但量价尚未确认。",
+                            "confirmed": "价格与量能共同确认，等待人工复核。",
+                            "divergence": "价格触发但量能不足。",
+                            "invalidated": "价格重新越过失效位，原判断失效。",
+                            "insufficient_data": "量价证据不足，仅保留价格提醒。",
+                            "bullish_case": "多头情景解释。",
+                            "bearish_case": "空头情景解释。",
+                        },
+                        "mapping_status": "mapped|partial",
+                        "automation_status": "action_ready|watch_only",
+                    }
+                ]
+            }
+            structured_rules = """
+monitoring_bundle.candidates 是唯一监控事实提案；不要生成 candidate_id、scenario_family_id 或 claim_ids，系统会确定性生成。
+每个必要条件必须逐字保存在 source_conditions，并通过 entry_conditions、confirmation_conditions 或 invalidation_conditions 引用 source_condition_id。
+条件对象必须使用上方扁平字段，禁止嵌套 parameters 或额外 label；required 条件必须在 entry_conditions 或 confirmation_conditions 中映射，invalidation 角色必须在 invalidation_conditions 中映射。
+条件对象仅允许 kind=price_compare|price_zone|bar_direction|price_reclaim|session_range|session_amplitude_bps|volume_ratio|cumulative_volume|cumulative_turnover|fund_flow|sector_state，interval 仅 1m|5m|30m|1d。
+approach_policy.source 只能是 report|atr20_default|user，check_interval 必须是 1m。
+日线、连续日或收盘条件必须保持 interval=1d，不得简化为 1m/5m；当前不支持的日线量价条件标记 unsupported 且 automation_status=watch_only。
+成交额只能使用 cumulative_turnover/cumulative_amount，成交量只能使用 volume_ratio 或 cumulative_volume；绝对成交量单位不明确时不得使用 absolute_cumulative_volume。
+量价只能做 classify_only，不能删除已经发生的价格事实。估值便宜不能直接生成买点。价格全部使用 raw 口径。
+若 watch_points、risks 或已验证行情中已有明确 raw 点位且能给出可核对 calculation_basis，应保留为 watch_only 候选；不能 action_ready 不等于必须删除安全的价格观察候选。
+已验证的持仓成本价可以作为 intent=watch、action=observe 的盈亏平衡观察位，但只能是 watch_only，不得解释成估值买点或加仓点。
+condition_orders 必须输出空数组，后续由通过校验的 candidates 派生。没有合格点位时 candidates=[]，不得编造。"""
         prompt = f"""你是组合晨会中的个股研究 Worker。只分析 {symbol}，不得调用或推断任何真实交易动作。
+先调用 load_skill，加载 market-analysis-method；Skill 只规定分析方法，冻结输入仍是唯一事实来源。
 输入已经冻结；不要重新获取组合持仓或行情。整体数据状态为 {data_status}，但必须以
 decision_scopes 的分区状态决定各段结论：daily_trend 只控制日线趋势，intraday 只控制
 盘中判断，condition_order 控制精确条件价，新闻或基本面缺失不得污染已校核的趋势结论。
@@ -1299,11 +2259,27 @@ decision_scopes 的分区状态决定各段结论：daily_trend 只控制日线�
 持仓事实：{json.dumps(holding, ensure_ascii=False, default=str)}
 分组事实：{json.dumps(assignment, ensure_ascii=False, default=str)}
 冻结数据上下文：{compact_context}
+报告时间与数据口径：{json.dumps(market_data_basis, ensure_ascii=False, default=str)}
+确定性分析方法快照：{json.dumps(method_snapshot, ensure_ascii=False, default=str)}
+
+market.series[].bars 非空即表示连续日线已经随冻结输入提供；不得再声称缺少连续日线 K 线。
+日线业务日期以 session_date 为准，不得把 UTC bar_time 的自然日误写成交易日。
+若 price_basis=previous_trading_session，必须明确这是盘前或非交易时段报告，量价分析采用上一交易日已收盘数据；
+新闻与公告仍按生成时可得的最新信息分析，二者不得共用同一个日期口径。
+若 etf_product 存在，必须把 share_history 与 peer_group 纳入 ETF 判断：优先使用同指数 ETF 组的
+份额变化、覆盖率和估算净流量判断资金参与度。科创50、沪深300、中证500、中证1000、
+中证A500 等宽基 ETF 可作为对应市场分层的风险偏好代理；单只基金份额变化不得直接等同于
+整个市场或指数涨跌，也不得替代上一交易日价格与成交量确认。
+
+agent_analysis 只能选择快照中 status=available 的方法编号和已有候选区间编号。
+Agent 不得在 agent_analysis 的文字中输出任何数字、日期、价格、比例或区间；系统会依据候选编号渲染数值。
+必须同时给出支持证据、反对证据、失效条件和反证审查，不得只写单边观点。
 
 只输出一个 JSON 对象，不要 Markdown，不要解释。字段：
-{{"summary":"一句话", "trend":{{"summary":"一句话", "stage":"上升|下降|震荡|筑底|待确认", "direction":"向上|向下|横盘|待确认", "strength":"强|中|弱|待确认"}}, "action":"observe|add|reduce|exit", "confidence":"low|medium|high", "suggested_amount":数字或null, "reasons":["..."], "risks":["..."], "watch_points":["..."], "condition_order_status":"available|not_recommended|data_insufficient", "condition_order_summary":"一句话", "condition_orders":[{{"trigger":"...", "confirmation":"...", "invalidation":"...", "response":"...", "priority":"normal|high"}}], "data_scopes":{json.dumps(scoped_quality, ensure_ascii=False, default=str)}, "data_limited":false}}
+{json.dumps(output_contract, ensure_ascii=False, default=str)}
 只有 daily_trend 本身不可用时才设置 data_limited=true 并强制观察；新闻、研报或基本面局部缺失只写入 data_scopes。
-若 condition_order 不可用，必须 condition_order_status=data_insufficient 且 condition_orders=[]；没有合格情景则写 not_recommended。"""
+若 condition_order 不可用，必须 condition_order_status=data_insufficient 且 condition_orders=[]；没有合格情景则写 not_recommended。
+{structured_rules}"""
         session = self.session_service.create_session(
             title=f"DailyRun {run_id} {symbol}",
             config={
@@ -1323,7 +2299,15 @@ decision_scopes 的分区状态决定各段结论：daily_trend 只控制日线�
         reply = next((item for item in reversed(messages) if item.role == "assistant"), None)
         if reply is None:
             raise BriefContractError("worker session did not produce an assistant response")
-        brief = parse_holding_brief(reply.content, symbol=symbol)
+        brief = parse_holding_brief(
+            reply.content,
+            symbol=symbol,
+            structured_monitoring=self.structured_monitoring,
+            method_snapshot=method_snapshot,
+        )
+        _validate_brief_against_market_basis(brief, market_data_basis)
+        brief["market_data_basis"] = market_data_basis
+        brief["analysis_method_snapshot"] = method_snapshot
         daily_scope = scoped_quality.get("daily_trend") if isinstance(scoped_quality, dict) else {}
         condition_scope = scoped_quality.get("condition_order") if isinstance(scoped_quality, dict) else {}
         daily_actionable = (
@@ -1342,6 +2326,18 @@ decision_scopes 的分区状态决定各段结论：daily_trend 只控制日线�
             "fund_flow": scoped_quality.get("fund_flow") or {"status": "not_requested"},
             "news": scoped_quality.get("news") or {"status": "not_requested"},
             "fundamentals": scoped_quality.get("fundamentals") or {"status": "not_requested"},
+            "etf_share": (
+                {
+                    "status": "verified",
+                    "actionability": "analysis_only",
+                    "as_of": (
+                        (etf_share_context.get("peer_group") or {}).get("data_as_of")
+                        or etf_share_context.get("data_as_of")
+                    ),
+                }
+                if etf_share_context
+                else {"status": "not_requested", "actionability": "analysis_only"}
+            ),
         }
         brief["data_limited"] = not daily_actionable
         if not condition_actionable:
@@ -1392,6 +2388,7 @@ decision_scopes 的分区状态决定各段结论：daily_trend 只控制日线�
             safe_security_name = _safe_filename_part(
                 security_name, fallback=_safe_symbol(symbol)
             )
+            report_label = "ETF晨报" if _is_etf_holding(holding) else "个股晨报"
             markdown = render_holding_markdown(
                 market_date=market_date,
                 holding=holding,
@@ -1399,7 +2396,7 @@ decision_scopes 的分区状态决定各段结论：daily_trend 只控制日线�
                 data_status=data_status,
             )
             holding_markdowns.append(markdown)
-            title = f"{market_date} {security_name}（{symbol}）个股晨报"
+            title = f"{market_date} {security_name}（{symbol}）{report_label}"
             artifacts.append(
                 self.store.write_artifact(
                     run_id,
@@ -1408,7 +2405,7 @@ decision_scopes 的分区状态决定各段结论：daily_trend 只控制日线�
                     security_name=security_name,
                     filename=(
                         f"{market_date}_{_safe_symbol(symbol)}_"
-                        f"{safe_security_name}_个股晨报.json"
+                        f"{safe_security_name}_{report_label}.json"
                     ),
                     payload=json.dumps(
                         brief, ensure_ascii=False, indent=2, sort_keys=True
@@ -1425,7 +2422,7 @@ decision_scopes 的分区状态决定各段结论：daily_trend 只控制日线�
                     security_name=security_name,
                     filename=(
                         f"{market_date}_{_safe_symbol(symbol)}_"
-                        f"{safe_security_name}_个股晨报.md"
+                        f"{safe_security_name}_{report_label}.md"
                     ),
                     payload=markdown.encode("utf-8"),
                     media_type="text/markdown",
@@ -1442,7 +2439,7 @@ decision_scopes 的分区状态决定各段结论：daily_trend 只控制日线�
                 security_name=security_name,
                 filename=(
                     f"{market_date}_{_safe_symbol(symbol)}_"
-                    f"{safe_security_name}_个股晨报.pdf"
+                    f"{safe_security_name}_{report_label}.pdf"
                 ),
                 payload=pdf,
                 revision=revision,

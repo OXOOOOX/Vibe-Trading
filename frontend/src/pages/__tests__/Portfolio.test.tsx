@@ -6,6 +6,8 @@ import {
   type MarketCacheRun,
   type PortfolioAnalysisSession,
   type PortfolioMandate,
+  type MonitorProfile,
+  type MonitorPriceVolumeSnapshot,
   type MonitorPlanVersion,
   type PortfolioReview,
 } from "@/lib/api";
@@ -315,6 +317,50 @@ function monitorPriceVolumeDisplayPlan(dataAsOf: string): MonitorPlanVersion {
   };
 }
 
+function monitorPriceVolumeProfile(
+  checkedAt: string,
+  options: {
+    market?: string;
+    priceVolume?: MonitorPriceVolumeSnapshot | null;
+    historicalPriceVolume?: MonitorPriceVolumeSnapshot | null;
+    backfillStatus?: string;
+    dataMode?: "verified" | "single_source";
+  } = {},
+): MonitorProfile {
+  const displayPlan = monitorPriceVolumeDisplayPlan(checkedAt);
+  displayPlan.plan.data_mode = options.dataMode || "verified";
+  return {
+    profile_id: `profile-price-volume-${options.market || "SH"}`,
+    symbol: "588870.SH",
+    market: options.market || "SH",
+    instrument_type: "etf",
+    status: "active",
+    active_plan_version: 1,
+    profile_revision: 1,
+    delivery_target_id: "target-1",
+    input_outdated: false,
+    blocked_reasons: [],
+    updated_at: checkedAt,
+    last_quote_check_at: checkedAt,
+    last_success_at: checkedAt,
+    last_quote: {
+      price: 2.1,
+      observed_at: checkedAt,
+      data_as_of: checkedAt,
+      status: "verified",
+      interval: "5m",
+      sources: ["tencent", "mootdx"],
+      session_open: 2.08,
+      price_volume: options.priceVolume,
+      historical_price_volume: options.historicalPriceVolume,
+      price_volume_backfill: options.backfillStatus
+        ? { status: options.backfillStatus }
+        : null,
+    },
+    display_plan: displayPlan,
+  };
+}
+
 describe("Portfolio market cache", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -346,6 +392,7 @@ describe("Portfolio market cache", () => {
       automatic_trading: "forbidden",
     });
     vi.spyOn(api, "listPortfolioMonitoringAutopilotRuns").mockResolvedValue({ runs: [] });
+    vi.spyOn(api, "listPortfolioMonitoringTargets").mockResolvedValue({ targets: [] });
     vi.spyOn(api, "listPortfolioMonitorRecommendations").mockResolvedValue({ recommendations: [] });
     vi.spyOn(api, "getPortfolioMonitoringStatus").mockResolvedValue({
       enabled_by_config: false,
@@ -587,21 +634,23 @@ describe("Portfolio market cache", () => {
     const user = userEvent.setup();
     render(<Portfolio />, { wrapper: MemoryRouter });
 
-    const radar = await screen.findByRole("button", { name: "选择 588870.SH 用于 AI 监控" });
-    expect(radar).toHaveAttribute("aria-pressed", "false");
-    expect(radar).toHaveAttribute("data-monitor-selected", "false");
-    await user.click(radar);
-    expect(screen.getByRole("button", { name: "取消选择 588870.SH 用于 AI 监控" })).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByRole("button", { name: "取消选择 588870.SH 用于 AI 监控" })).toHaveAttribute("data-monitor-selected", "true");
+    const radar = await screen.findByRole("button", { name: "588870.SH 监控等级：未监控；点击切换为普通监控" });
+    expect(radar).toHaveAttribute("data-monitor-mode", "off");
+    vi.useFakeTimers();
+    fireEvent.click(radar);
+    expect(screen.getByRole("button", { name: "588870.SH 监控等级：普通监控；点击切换为AI 自主监控" })).toHaveAttribute("data-monitor-mode", "manual");
+    expect(screen.getByText("已切换到普通监控 · 5 秒后应用")).toHaveClass("absolute");
+    await act(async () => { vi.advanceTimersByTime(5_000); });
+    vi.useRealTimers();
     await waitFor(() => expect(JSON.parse(
-      localStorage.getItem("vibe-trading:portfolio-monitor-selection:v1") || "{}",
-    )).toEqual({ version: 1, symbols: ["588870.SH"] }));
+      localStorage.getItem("vibe-trading:portfolio-monitor-levels:v2") || "{}",
+    )).toEqual({ version: 2, levels: { "588870.SH": "manual" } }));
     await user.click(screen.getByRole("button", { name: "生成监控草案" }));
     expect(create).toHaveBeenCalledWith({
       symbols: ["588870.SH"],
       report_refs: {},
       research_policy: "if_needed",
-      delivery_target_id: target.target_id,
+      delivery_target_id: undefined,
       force_fresh: true,
     });
     expect(await screen.findByRole("dialog", { name: "588870.SH 监控计划" })).toBeInTheDocument();
@@ -654,7 +703,7 @@ describe("Portfolio market cache", () => {
       1,
     ));
     expect(screen.getByLabelText("服务器检查频次")).toHaveValue("active");
-    expect(screen.getByRole("button", { name: "取消选择 588870.SH 用于 AI 监控" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "588870.SH 监控等级：普通监控；点击切换为AI 自主监控" })).toHaveAttribute("data-monitor-mode", "manual");
     await user.click(screen.getByRole("button", { name: "保存并启用" }));
     expect(saveAndActivate).toHaveBeenCalledWith(
       "profile-1",
@@ -667,34 +716,40 @@ describe("Portfolio market cache", () => {
     );
   }, 10_000);
 
-  it("keeps each monitor radar on or off across page remounts", async () => {
-    const user = userEvent.setup();
+  it("keeps each three-level monitor radar state across page remounts", async () => {
     const firstRender = render(<Portfolio />, { wrapper: MemoryRouter });
 
-    await user.click(await screen.findByRole("button", { name: "选择 588870.SH 用于 AI 监控" }));
+    const offRadar = await screen.findByRole("button", { name: "588870.SH 监控等级：未监控；点击切换为普通监控" });
+    vi.useFakeTimers();
+    fireEvent.click(offRadar);
+    await act(async () => { vi.advanceTimersByTime(5_000); });
+    vi.useRealTimers();
     await waitFor(() => expect(JSON.parse(
-      localStorage.getItem("vibe-trading:portfolio-monitor-selection:v1") || "{}",
-    )).toEqual({ version: 1, symbols: ["588870.SH"] }));
+      localStorage.getItem("vibe-trading:portfolio-monitor-levels:v2") || "{}",
+    )).toEqual({ version: 2, levels: { "588870.SH": "manual" } }));
     firstRender.unmount();
     expect(JSON.parse(
-      localStorage.getItem("vibe-trading:portfolio-monitor-selection:v1") || "{}",
-    )).toEqual({ version: 1, symbols: ["588870.SH"] });
+      localStorage.getItem("vibe-trading:portfolio-monitor-levels:v2") || "{}",
+    )).toEqual({ version: 2, levels: { "588870.SH": "manual" } });
 
     const secondRender = render(<Portfolio />, { wrapper: MemoryRouter });
     expect(JSON.parse(
-      localStorage.getItem("vibe-trading:portfolio-monitor-selection:v1") || "{}",
-    )).toEqual({ version: 1, symbols: ["588870.SH"] });
-    const persistedRadar = await screen.findByRole("button", { name: "取消选择 588870.SH 用于 AI 监控" });
-    expect(persistedRadar).toHaveAttribute("aria-pressed", "true");
-    await user.click(persistedRadar);
+      localStorage.getItem("vibe-trading:portfolio-monitor-levels:v2") || "{}",
+    )).toEqual({ version: 2, levels: { "588870.SH": "manual" } });
+    const persistedRadar = await screen.findByRole("button", { name: "588870.SH 监控等级：普通监控；点击切换为AI 自主监控" });
+    expect(persistedRadar).toHaveAttribute("data-monitor-mode", "manual");
+    vi.useFakeTimers();
+    fireEvent.click(persistedRadar);
+    await act(async () => { vi.advanceTimersByTime(5_000); });
+    vi.useRealTimers();
     await waitFor(() => expect(JSON.parse(
-      localStorage.getItem("vibe-trading:portfolio-monitor-selection:v1") || "{}",
-    )).toEqual({ version: 1, symbols: [] }));
+      localStorage.getItem("vibe-trading:portfolio-monitor-levels:v2") || "{}",
+    )).toEqual({ version: 2, levels: { "588870.SH": "autonomous" } }));
     secondRender.unmount();
 
     render(<Portfolio />, { wrapper: MemoryRouter });
-    expect(await screen.findByRole("button", { name: "选择 588870.SH 用于 AI 监控" }))
-      .toHaveAttribute("aria-pressed", "false");
+    expect(await screen.findByRole("button", { name: "588870.SH 监控等级：AI 自主监控；点击切换为未监控" }))
+      .toHaveAttribute("data-monitor-mode", "autonomous");
   });
 
   it("hydrates a missing local monitor selection from the server without clearing autopilot", async () => {
@@ -708,11 +763,11 @@ describe("Portfolio market cache", () => {
 
     render(<Portfolio />, { wrapper: MemoryRouter });
 
-    expect(await screen.findByRole("button", { name: "取消选择 588870.SH 用于 AI 监控" }))
-      .toHaveAttribute("aria-pressed", "true");
+    expect(await screen.findByRole("button", { name: "588870.SH 监控等级：AI 自主监控；点击切换为未监控" }))
+      .toHaveAttribute("data-monitor-mode", "autonomous");
     await waitFor(() => expect(JSON.parse(
-      localStorage.getItem("vibe-trading:portfolio-monitor-selection:v1") || "{}",
-    )).toEqual({ version: 1, symbols: ["588870.SH"] }));
+      localStorage.getItem("vibe-trading:portfolio-monitor-levels:v2") || "{}",
+    )).toEqual({ version: 2, levels: { "588870.SH": "autonomous" } }));
     expect(configure).not.toHaveBeenCalled();
   });
 
@@ -737,8 +792,8 @@ describe("Portfolio market cache", () => {
     );
     await act(async () => { await Promise.resolve(); });
     expect(configure).not.toHaveBeenCalled();
-    expect(await screen.findByRole("button", { name: "选择 588870.SH 用于 AI 监控" }))
-      .toHaveAttribute("aria-pressed", "false");
+    expect(await screen.findByRole("button", { name: "588870.SH 监控等级：未监控；点击切换为普通监控" }))
+      .toHaveAttribute("data-monitor-mode", "off");
     expect(JSON.parse(
       localStorage.getItem("vibe-trading:portfolio-monitor-selection:v1") || "{}",
     )).toEqual({ version: 1, symbols: [] });
@@ -762,10 +817,14 @@ describe("Portfolio market cache", () => {
     };
     vi.mocked(api.getPortfolioMonitoringAutopilot).mockResolvedValue(serverAutopilot);
     const configure = vi.spyOn(api, "configurePortfolioMonitoringAutopilot").mockResolvedValue(disabledAutopilot);
-    const user = userEvent.setup();
-
     render(<Portfolio />, { wrapper: MemoryRouter });
-    await user.click(await screen.findByRole("button", { name: "取消选择 588870.SH 用于 AI 监控" }));
+    const autonomousRadar = await screen.findByRole("button", { name: "588870.SH 监控等级：AI 自主监控；点击切换为未监控" });
+    vi.useFakeTimers();
+    fireEvent.click(autonomousRadar);
+    expect(screen.getByText("已切换到未监控 · 5 秒后应用")).toBeInTheDocument();
+    expect(configure).not.toHaveBeenCalled();
+    await act(async () => { vi.advanceTimersByTime(5_000); });
+    vi.useRealTimers();
 
     await waitFor(() => expect(configure).toHaveBeenCalledWith(expect.objectContaining({
       enabled: false,
@@ -778,6 +837,34 @@ describe("Portfolio market cache", () => {
     );
   });
 
+  it("debounces rapid three-level clicks so autopilot never toggles for an abandoned choice", async () => {
+    localStorage.setItem("vibe-trading:portfolio-monitor-levels:v2", JSON.stringify({
+      version: 2,
+      levels: { "588870.SH": "autonomous" },
+    }));
+    const serverAutopilot = {
+      ...await api.getPortfolioMonitoringAutopilot(),
+      enabled: true,
+      selected_symbols: ["588870.SH"],
+    };
+    vi.mocked(api.getPortfolioMonitoringAutopilot).mockResolvedValue(serverAutopilot);
+    const configure = vi.spyOn(api, "configurePortfolioMonitoringAutopilot").mockResolvedValue(serverAutopilot);
+
+    render(<Portfolio />, { wrapper: MemoryRouter });
+    const autonomousRadar = await screen.findByRole("button", { name: "588870.SH 监控等级：AI 自主监控；点击切换为未监控" });
+    vi.useFakeTimers();
+    fireEvent.click(autonomousRadar);
+    fireEvent.click(screen.getByRole("button", { name: "588870.SH 监控等级：未监控；点击切换为普通监控" }));
+    fireEvent.click(screen.getByRole("button", { name: "588870.SH 监控等级：普通监控；点击切换为AI 自主监控" }));
+
+    expect(screen.getByRole("button", { name: "588870.SH 监控等级：AI 自主监控；点击切换为未监控" }))
+      .toHaveAttribute("data-monitor-pending", "false");
+    expect(configure).not.toHaveBeenCalled();
+    await act(async () => { vi.advanceTimersByTime(5_000); });
+    vi.useRealTimers();
+    expect(configure).not.toHaveBeenCalled();
+  });
+
   it("removes persisted monitor symbols that are no longer in the portfolio", async () => {
     localStorage.setItem("vibe-trading:portfolio-monitor-selection:v1", JSON.stringify({
       version: 1,
@@ -786,11 +873,11 @@ describe("Portfolio market cache", () => {
 
     render(<Portfolio />, { wrapper: MemoryRouter });
 
-    expect(await screen.findByRole("button", { name: "取消选择 588870.SH 用于 AI 监控" }))
-      .toHaveAttribute("aria-pressed", "true");
+    expect(await screen.findByRole("button", { name: "588870.SH 监控等级：AI 自主监控；点击切换为未监控" }))
+      .toHaveAttribute("data-monitor-mode", "autonomous");
     await waitFor(() => expect(JSON.parse(
-      localStorage.getItem("vibe-trading:portfolio-monitor-selection:v1") || "{}",
-    )).toEqual({ version: 1, symbols: ["588870.SH"] }));
+      localStorage.getItem("vibe-trading:portfolio-monitor-levels:v2") || "{}",
+    )).toEqual({ version: 2, levels: { "588870.SH": "autonomous" } }));
   });
 
   it("shows the holding name together with the six-digit code in monitor targets", async () => {
@@ -984,6 +1071,7 @@ describe("Portfolio market cache", () => {
     expect(within(summary).getByText("每 5 分钟")).toBeInTheDocument();
     expect(within(summary).getByText("5m K线")).toBeInTheDocument();
     expect(within(summary).getByText("突破点 L1 · 价格向上突破 2.2")).toBeInTheDocument();
+    expect(summary.querySelector("[data-monitor-rule-grid='compact']")).not.toBeNull();
     expect(within(summary).getByText("飞书目标待确认")).toBeInTheDocument();
     await userEvent.setup().click(within(card).getByRole("button", { name: "计划与审核" }));
 
@@ -1396,7 +1484,9 @@ describe("Portfolio market cache", () => {
     await user.click(screen.getByRole("button", { name: "我已发送，立即检查" }));
     await waitFor(() => expect(api.getPortfolioMonitorDeliveryBindingCode).toHaveBeenCalledWith("binding-1"));
     expect(await screen.findByText("绑定成功，已自动选中该群聊。")).toBeInTheDocument();
-    expect(screen.getByLabelText("飞书提醒目标")).toHaveValue("target-bound");
+    await waitFor(() => {
+      expect(screen.getByRole("combobox", { name: "飞书提醒目标" })).toHaveValue("target-bound");
+    });
   });
 
   it("shows shadow mode health and marks would-deliver events as not sent", async () => {
@@ -1664,6 +1754,8 @@ describe("Portfolio market cache", () => {
       name: /科创50指 588870，现价 2\.100，较开盘 \+2\.44%，监控运行正常/,
     });
     const nearestTargetGlyph = within(monitorRow).getByLabelText(/L1 加仓，目标价 2\.000，距离 4\.76%/);
+    expect(nearestTargetGlyph).toHaveAttribute("data-target-side", "left");
+    expect(nearestTargetGlyph.firstElementChild).toHaveClass("flex-row-reverse", "justify-end");
     expect(within(nearestTargetGlyph).getByText("L1 加仓")).toHaveClass("text-blue-700");
     expect(within(monitorRow).getByRole("img", {
       name: /588870.SH 监控运行正常，下次检查倒计时 1:0[0-5]/,
@@ -1699,7 +1791,7 @@ describe("Portfolio market cache", () => {
     expect(within(targetBand).getByText("2.050")).toBeInTheDocument();
     expect(within(targetBand).getByText("2.200")).toBeInTheDocument();
     expect(within(targetBand).getByText("较开盘 -2.44%")).toHaveClass("text-emerald-600");
-    expect(within(targetBand).getByText("较开盘 +7.32%")).toHaveClass("text-red-600");
+    expect(within(targetBand).getByText("距现价 +4.76%")).toHaveClass("text-red-600");
     expect(within(targetBand).getByText("较开盘 +2.44%")).toHaveClass("text-red-600");
     const trendText = "较开盘 +2.44%";
     expect(within(snapshot).getAllByText(trendText)[0]?.parentElement).toHaveClass("text-red-600");
@@ -1825,6 +1917,99 @@ describe("Portfolio market cache", () => {
     expect(priceVolume).toHaveTextContent("历史同时间桶样本不足");
   });
 
+  it("falls back to a timestamped single-source historical reference without live-trigger wording", async () => {
+    const checkedAt = new Date().toISOString();
+    vi.mocked(api.listPortfolioMonitors).mockResolvedValue({
+      profiles: [monitorPriceVolumeProfile(checkedAt, {
+        dataMode: "single_source",
+        priceVolume: {
+          status: "insufficient_data",
+          regime: null,
+          volume_state: null,
+          volume_ratio: null,
+          baseline_samples: 2,
+          three_bar_return_bps: null,
+          latest_return_bps: null,
+          close_location: null,
+          accelerated_decline: false,
+          reason_codes: ["volume_conflict"],
+          analysis_scope: "live",
+        },
+        historicalPriceVolume: {
+          status: "ready",
+          regime: "bullish_expansion",
+          volume_state: "expanded",
+          volume_ratio: 1.62,
+          baseline_samples: 10,
+          three_bar_return_bps: 32,
+          latest_return_bps: 12,
+          close_location: 0.72,
+          accelerated_decline: false,
+          reason_codes: ["historical_reference"],
+          analysis_scope: "historical",
+          data_as_of: "2026-07-21T06:55:00+00:00",
+          volume_quality: "single_source",
+          volume_source_count: 1,
+          volume_sources: ["tencent"],
+          volume_unit: "shares",
+        },
+      })],
+    });
+
+    render(<Portfolio />, { wrapper: MemoryRouter });
+
+    const card = await screen.findByRole("article", { name: "科创50指 588870 监控标的" });
+    const priceVolume = within(card).getByLabelText("588870.SH 量价分析");
+    expect(priceVolume).toHaveAttribute("data-analysis-scope", "historical");
+    expect(priceVolume).toHaveTextContent("历史量价参考");
+    expect(priceVolume).toHaveTextContent("实时量价暂不可用：成交量来源冲突");
+    expect(priceVolume).toHaveTextContent("该结论不参与实时触发");
+    expect(priceVolume).toHaveTextContent("单一来源量价参考");
+  });
+
+  it("shows history backfill progress instead of final insufficiency", async () => {
+    const checkedAt = new Date().toISOString();
+    vi.mocked(api.listPortfolioMonitors).mockResolvedValue({
+      profiles: [monitorPriceVolumeProfile(checkedAt, {
+        backfillStatus: "running",
+        priceVolume: {
+          status: "insufficient_data",
+          regime: null,
+          volume_state: null,
+          volume_ratio: null,
+          baseline_samples: 2,
+          three_bar_return_bps: null,
+          latest_return_bps: null,
+          close_location: null,
+          accelerated_decline: false,
+          reason_codes: ["insufficient_same_time_baseline"],
+        },
+      })],
+    });
+
+    render(<Portfolio />, { wrapper: MemoryRouter });
+
+    const card = await screen.findByRole("article", { name: "科创50指 588870 监控标的" });
+    const priceVolume = within(card).getByLabelText("588870.SH 量价分析");
+    expect(priceVolume).toHaveTextContent("正在补齐历史量价基线");
+    expect(priceVolume).not.toHaveTextContent("量价证据不足");
+  });
+
+  it("labels unsupported markets explicitly", async () => {
+    const checkedAt = new Date().toISOString();
+    vi.mocked(api.listPortfolioMonitors).mockResolvedValue({
+      profiles: [monitorPriceVolumeProfile(checkedAt, { market: "US" })],
+    });
+
+    render(<Portfolio />, { wrapper: MemoryRouter });
+
+    const card = await screen.findByRole("article", { name: "科创50指 588870 监控标的" });
+    const priceVolume = within(card).getByLabelText("588870.SH 量价分析");
+    expect(priceVolume).toHaveAttribute("data-price-volume-status", "unsupported-market");
+    expect(priceVolume).toHaveTextContent("该市场量价监测暂未支持");
+    expect(priceVolume).not.toHaveTextContent("数据不足");
+  });
+
   it("keeps intraday high and low visible after price returns inside the target window", async () => {
     const checkedAt = new Date().toISOString();
     vi.mocked(api.listPortfolioMonitors).mockResolvedValue({
@@ -1894,7 +2079,7 @@ describe("Portfolio market cache", () => {
       left: "L1 · 止盈点",
       right: "L2 · 止盈点",
       crossed: "1",
-      message: /突破 Boost · 已突破 L1 · 止盈点；正在冲击 L2 · 止盈点/,
+      message: /今日上行，已突破 L1/,
     },
     {
       label: "下破加仓观察点后显示下一止损点",
@@ -1907,7 +2092,7 @@ describe("Portfolio market cache", () => {
       left: "L2 · 止损点",
       right: "L1 · 加仓点",
       crossed: "1",
-      message: /下行 Boost · 已跌破 L1 · 加仓点；正在接近 L2 · 止损点/,
+      message: /今日下行，已跌破 L1/,
     },
     {
       label: "没有更高目标时使用现价作为右侧边界",
@@ -1920,7 +2105,20 @@ describe("Portfolio market cache", () => {
       left: "L2 · 止盈点",
       right: "现价边界",
       crossed: "2",
-      message: /暂无更高目标，现价作为右侧边界/,
+      message: /今日上行，已突破 L2/,
+    },
+    {
+      label: "跌破第二止损点后精简显示 L2 下行提示",
+      price: 1.75,
+      previous: 1.77,
+      trend: "down" as const,
+      direction: "down",
+      rangeState: "below-first-target",
+      position: "0.00",
+      left: "现价边界",
+      right: "L2 · 止损点",
+      crossed: "2",
+      message: /今日下行，已跌破 L2/,
     },
   ])("uses the dynamic target ladder when $label", async ({
     price,
@@ -1981,8 +2179,8 @@ describe("Portfolio market cache", () => {
     expect(snapshot).toHaveAttribute("data-boost-direction", direction);
     const boostBadge = within(snapshot).getByRole("status");
     expect(within(boostBadge).getByText(message)).toBeInTheDocument();
-    expect(boostBadge).toHaveClass("max-w-[13rem]", "text-[10px]", "py-1");
-    expect(boostBadge.parentElement).toHaveClass("justify-self-end");
+    expect(boostBadge).toHaveClass("whitespace-nowrap", "text-[10px]", "py-1");
+    expect(boostBadge.parentElement).toHaveClass("sm:justify-items-end");
     const targetBand = within(snapshot).getByLabelText("588870.SH 价格目标区间");
     expect(targetBand).toHaveAttribute("data-current-range-state", rangeState);
     expect(targetBand).toHaveAttribute("data-current-position", position);
@@ -2447,7 +2645,7 @@ describe("Portfolio market cache", () => {
       },
     };
     vi.mocked(api.getPortfolioReview).mockResolvedValue(tradeReview);
-    vi.spyOn(api, "deletePortfolioTrade").mockResolvedValue({
+    vi.spyOn(api, "reversePortfolioTrade").mockResolvedValue({
       ...tradeReview,
       portfolio_state: { ...tradeReview.portfolio_state, recent_trades: [] },
     });
@@ -2457,8 +2655,8 @@ describe("Portfolio market cache", () => {
 
     await user.click(await screen.findByRole("button", { name: "删除交易 科创50ETF汇添富（588870） 2026-07-12" }));
 
-    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("不会撤销它已经造成的持仓变化"));
-    expect(api.deletePortfolioTrade).toHaveBeenCalledWith("trade-delete-1");
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("历史事件不会删除"));
+    expect(api.reversePortfolioTrade).toHaveBeenCalledWith("trade-delete-1");
     await waitFor(() => expect(within(screen.getByRole("table", { name: "最近交易记录" })).getByText("暂无最近交易记录。")).toBeInTheDocument());
     const holdingRow = within(screen.getByRole("table", { name: "持仓矩阵" })).getByText("科创50指").closest("tr");
     expect(within(holdingRow as HTMLTableRowElement).getByText("2,200")).toBeInTheDocument();
