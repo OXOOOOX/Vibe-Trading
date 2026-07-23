@@ -1500,6 +1500,18 @@ class ChannelRuntime:
             or (msg is not None and not self._deep_report_matches_chat(record.session_id, msg))
         ):
             return None
+        history_delta = dict(record.history_delta or {})
+        research_coverage = dict(record.research_coverage or {})
+        if not history_delta or not research_coverage:
+            try:
+                from src.research import get_research_knowledge_store, knowledge_enabled
+
+                if knowledge_enabled():
+                    knowledge = get_research_knowledge_store()
+                    history_delta = history_delta or knowledge.delta(record.report_id) or {}
+                    research_coverage = research_coverage or knowledge.coverage(record.report_id) or {}
+            except Exception:
+                pass
         return {
             "report_id": record.report_id,
             "session_id": record.session_id,
@@ -1509,6 +1521,8 @@ class ChannelRuntime:
             "security_name": record.security_name,
             "symbol": record.symbol,
             "data_as_of": record.data_as_of,
+            "history_delta": history_delta,
+            "research_coverage": research_coverage,
         }
 
     def _daily_report_digest(

@@ -153,6 +153,17 @@
           "footer": "适合需要留档和复核的上市公司研究；证据不足的模块会明确降级。",
           "cta": "进入深度研究模式"
         },
+        "weeklyReport": {
+          "title": "正式周度复盘",
+          "description": "为一只个股或 ETF 创建正式周报，并沉淀到统一报告库。",
+          "eyebrow": "完整交易周 · 正式任务 · Markdown + PDF",
+          "detail1": "先确认准确标的，默认采用最近一个已完成交易周",
+          "detail2": "创建正式 WeeklyReportRun，并输出结构化 JSON、Markdown 与 PDF",
+          "detail3": "本次只生成面向用户的周报，监控周报保留独立能力位",
+          "footer": "仅用于研究：不会自动激活监控、发送文件、执行交易或授权 P4B2 扩展研究。",
+          "cta": "填写个股或 ETF",
+          "prompt": "请为【公司、ETF 名称或准确代码】生成一份面向用户的正式周报。先确认唯一证券代码，再调用 weekly_report 的 start 命令，默认使用最近一个已完成交易周。不要用普通聊天摘要代替正式任务；不要激活监控、发送文件、执行交易或授权 P4B2 研究。"
+        },
         "marketReview": {
           "title": "盘前 / 盘后复盘",
           "description": "结合持仓、隔夜市场与当日新闻，整理下一交易日重点。",
@@ -479,6 +490,7 @@
     "connectorRuntimeHalted": "连接器运行已停止",
     "checkConnector": "检查连接器",
     "analyzePortfolio": "分析连接器投资组合",
+    "weeklyReport": "创建正式周报",
     "executionTimedOut": "执行超时，已自动停止",
     "researchGoalAttached": "研究目标已附加",
     "failedToStartGoal": "启动目标失败。",

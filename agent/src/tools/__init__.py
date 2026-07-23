@@ -75,6 +75,7 @@ def build_registry(
     exclude_tool_names: set[str] | None = None,
     financial_rigor_commands: set[str] | None = None,
     report_workspace_handler: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+    weekly_report_handler: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
     _mcp_server_tool_name_segments: Mapping[str, str] | None = None,
 ) -> ToolRegistry:
     """Build the tool registry via auto-discovery, optionally enriched with MCP tools.
@@ -127,12 +128,16 @@ def build_registry(
     )
     from src.tools.autopilot_tool import RunResearchAutopilotTool
     from src.tools.financial_snapshot_analysis_tool import FinancialSnapshotAnalysisTool
+    from src.tools.etf_research_context_tool import PrepareETFResearchTool
     from src.tools.financial_rigor_tool import FinancialRigorTool
     from src.tools.report_audit_tool import ReportAuditTool
     from src.tools.report_evidence_tool import RecordReportEvidenceTool
     from src.tools.report_workspace_tool import ReportWorkspaceTool
+    from src.tools.official_filings_tool import OfficialFilingsTool
     from src.tools.remember_tool import RememberTool
     from src.tools.swarm_tool import SwarmTool
+    from src.tools.web_reader_tool import WebReaderTool
+    from src.tools.weekly_report_tool import WeeklyReportTool
 
     goal_tool_classes = {
         StartResearchGoalTool,
@@ -145,9 +150,11 @@ def build_registry(
     session_injected_classes = goal_tool_classes | {
         RunResearchAutopilotTool,
         FinancialSnapshotAnalysisTool,
+        PrepareETFResearchTool,
         FinancialRigorTool,
         ReportAuditTool,
         RecordReportEvidenceTool,
+        WebReaderTool,
     }
     registry = ToolRegistry()
     for cls in _discover_subclasses():
@@ -174,6 +181,16 @@ def build_registry(
                     handler=report_workspace_handler,
                     event_callback=event_callback,
                 ))
+            elif cls is WeeklyReportTool:
+                if weekly_report_handler is None:
+                    logger.info("Tool %s unavailable without a weekly report handler", cls.name)
+                    continue
+                registry.register(cls(
+                    handler=weekly_report_handler,
+                    event_callback=event_callback,
+                ))
+            elif cls is OfficialFilingsTool:
+                registry.register(cls(event_callback=event_callback))
             elif cls in session_injected_classes:
                 registry.register(cls(default_session_id=session_id, event_callback=event_callback))
             elif cls is SwarmTool:
@@ -284,6 +301,7 @@ def build_filtered_registry(
     event_callback: Callable[[str, dict], None] | None = None,
     financial_rigor_commands: set[str] | None = None,
     report_workspace_handler: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+    weekly_report_handler: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
 ) -> ToolRegistry:
     """Build a ToolRegistry with only specified tools.
 
@@ -307,6 +325,7 @@ def build_filtered_registry(
         event_callback=event_callback,
         financial_rigor_commands=financial_rigor_commands,
         report_workspace_handler=report_workspace_handler,
+        weekly_report_handler=weekly_report_handler,
     )
     return _filter_registry(full, tool_names, include_shell_tools=include_shell_tools)
 

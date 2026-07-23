@@ -101,7 +101,12 @@ class _StubLLMCancelMidStream:
         return _StubLLMResponse()
 
 
-def _build_agent(llm: Any, max_iter: int = 3, tmp_run_dir: Path | None = None) -> AgentLoop:
+def _build_agent(
+    llm: Any,
+    max_iter: int = 3,
+    tmp_run_dir: Path | None = None,
+    max_total_tokens: int | None = None,
+) -> AgentLoop:
     """Build an AgentLoop with a real (but empty) registry and a stub LLM."""
     from src.tools import build_registry
     from src.memory.persistent import PersistentMemory
@@ -112,6 +117,7 @@ def _build_agent(llm: Any, max_iter: int = 3, tmp_run_dir: Path | None = None) -
         llm=llm,
         event_callback=None,
         max_iterations=max_iter,
+        max_total_tokens=max_total_tokens,
         persistent_memory=pm,
     )
     if tmp_run_dir is not None:
@@ -296,6 +302,33 @@ class _StubLLMIgnoresForcedTextOnly:
         return _StubLLMResponse()
 
 
+class _StubLLMToolCallsOverTokenBudget:
+    """One expensive tool-calling turn must stop before the tool executes."""
+
+    def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any] | None = None,
+        on_text_chunk: Callable[[str], None] | None = None,
+        on_reasoning_chunk: Callable[[str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> _StubLLMResponse:
+        response = _StubLLMResponse()
+        response.has_tool_calls = True
+        response.tool_calls = [
+            SimpleNamespace(id="c-budget", name="compact", arguments={})
+        ]
+        response.usage_metadata = {
+            "input_tokens": 110,
+            "output_tokens": 10,
+            "total_tokens": 120,
+        }
+        return response
+
+    def chat(self, messages: list[dict[str, Any]], **_: Any) -> _StubLLMResponse:
+        return _StubLLMResponse()
+
+
 class _StubLLMStreamFailure:
     def stream_chat(
         self,
@@ -339,6 +372,31 @@ def test_true_max_iterations_still_returns_max_iteration_reason(tmp_path: Path) 
     assert result["status"] == "failed"
     assert result["reason"] == "reached max iterations (1) without final answer"
     assert result["iterations"] == 1
+
+
+def test_token_budget_stops_before_more_tool_execution(tmp_path: Path) -> None:
+    agent = _build_agent(
+        _StubLLMToolCallsOverTokenBudget(),
+        max_iter=5,
+        max_total_tokens=100,
+        tmp_run_dir=tmp_path / "run",
+    )
+    processed = {"tools": False}
+
+    def _fail_if_called(*_args: Any, **_kwargs: Any):
+        processed["tools"] = True
+        raise AssertionError("tool execution must be skipped after budget exhaustion")
+
+    agent._process_tool_calls = _fail_if_called  # type: ignore[method-assign]
+    result = agent.run(user_message="continue researching")
+
+    assert result["status"] == "failed"
+    assert result["reason"] == (
+        "reached autonomous token budget (120/100) before executing more tools"
+    )
+    assert result["iterations"] == 1
+    assert result["max_total_tokens"] == 100
+    assert processed["tools"] is False
 
 
 def test_force_text_only_on_last_iteration(tmp_path: Path) -> None:

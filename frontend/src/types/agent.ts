@@ -1,4 +1,6 @@
 /** Chat message types */
+import type { ETFReportReadiness } from "@/lib/api";
+
 export type AgentMessageType =
   | "user" | "thinking" | "tool_call" | "tool_result"
   | "answer" | "error" | "run_complete" | "compact" | "swarm_status";
@@ -59,6 +61,8 @@ export interface AgentMessage {
   /** Persisted equity Deep Report attached to this answer. */
   reportId?: string;
   reportQualityStatus?: "passed" | "passed_with_gaps" | "failed_validation";
+  reportProfile?: "equity_deep_research" | "etf_deep_research" | string;
+  reportEtfReadiness?: ETFReportReadiness;
   reportSymbol?: string;
   reportSecurityName?: string;
   reportDataAsOf?: string;
@@ -74,6 +78,19 @@ export interface AgentMessage {
   reportMarkdownAvailable?: boolean;
   reportDiagnosticAvailable?: boolean;
   reportDiffAvailable?: boolean;
+  reportResearchCoverage?: {
+    reused_fact_count?: number;
+    refreshed_fact_count?: number;
+    material_conflicts?: unknown[];
+  };
+  reportHistoryDelta?: {
+    base_report_id?: string | null;
+    added?: unknown[];
+    updated?: unknown[];
+    confirmed?: unknown[];
+    stale?: unknown[];
+    contradicted?: unknown[];
+  };
 }
 
 export interface ReportPreviewTarget {

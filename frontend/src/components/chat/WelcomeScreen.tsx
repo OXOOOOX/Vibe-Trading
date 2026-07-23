@@ -5,6 +5,7 @@ import {
   ArrowUpRight,
   BookOpen,
   Bot,
+  CalendarRange,
   CheckCircle2,
   Globe,
   Landmark,
@@ -68,6 +69,13 @@ const QUICK_ACTIONS: QuickAction[] = [
     tone: "border-cyan-500/30 hover:border-cyan-500/60 hover:bg-cyan-500/[0.04]",
     iconTone: "bg-cyan-500/10 text-cyan-600 dark:text-cyan-300",
     behavior: { kind: "mode", mode: "deepReport" },
+  },
+  {
+    key: "weeklyReport",
+    icon: CalendarRange,
+    tone: "border-indigo-500/30 hover:border-indigo-500/60 hover:bg-indigo-500/[0.04]",
+    iconTone: "bg-indigo-500/10 text-indigo-600 dark:text-indigo-300",
+    behavior: { kind: "draft", promptKey: "welcome.quickStart.actions.weeklyReport.prompt" },
   },
   {
     key: "marketReview",

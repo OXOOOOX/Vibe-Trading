@@ -71,7 +71,7 @@ export type ResponseMode = "chat" | "deep_report";
 
 export interface SendMessageOptions {
   responseMode?: ResponseMode;
-  reportProfile?: "equity_deep_research";
+  reportProfile?: "equity_deep_research" | "etf_deep_research";
   routingDecisionId?: string;
 }
 
@@ -92,12 +92,41 @@ export interface DeepReportModule {
   details?: Record<string, unknown>;
 }
 
+export type ETFReadinessStatus =
+  | "not_publishable"
+  | "structure_ready"
+  | "penetration_partial"
+  | "penetration_ready";
+
+export interface ETFReportReadiness {
+  version?: string;
+  status: ETFReadinessStatus;
+  evidence_quality?: "passed" | "passed_with_gaps" | "failed_validation" | string;
+  hard_gate_passed?: boolean;
+  structure_checks?: Record<string, boolean>;
+  penetration_checks?: Record<string, boolean>;
+  metrics?: {
+    holdings_weight_coverage?: number;
+    selected_component_count?: number;
+    selected_weight_coverage?: number;
+    component_research_coverage?: number;
+    fully_supported_etf_weight?: number;
+    mandatory_incomplete_components?: string[];
+    [key: string]: unknown;
+  };
+  thresholds?: Record<string, number>;
+  reason_codes?: string[];
+  missing_actions?: string[];
+  input_fingerprint?: string;
+}
+
 export interface DeepReportRecord {
   schema_version?: number;
   report_id: string;
   session_id: string;
   attempt_id: string;
   profile: "equity_deep_research" | string;
+  instrument_type?: "company_equity" | "etf" | "index";
   symbol: string;
   security_name: string;
   report_date: string;
@@ -105,6 +134,9 @@ export interface DeepReportRecord {
   quality_status: "passed" | "passed_with_gaps" | "failed_validation";
   status: "running" | "completed" | "failed" | "cancelled" | string;
   analysis_modules: Record<string, DeepReportModule>;
+  pipeline_checks?: Record<string, DeepReportModule>;
+  report_sections?: Record<string, DeepReportModule>;
+  etf_readiness?: ETFReportReadiness;
   artifacts: DeepReportArtifact[];
   validation_issues: string[];
   created_at: string;
@@ -123,6 +155,7 @@ export interface DeepReportRecord {
   content_role?: "report" | "diagnostic" | null;
   research_coverage?: ResearchCoverage;
   history_delta?: ResearchDelta;
+  subject_profile?: ETFProductProfile | null;
 }
 
 export interface ResearchCoverageDomain {
@@ -171,6 +204,695 @@ export interface ResearchSymbolHistory {
   reports: Array<Record<string, unknown>>;
 }
 
+export type ReportHorizon = "intraday" | "daily" | "weekly" | "structural";
+export type ReportKind =
+  | "deep_research"
+  | "daily_holding"
+  | "daily_portfolio"
+  | "weekly_review"
+  | "monitor_research"
+  | "component_research";
+
+export interface ReportLibraryViewpoint {
+  viewpoint_id: string;
+  report_id: string;
+  horizon: ReportHorizon;
+  stance: "bullish" | "neutral" | "bearish" | "mixed" | "unknown";
+  action: "observe" | "add" | "reduce" | "exit" | "not_applicable";
+  confidence: "low" | "medium" | "high" | "unknown";
+  summary_claim_id?: string | null;
+  reason_claim_ids: string[];
+  risk_claim_ids: string[];
+  condition_claim_ids: string[];
+  invalidation_claim_ids: string[];
+  valid_from?: string | null;
+  valid_until?: string | null;
+}
+
+export interface ReportLibraryArtifact {
+  artifact_id: string;
+  artifact_role: string;
+  filename: string;
+  media_type: string;
+  source_locator: string;
+  sha256?: string | null;
+  available: boolean;
+  revision: number;
+  url?: string | null;
+}
+
+export interface ReportLibraryRecord {
+  report_id: string;
+  family_id: string;
+  report_kind: ReportKind;
+  subject_type: "symbol" | "portfolio";
+  subject_key: string;
+  symbol?: string | null;
+  security_name: string;
+  status: "published" | "diagnostic" | "archived";
+  report_quality_status: "passed" | "passed_with_gaps" | "failed_validation";
+  coverage_status: "complete" | "partial" | "insufficient" | "unknown";
+  generated_at: string;
+  data_as_of: string;
+  report_period: {
+    start_date?: string | null;
+    end_date?: string | null;
+    label?: string | null;
+  };
+  source_type: string;
+  source_id: string;
+  source_revision: number;
+  knowledge_link: {
+    coverage_snapshot_id?: string | null;
+    evidence_ids?: string[];
+    fact_ids?: string[];
+    claim_ids?: string[];
+    internal_reference_code?: string | null;
+    profile?: string | null;
+    instrument_type?: "company_equity" | "etf" | "index" | null;
+    etf_readiness?: ETFReportReadiness;
+    pipeline_checks?: Record<string, DeepReportModule>;
+    report_sections?: Record<string, DeepReportModule>;
+    etf_penetration?: {
+      selection_status?: string;
+      component_research_status?: string;
+      selected_count?: number;
+      selected_weight_coverage?: number;
+      explanation_coverage?: number;
+      research_coverage?: number;
+      fully_supported_coverage?: number;
+      reusable_count?: number;
+      missing_count?: number;
+      stale_count?: number;
+      conflicted_count?: number;
+    } | null;
+    monitoring_bundle_artifact_id?: string | null;
+    monitoring_bundle_source_locator?: string | null;
+    monitoring_bundle_status?: "available" | "not_recommended" | "data_insufficient";
+    monitoring_candidate_count?: number;
+    monitoring_schema_version?: number;
+  };
+  monitoring_bundle?: MonitoringBundle | null;
+  weekly_review?: WeeklyReviewSummary | null;
+  viewpoints: ReportLibraryViewpoint[];
+  artifacts: ReportLibraryArtifact[];
+  relations: Array<Record<string, unknown>>;
+  created_at: string;
+  updated_at: string;
+  sources?: ReportSourceLink[];
+}
+
+export interface ReportLibraryCurrentCandidate {
+  report_id: string;
+  report_kind: ReportLibraryRecord["report_kind"];
+  symbol?: string | null;
+  security_name: string;
+  data_as_of: string;
+  generated_at: string;
+  report_quality_status: ReportLibraryRecord["report_quality_status"];
+  coverage_status: ReportLibraryRecord["coverage_status"];
+  viewpoint: ReportLibraryViewpoint;
+  summary?: { claim_id: string; section_id?: string | null; text: string } | null;
+  risks?: Array<{ claim_id: string; section_id?: string | null; text: string }>;
+  pending_items?: Array<{ claim_id: string; section_id?: string | null; text: string }>;
+}
+
+export interface ETFUniverseComponent {
+  symbol: string;
+  name: string;
+  weight: number;
+  metadata: Record<string, unknown>;
+}
+
+export interface ETFUniverseProfile {
+  snapshot_id?: string | null;
+  etf_symbol: string;
+  etf_name?: string | null;
+  tracked_index_code?: string | null;
+  tracked_index_name?: string | null;
+  data_as_of: string;
+  retrieved_at?: string | null;
+  freshness_expires_at?: string | null;
+  quality_status?: string | null;
+  quality?: string | null;
+  provider_id?: string | null;
+  source_type: string;
+  source_ids: string[];
+  source_urls: string[];
+  weight_scale: "fraction" | string;
+  weight_semantics: "tracked_index_weight" | "disclosed_fund_holding_weight";
+  expected_component_count: number;
+  observed_component_count: number;
+  observed_weight_coverage: number;
+  required_field_coverage: number;
+  universe_complete: boolean;
+  partial_components_are_top_ranked: boolean;
+  warnings: string[];
+  components: ETFUniverseComponent[];
+}
+
+export interface ETFProductField {
+  value: string | number | boolean | number[] | null;
+  status: "available" | "missing" | "stale" | "conflict" | string;
+  unit?: string | null;
+  data_as_of: string;
+  source_ids: string[];
+  semantics: string;
+  note?: string | null;
+}
+
+export interface ETFPeerFlowMember {
+  symbol: string;
+  name?: string | null;
+  manager?: string | null;
+  mapping_status: "official_index_code" | "name_alias_requires_cross_check" | string;
+  data_as_of: string;
+  current_units?: number | null;
+  delta_1d?: number | null;
+  delta_5d?: number | null;
+  delta_20d?: number | null;
+  current_price?: number | null;
+  estimation_price?: number | null;
+  estimation_price_type?: "exchange_market_price" | "exchange_published_nav_proxy" | string | null;
+  estimated_net_flow_1d?: number | null;
+  estimated_net_flow_semantics?: string | null;
+  source_ids: string[];
+}
+
+export interface ETFProductProfile {
+  schema_version: number;
+  profile_snapshot_id: string;
+  symbol: string;
+  data_as_of: string;
+  retrieved_at: string;
+  snapshot_ids: Record<string, string>;
+  identity: Record<string, ETFProductField>;
+  index_methodology: Record<string, ETFProductField>;
+  product_metrics: Record<string, ETFProductField>;
+  share_history?: {
+    current_units?: number | null;
+    delta_1d?: number | null;
+    delta_5d?: number | null;
+    delta_20d?: number | null;
+    estimated_net_flow_1d?: number | null;
+    estimated_net_flow_semantics?: string | null;
+    observations?: Array<{ data_as_of: string; fund_units: number; source_ids: string[] }>;
+  } | null;
+  peer_group?: {
+    tracked_index_code?: string | null;
+    tracked_index_name?: string | null;
+    data_as_of: string;
+    member_count: number;
+    official_index_mapping_count: number;
+    name_mapped_count: number;
+    estimated_net_flow_1d?: number | null;
+    estimated_net_flow_semantics?: string | null;
+    inflow_member_ratio_1d?: number | null;
+    flow_coverage_ratio: number;
+    unit_change_coverage_ratio: number;
+    market_price_flow_count?: number;
+    nav_proxy_flow_count?: number;
+    members: ETFPeerFlowMember[];
+    warnings: string[];
+  } | null;
+  sources: Array<{
+    source_id: string;
+    kind: string;
+    title: string;
+    publisher: string;
+    url?: string | null;
+    content_hash: string;
+    retrieved_at: string;
+    published_at?: string | null;
+    verification_status: SourceVerificationStatus | string;
+  }>;
+  hard_gate_status: "passed" | "failed_validation" | string;
+  quality_status: "passed" | "passed_with_gaps" | "failed_validation" | string;
+  missing_hard_fields: string[];
+  missing_optional_fields: string[];
+  conflicts: Array<Record<string, unknown>>;
+  refresh_errors: unknown[];
+  refresh_status: "completed" | "completed_with_gaps" | "cache_only" | string;
+  source_policy?: {
+    registry_version: string;
+    rules: Array<{
+      rule_id: string;
+      label: string;
+      phase: "product_profile" | "share_flow" | string;
+      slot: string;
+      source_kind: string;
+      publisher: string;
+      verification_status: SourceVerificationStatus | string;
+      priority: number;
+      parser_id: string;
+      response_type: string;
+      provides: string[];
+      required_for_publish: boolean;
+      freshness_days: number;
+      refresh_trigger: string;
+      failure_policy: string;
+      status: "completed" | "completed_with_gaps" | "failed" | string;
+      source_id?: string | null;
+      url?: string | null;
+      error?: string | null;
+    }>;
+  } | null;
+  cache_reused_sections?: Array<{ section: string; snapshot_id: string }>;
+  stale?: boolean;
+}
+
+export interface InstrumentHistoricalPercentileMetric {
+  key: string;
+  label: string;
+  value: number | null;
+  unit?: string | null;
+  percentile: number | null;
+  temperature: "极冷" | "偏冷" | "正常" | "偏热" | "极热"
+    | "极低" | "偏低" | "中位" | "偏高" | "极高" | "暂无" | string;
+  observation_count?: number | null;
+  sample_start?: string | null;
+  sample_end?: string | null;
+  definition?: string | null;
+}
+
+export interface InstrumentHistoricalPercentileSnapshot {
+  schema_version: number;
+  snapshot_id: string;
+  symbol: string;
+  instrument_type?: "company_equity" | "etf" | "index" | string;
+  instrument_name?: string | null;
+  valuation_basis?: "company_valuation" | "tracked_index_valuation" | "index_valuation"
+    | "adjusted_price_history" | string;
+  scope_label?: string | null;
+  tracked_index_code?: string | null;
+  tracked_index_name?: string | null;
+  status: "available" | "unavailable" | string;
+  lookback_years: number;
+  sample_start?: string | null;
+  sample_end?: string | null;
+  sample_count?: number | null;
+  data_as_of: string;
+  retrieved_at: string;
+  mapping_method: string;
+  percentile_method?: string | null;
+  metrics: InstrumentHistoricalPercentileMetric[];
+  source: {
+    source_id: string;
+    provider_id: string;
+    label: string;
+    publisher: string;
+    verification_status: SourceVerificationStatus | string;
+    url: string;
+    methodology_url: string;
+    retrieved_at: string;
+  };
+  unavailable_reason?: string | null;
+  warnings: string[];
+  history_count: number;
+}
+
+/** Backward-compatible names for ETF callers while the API rolls out generically. */
+export type ETFValuationPercentileMetric = InstrumentHistoricalPercentileMetric;
+export type ETFValuationPercentileSnapshot = InstrumentHistoricalPercentileSnapshot;
+
+export type InstrumentProfileMetricStatus = "available" | "unavailable";
+
+export interface InstrumentProfileMetric {
+  key: string;
+  label: string;
+  value: number | null;
+  unit: "CNY" | "pct" | "ratio" | "multiple" | "shares" | "fund_units" | "CNY_per_10_shares" | "CNY_per_fund_unit" | string;
+  category: "market" | "scale" | "valuation" | "profitability" | "dividend" | string;
+  status: InstrumentProfileMetricStatus;
+  unavailable_reason?: string | null;
+  source_id: string;
+  data_as_of: string;
+  raw_field?: string | null;
+  semantics: string;
+}
+
+export interface InstrumentProfileSnapshot {
+  schema_version: number;
+  snapshot_id: string;
+  symbol: string;
+  instrument_type: "company_equity" | "etf" | "index";
+  data_as_of: string;
+  retrieved_at: string;
+  quality_status: "complete" | "partial" | string;
+  history_count: number;
+  identity: {
+    symbol: string;
+    name: string;
+    instrument_type: "company_equity" | "etf" | "index";
+    exchange: string;
+    currency: string;
+    industry?: string | null;
+    region?: string | null;
+    concepts: string[];
+    listing_date?: string | null;
+  };
+  metrics: InstrumentProfileMetric[];
+  sources: Array<{
+    source_id: string;
+    provider_id: string;
+    label: string;
+    data_as_of: string;
+    retrieved_at: string;
+    url?: string | null;
+    plan?: string | null;
+    report_date?: string | null;
+    ex_dividend_date?: string | null;
+  }>;
+  warnings: string[];
+}
+
+export type SourceVerificationStatus =
+  | "official_primary"
+  | "live_retrieved"
+  | "source_recorded"
+  | "historical_context";
+
+export type SourceKind =
+  | "official_filing"
+  | "company_disclosure"
+  | "fund_product"
+  | "index_methodology"
+  | "index_constituents"
+  | "fund_share_scale"
+  | "market_data"
+  | "structured_financial"
+  | "consensus_data"
+  | "derived_analysis"
+  | "news"
+  | "broker_research"
+  | "fundamental"
+  | "report"
+  | "other";
+
+export interface CollectedSourceSummary {
+  observation_id?: string;
+  document_ref: string;
+  source_kind: SourceKind;
+  title: string;
+  publisher: string;
+  provider_id?: string | null;
+  published_at?: string | null;
+  retrieved_at?: string | null;
+  observed_at?: string | null;
+  source_url?: string | null;
+  source_locator?: string | null;
+  verification_status: SourceVerificationStatus;
+  body_status: "full_text" | "structured_payload" | "excerpt" | "metadata_only" | string;
+  used_by_report_count: number;
+  structured_status?: "validated" | "needs_review" | "not_applicable" | "failed" | "superseded" | null;
+  structured_metrics_count?: number;
+  ocr_performed?: boolean;
+  structured_extractor_version?: string | null;
+  structured_failed_checks?: string[];
+  structured_error?: string | null;
+  structured_auto_repair_available?: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ReportSourceLink extends CollectedSourceSummary {
+  report_id: string;
+  revision: number;
+  relation_type: "cited" | "supporting" | "input" | string;
+  evidence_ids: string[];
+  fact_ids: string[];
+  claim_ids: string[];
+  section_ids: string[];
+}
+
+export interface ResearchNoteResolution {
+  note_claim_id: string;
+  report_id: string;
+  report_claim_id: string;
+  resolution_status: "confirmed" | "contradicted" | "superseded";
+  resolved_at: string;
+}
+
+export interface ResearchNote {
+  note_claim_id: string;
+  subject_key: string;
+  session_id: string;
+  message_id: string;
+  role: "user" | "assistant";
+  text: string;
+  claim_status: string;
+  created_at: string;
+  derived_status: "unverified" | ResearchNoteResolution["resolution_status"];
+  resolutions: ResearchNoteResolution[];
+}
+
+export interface ReportSourceDocument {
+  document_id: string;
+  kind: SourceKind;
+  title: string;
+  summary?: string | null;
+  publisher: string;
+  provider?: string | null;
+  analyst?: string | string[] | null;
+  association_scope?: "direct_subject" | "etf_product" | "tracking_index" | "industry_theme" | "key_constituent" | string | null;
+  related_symbol?: string | null;
+  evidence_level?: "A" | "B" | "C" | "D" | null;
+  published_at?: string | null;
+  retrieved_at: string;
+  source_url?: string | null;
+  source_locator?: string | null;
+  verification_status: SourceVerificationStatus;
+  body_status?: string;
+  used_by_report_count?: number;
+  structured_status?: CollectedSourceSummary["structured_status"];
+  structured_metrics_count?: number;
+  ocr_performed?: boolean;
+  structured_extractor_version?: string | null;
+  structured_failed_checks?: string[];
+  structured_error?: string | null;
+  structured_auto_repair_available?: boolean;
+  reporting_year?: number | null;
+  filing_type?: string | null;
+  metrics: Array<{ label: string; value: number; unit: string }>;
+}
+
+export interface ReportSourceBundle {
+  symbol: string;
+  generated_at?: string | null;
+  traceable_count: number;
+  excluded_count: number;
+  verification_counts: Record<SourceVerificationStatus, number>;
+  domains: Array<{
+    kind: ReportSourceDocument["kind"];
+    label: string;
+    description: string;
+    document_count: number;
+    documents: ReportSourceDocument[];
+  }>;
+  verification_contract: Record<SourceVerificationStatus, string>;
+}
+
+export interface AnnualReportCoverage {
+  symbol: string;
+  requested_years: number[];
+  covered_years: number[];
+  archived_years?: number[];
+  analysis_ready_years?: number[];
+  needs_review_years?: number[];
+  unusable_years?: number[];
+  missing_years: number[];
+  coverage_ratio: number;
+  analysis_ready_ratio?: number;
+  documents_by_year: Record<string, Array<{
+    document_ref: string;
+    title: string;
+    source_url?: string | null;
+    structured_status?: string | null;
+  }>>;
+  unusable_documents_by_year?: Record<string, Array<{
+    document_ref: string;
+    title: string;
+    source_url?: string | null;
+    structured_status?: string | null;
+  }>>;
+}
+
+export interface AnnualReportBackfillResult {
+  symbol: string;
+  status: "completed" | "completed_with_gaps";
+  collection_scope: "historical_annual_reports";
+  refreshed: number;
+  failed: number;
+  document_refs: string[];
+  coverage: AnnualReportCoverage;
+  provider_attempts: Array<Record<string, unknown>>;
+  structured: Record<string, unknown>;
+}
+
+export interface AnnualReportBackfillJobResult {
+  symbol: string;
+  status: "completed" | "completed_with_gaps";
+  refreshed: number;
+  failed: number;
+  document_refs: string[];
+  relevance_downgraded?: boolean;
+  coverage: AnnualReportCoverage;
+  structured: Record<string, unknown>;
+}
+
+export type AnnualReportBackfillJobStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "completed_with_gaps"
+  | "failed"
+  | "cancelled"
+  | "interrupted";
+
+export type AnnualReportBackfillPhaseStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "reused"
+  | "failed";
+
+export interface AnnualReportBackfillYearProgress {
+  year: number;
+  status: string;
+  current_stage: string;
+  message: string;
+  provider_id?: string | null;
+  document_ref?: string | null;
+  error?: string | null;
+  updated_at?: string | null;
+  phases: Record<"discovery" | "download" | "parsing" | "validation", AnnualReportBackfillPhaseStatus>;
+}
+
+export interface AnnualReportBackfillJob {
+  schema_version: number;
+  job_id: string;
+  symbol: string;
+  years: number[];
+  force: boolean;
+  status: AnnualReportBackfillJobStatus;
+  stage: string;
+  message: string;
+  progress_pct: number;
+  year_progress: AnnualReportBackfillYearProgress[];
+  result?: AnnualReportBackfillJobResult | null;
+  error?: string | null;
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  updated_at: string;
+}
+
+export interface AnnualReportBackfillJobAccepted {
+  status: "accepted";
+  job_id: string;
+  deduplicated: boolean;
+  job: AnnualReportBackfillJob;
+}
+
+export interface ReportLibrarySubject {
+  subject_type?: "symbol" | "portfolio" | null;
+  subject_key: string;
+  symbol?: string | null;
+  security_name?: string | null;
+  report_count?: number;
+  latest_generated_at?: string | null;
+  current: Record<ReportHorizon, {
+    latest: ReportLibraryCurrentCandidate | null;
+    latest_complete: ReportLibraryCurrentCandidate | null;
+  }>;
+  timeline: ReportLibraryRecord[];
+  instrument_profile?: InstrumentProfileSnapshot | null;
+  etf_universe?: ETFUniverseProfile | null;
+  etf_product?: ETFProductProfile | null;
+  historical_percentile?: InstrumentHistoricalPercentileSnapshot | null;
+  etf_valuation_percentile?: ETFValuationPercentileSnapshot | null;
+  component_research?: Record<string, unknown> | null;
+  source_bundle?: ReportSourceBundle | null;
+  profile?: {
+    etf?: {
+      instrument?: InstrumentProfileSnapshot | null;
+      universe?: ETFUniverseProfile | null;
+      product?: ETFProductProfile | null;
+      historical_percentile?: InstrumentHistoricalPercentileSnapshot | null;
+      valuation_percentile?: ETFValuationPercentileSnapshot | null;
+      component_research?: Record<string, unknown> | null;
+    };
+    equity?: {
+      instrument?: InstrumentProfileSnapshot | null;
+      historical_percentile?: InstrumentHistoricalPercentileSnapshot | null;
+      component_research?: Record<string, unknown> | null;
+    };
+    index?: {
+      instrument?: InstrumentProfileSnapshot | null;
+      historical_percentile?: InstrumentHistoricalPercentileSnapshot | null;
+      component_research?: Record<string, unknown> | null;
+    };
+  };
+}
+
+export interface ReportLibrarySubjectSummary {
+  subject_key: string;
+  symbol?: string | null;
+  security_name: string;
+  report_count: number;
+  new_report_count: number;
+  latest_generated_at: string;
+  latest_data_as_of?: string | null;
+  research_note_count: number;
+  confirmed_note_count: number;
+  broker_research_count: number;
+  report_kinds: ReportKind[];
+  current_viewpoint_summary?: string;
+  quality_summary: { passed: number; complete: number };
+  latest_report: Pick<
+    ReportLibraryRecord,
+    | "report_id"
+    | "report_kind"
+    | "subject_key"
+    | "symbol"
+    | "security_name"
+    | "status"
+    | "report_quality_status"
+    | "coverage_status"
+    | "generated_at"
+    | "data_as_of"
+    | "report_period"
+  > | null;
+}
+
+export interface ReportLibraryComparison {
+  selected: Array<{
+    report_id: string;
+    report_kind: ReportLibraryRecord["report_kind"];
+    subject_key: string;
+    symbol?: string | null;
+    security_name?: string | null;
+    data_as_of: string;
+    generated_at: string;
+    viewpoint: ReportLibraryViewpoint;
+    claims: Array<{ claim_id: string; section_id?: string | null; text: string }>;
+  }>;
+  deltas: Array<{
+    base_report_id: string;
+    current_report_id: string;
+    relation: "continued" | "updated" | "diverged" | "different_horizon" | "not_comparable";
+    changes: Record<string, { before: unknown; after: unknown }>;
+    research_delta: ResearchDelta | Record<string, unknown>;
+  }>;
+  ai_summary: {
+    status: "not_requested" | "disabled" | "unavailable" | "completed";
+    summary?: string;
+    items?: Array<{
+      text: string;
+      citations: Array<{ report_id: string; claim_id: string; section_id?: string | null }>;
+    }>;
+  };
+}
+
 export interface RunReportPreview {
   run_id: string;
   title: string;
@@ -181,11 +903,21 @@ export interface RunReportPreview {
   source: "run_artifact" | string;
 }
 
+export interface ReportArtifactDeliveryResult {
+  status: string;
+  filename: string;
+  target_id: string;
+  target_name?: string;
+  provider?: string;
+  remote_message_id?: string;
+}
+
 export interface EquityResolutionOption {
   symbol: string;
   security_name: string;
   market?: string | null;
   source?: string | null;
+  instrument_type?: "company_equity" | "etf" | "index";
 }
 
 export interface EquityResolution {
@@ -195,6 +927,7 @@ export interface EquityResolution {
   security_name?: string;
   market?: string | null;
   source?: string | null;
+  instrument_type?: "company_equity" | "etf" | "index";
   options: EquityResolutionOption[];
   source_statuses?: Record<string, string>;
 }
@@ -287,6 +1020,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ query }),
     }),
+  resolveDeepReportInstrument: (query: string) =>
+    request<EquityResolution>("/reports/resolve-instrument", {
+      method: "POST",
+      body: JSON.stringify({ query }),
+    }),
   getDeepReport: (reportId: string, includeContent = false) =>
     request<DeepReportRecord>(`/reports/${encodeURIComponent(reportId)}${includeContent ? "?include_content=true" : ""}`),
   searchResearchKnowledge: (params: {
@@ -310,8 +1048,229 @@ export const api = {
     request<ResearchSymbolHistory>(
       `/research/symbols/${encodeURIComponent(symbol)}/history?limit=${encodeURIComponent(String(limit))}`,
     ),
-  deepReportArtifactUrl: (reportId: string, artifactId: "markdown" | "pdf" | "diagnostic" | "diff") =>
-    withAuthQuery(`${BASE}/reports/${encodeURIComponent(reportId)}/artifacts/${artifactId}`),
+  listReportLibrary: (params: {
+    query?: string;
+    subjectType?: "symbol" | "portfolio";
+    reportKind?: string;
+    horizon?: ReportHorizon;
+    status?: string;
+    quality?: string;
+    startAt?: string;
+    endAt?: string;
+    limit?: number;
+    cursor?: string;
+  } = {}) => {
+    const query = new URLSearchParams();
+    if (params.query) query.set("query", params.query);
+    if (params.subjectType) query.set("subject_type", params.subjectType);
+    if (params.reportKind) query.set("report_kind", params.reportKind);
+    if (params.horizon) query.set("horizon", params.horizon);
+    if (params.status) query.set("status", params.status);
+    if (params.quality) query.set("quality", params.quality);
+    if (params.startAt) query.set("start_at", params.startAt);
+    if (params.endAt) query.set("end_at", params.endAt);
+    if (params.limit) query.set("limit", String(params.limit));
+    if (params.cursor) query.set("cursor", params.cursor);
+    const suffix = query.toString();
+    return request<{ reports: ReportLibraryRecord[]; next_cursor?: string | null; total_count: number }>(
+      `/report-library/reports${suffix ? `?${suffix}` : ""}`,
+    );
+  },
+  listReportLibrarySubjects: (params: {
+    query?: string;
+    reportKind?: ReportKind;
+    quality?: string;
+    startAt?: string;
+    endAt?: string;
+    limit?: number;
+    cursor?: string;
+  } = {}) => {
+    const query = new URLSearchParams();
+    if (params.query) query.set("query", params.query);
+    if (params.reportKind) query.set("report_kind", params.reportKind);
+    if (params.quality) query.set("quality", params.quality);
+    if (params.startAt) query.set("start_at", params.startAt);
+    if (params.endAt) query.set("end_at", params.endAt);
+    if (params.limit) query.set("limit", String(params.limit));
+    if (params.cursor) query.set("cursor", params.cursor);
+    const suffix = query.toString();
+    return request<{ subjects: ReportLibrarySubjectSummary[]; next_cursor?: string | null; total_count: number }>(
+      `/report-library/subjects${suffix ? `?${suffix}` : ""}`,
+    );
+  },
+  getReportLibrarySubject: (
+    subjectKey: string,
+    limit = 100,
+    options: { includeTimeline?: boolean; includeSourceDocuments?: boolean } = {},
+  ) => {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (typeof options.includeTimeline === "boolean") query.set("include_timeline", String(options.includeTimeline));
+    if (typeof options.includeSourceDocuments === "boolean") query.set("include_source_documents", String(options.includeSourceDocuments));
+    return (
+    request<ReportLibrarySubject>(
+      `/report-library/subjects/${encodeURIComponent(subjectKey)}?${query.toString()}`,
+    ));
+  },
+  getReportLibrarySubjectReports: (
+    subjectKey: string,
+    params: { limit?: number; cursor?: string } = {},
+  ) => {
+    const query = new URLSearchParams();
+    if (params.limit) query.set("limit", String(params.limit));
+    if (params.cursor) query.set("cursor", params.cursor);
+    const suffix = query.toString();
+    return request<{ reports: ReportLibraryRecord[]; next_cursor?: string | null; total_count: number }>(
+      `/report-library/subjects/${encodeURIComponent(subjectKey)}/reports${suffix ? `?${suffix}` : ""}`,
+    );
+  },
+  getReportLibrarySubjectSources: (
+    subjectKey: string,
+    params: {
+      sourceKind?: SourceKind;
+      verificationStatus?: SourceVerificationStatus;
+      usedByReport?: boolean;
+      publisher?: string;
+      publishedSince?: string;
+      limit?: number;
+      cursor?: string;
+    } = {},
+  ) => {
+    const query = new URLSearchParams();
+    if (params.sourceKind) query.set("source_kind", params.sourceKind);
+    if (params.verificationStatus) query.set("verification_status", params.verificationStatus);
+    if (typeof params.usedByReport === "boolean") query.set("used_by_report", String(params.usedByReport));
+    if (params.publisher) query.set("publisher", params.publisher);
+    if (params.publishedSince) query.set("published_since", params.publishedSince);
+    if (params.limit) query.set("limit", String(params.limit));
+    if (params.cursor) query.set("cursor", params.cursor);
+    const suffix = query.toString();
+    return request<{ subject_key: string; sources: CollectedSourceSummary[]; next_cursor?: string | null }>(
+      `/report-library/subjects/${encodeURIComponent(subjectKey)}/sources${suffix ? `?${suffix}` : ""}`,
+    );
+  },
+  getReportLibraryResearchNotes: (
+    subjectKey: string,
+    params: { status?: ResearchNote["derived_status"]; limit?: number; cursor?: string } | number = {},
+  ) => {
+    const normalized = typeof params === "number" ? { limit: params } : params;
+    const query = new URLSearchParams();
+    if (normalized.status) query.set("status", normalized.status);
+    if (normalized.limit) query.set("limit", String(normalized.limit));
+    if (normalized.cursor) query.set("cursor", normalized.cursor);
+    return request<{
+      subject_key: string;
+      notes: ResearchNote[];
+      counts: Record<ResearchNote["derived_status"], number>;
+      total_count: number;
+      next_cursor?: string | null;
+    }>(`/report-library/subjects/${encodeURIComponent(subjectKey)}/research-notes?${query.toString()}`);
+  },
+  refreshReportLibrarySources: (subjectKey: string, force = true) =>
+    request<Record<string, unknown>>(
+      `/report-library/subjects/${encodeURIComponent(subjectKey)}/sources/refresh?force=${force ? "true" : "false"}`,
+      { method: "POST" },
+    ),
+  getReportLibraryAnnualReportCoverage: (subjectKey: string, startYear: number, endYear: number) =>
+    request<AnnualReportCoverage>(
+      `/report-library/subjects/${encodeURIComponent(subjectKey)}/annual-reports/coverage?start_year=${encodeURIComponent(String(startYear))}&end_year=${encodeURIComponent(String(endYear))}`,
+    ),
+  backfillReportLibraryAnnualReports: (subjectKey: string, years: number[], force = false) =>
+    request<AnnualReportBackfillResult>(
+      `/report-library/subjects/${encodeURIComponent(subjectKey)}/annual-reports/backfill`,
+      {
+        method: "POST",
+        body: JSON.stringify({ years, force }),
+      },
+    ),
+  startReportLibraryAnnualReportBackfill: (subjectKey: string, years: number[], force = false) =>
+    request<AnnualReportBackfillJobAccepted>(
+      `/report-library/subjects/${encodeURIComponent(subjectKey)}/annual-reports/backfill-jobs`,
+      {
+        method: "POST",
+        body: JSON.stringify({ years, force }),
+      },
+    ),
+  getReportLibraryAnnualReportBackfillJob: (subjectKey: string, jobId: string) =>
+    request<AnnualReportBackfillJob>(
+      `/report-library/subjects/${encodeURIComponent(subjectKey)}/annual-reports/backfill-jobs/${encodeURIComponent(jobId)}`,
+    ),
+  getLatestReportLibraryAnnualReportBackfillJob: (subjectKey: string) =>
+    request<{ job: AnnualReportBackfillJob | null }>(
+      `/report-library/subjects/${encodeURIComponent(subjectKey)}/annual-reports/backfill-jobs/latest`,
+    ),
+  rebuildReportLibraryFinancialSnapshots: (subjectKey: string, force = true) =>
+    request<Record<string, unknown>>(
+      `/report-library/subjects/${encodeURIComponent(subjectKey)}/financial-snapshots/rebuild?force=${force ? "true" : "false"}`,
+      { method: "POST" },
+    ),
+  refreshReportLibraryInstrumentProfile: (subjectKey: string) =>
+    request<InstrumentProfileSnapshot>(
+      `/report-library/subjects/${encodeURIComponent(subjectKey)}/instrument-profile/refresh`,
+      { method: "POST" },
+    ),
+  refreshReportLibraryHistoricalPercentile: (subjectKey: string) =>
+    request<InstrumentHistoricalPercentileSnapshot>(
+      `/report-library/subjects/${encodeURIComponent(subjectKey)}/historical-percentile/refresh`,
+      { method: "POST" },
+    ),
+  refreshReportLibraryETFProfile: (subjectKey: string) =>
+    request<{
+      status: "completed" | "completed_with_gaps";
+      symbol: string;
+      profile: ETFProductProfile;
+      valuation_percentile?: ETFValuationPercentileSnapshot | null;
+      sources: Record<string, string>;
+      errors: unknown[];
+    }>(
+      `/report-library/subjects/${encodeURIComponent(subjectKey)}/etf-profile/refresh`,
+      { method: "POST" },
+    ),
+  getReportLibraryItem: (reportId: string) =>
+    request<ReportLibraryRecord>(`/report-library/reports/${encodeURIComponent(reportId)}`),
+  getReportLibrarySources: (reportId: string, limit = 100) =>
+    request<{ report_id: string; sources: ReportSourceLink[] }>(
+      `/report-library/reports/${encodeURIComponent(reportId)}/sources?limit=${encodeURIComponent(String(limit))}`,
+    ),
+  compareReportLibrary: (
+    items: Array<{ report_id: string; horizon: ReportHorizon }>,
+    includeAiSummary = false,
+  ) => request<ReportLibraryComparison>("/report-library/comparisons", {
+    method: "POST",
+    body: JSON.stringify({ items, include_ai_summary: includeAiSummary }),
+  }),
+  reconcileReportLibrary: () => request<Record<string, unknown>>("/report-library/reconcile", {
+    method: "POST",
+  }),
+  reportLibraryArtifactUrl: (
+    artifact: ReportLibraryArtifact,
+    mode: "preview" | "download" = "preview",
+  ) => artifact.url
+    ? withAuthQuery(appendQueryParam(`${BASE}${artifact.url}`, "download", mode === "download" ? "1" : "0"))
+    : "#",
+  deepReportArtifactUrl: (
+    reportId: string,
+    artifactId: "markdown" | "pdf" | "diagnostic" | "diff" | "monitoring_bundle",
+    mode: "preview" | "download" = "download",
+  ) => withAuthQuery(appendQueryParam(
+    `${BASE}/reports/${encodeURIComponent(reportId)}/artifacts/${artifactId}`,
+    "download",
+    mode === "download" ? "1" : "0",
+  )),
+  runReportArtifactUrl: (runId: string, mode: "preview" | "download" = "preview") =>
+    withAuthQuery(appendQueryParam(
+      `${BASE}/runs/${encodeURIComponent(runId)}/report-artifact`,
+      "download",
+      mode === "download" ? "1" : "0",
+    )),
+  sendReportArtifactToFeishu: (payload: {
+    source: "report_library" | "deep_report" | "run";
+    report_id: string;
+    artifact_id: string;
+    target_id?: string;
+  }) => request<ReportArtifactDeliveryResult>("/reports/send-to-feishu", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  }),
   followUpDeepReport: (reportId: string, content?: string) =>
     request<{ message_id: string; attempt_id: string; parent_report_id: string }>(`/reports/${encodeURIComponent(reportId)}/followups`, {
       method: "POST",
@@ -326,6 +1285,22 @@ export const api = {
     request<{ message_id: string; attempt_id: string; parent_report_id: string; revision_mode: "full_refresh" }>(`/reports/${encodeURIComponent(reportId)}/refresh`, {
       method: "POST",
       body: JSON.stringify({ instructions: instructions || "使用最新可验证数据重新研究。" }),
+    }),
+  enrichDeepReport: (reportId: string, instructions?: string) =>
+    request<{
+      message_id: string;
+      attempt_id: string;
+      parent_report_id: string;
+      revision_mode: "full_refresh";
+      research_depth: "extended";
+      token_notice_acknowledged: true;
+    }>(`/reports/${encodeURIComponent(reportId)}/refresh`, {
+      method: "POST",
+      body: JSON.stringify({
+        instructions: instructions || "用户已明确同意扩展资料搜集，并知悉这会增加研究耗时和 Token 消耗；请优先补齐当前报告中缺少的往年数据、可比期间和关键来源。",
+        research_depth: "extended",
+        consent_to_extended_research: true,
+      }),
     }),
   reviseDeepReport: (reportId: string, sectionIds: string[], instructions: string) =>
     request<{ message_id: string; attempt_id: string; parent_report_id: string }>(`/reports/${encodeURIComponent(reportId)}/revisions`, {
@@ -404,6 +1379,26 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(settings),
     }),
+  getFeishuDeliverySettings: () =>
+    request<FeishuDeliverySettings>("/settings/feishu-delivery"),
+  updateFeishuDeliverySettings: (defaultTargetId?: string | null) =>
+    request<FeishuDeliverySettings>("/settings/feishu-delivery", {
+      method: "PUT",
+      body: JSON.stringify({ default_target_id: defaultTargetId || null }),
+    }),
+  createFeishuDeliveryBindingCode: () =>
+    request<MonitorDeliveryBindingAttempt>("/settings/feishu-delivery/binding-codes", {
+      method: "POST",
+    }),
+  getFeishuDeliveryBindingCode: (bindingId: string) =>
+    request<MonitorDeliveryBindingAttempt>(
+      `/settings/feishu-delivery/binding-codes/${encodeURIComponent(bindingId)}`,
+    ),
+  revokeFeishuDeliveryTarget: (targetId: string) =>
+    request<MonitorDeliveryTarget>(
+      `/settings/feishu-delivery/targets/${encodeURIComponent(targetId)}/revoke`,
+      { method: "POST" },
+    ),
   getCodexCliStatus: () => request<CodexCliStatus>("/settings/codex-cli/status"),
   openCodexCliLogin: () => request<CodexCliLoginResult>("/settings/codex-cli/login", {
     method: "POST",
@@ -450,6 +1445,19 @@ export const api = {
       method: "POST",
       body: JSON.stringify(symbol ? { symbol } : {}),
     }),
+  listPortfolioWeeklyRuns: (limit = 30) =>
+    request<{ runs: PortfolioWeeklyRun[] }>(`/portfolio/weekly-runs?limit=${encodeURIComponent(String(limit))}`),
+  startPortfolioWeeklyRuns: (body: StartPortfolioWeeklyRunsRequest = {}) =>
+    request<{ runs: PortfolioWeeklyRun[] }>("/portfolio/weekly-runs", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  getPortfolioWeeklyRun: (runId: string) =>
+    request<PortfolioWeeklyRun>(`/portfolio/weekly-runs/${encodeURIComponent(runId)}`),
+  cancelPortfolioWeeklyRun: (runId: string) =>
+    request<PortfolioWeeklyRun>(`/portfolio/weekly-runs/${encodeURIComponent(runId)}/cancel`, { method: "POST" }),
+  retryPortfolioWeeklyRun: (runId: string) =>
+    request<PortfolioWeeklyRun>(`/portfolio/weekly-runs/${encodeURIComponent(runId)}/retry`, { method: "POST" }),
   listPortfolioMonitorDeliveryTargets: () =>
     request<{ targets: MonitorDeliveryTarget[] }>("/portfolio/monitor-delivery-targets"),
   bindPortfolioMonitorDeliveryTarget: (body: BindMonitorDeliveryTargetRequest) =>
@@ -552,6 +1560,42 @@ export const api = {
   portfolioMonitorEventsSseUrl: () => withAuthQuery(`${BASE}/portfolio/monitor-events/stream`),
   getPortfolioMonitorYmcaAudio: () => requestBlob("/portfolio/monitor-effects/ymca_v1/audio"),
   getPortfolioMonitoringStatus: () => request<PortfolioMonitoringStatus>("/portfolio/monitoring/status"),
+  listPortfolioMonitoringTargets: () =>
+    request<{ targets: MonitorTargetMonitoringCard[] }>("/portfolio/monitoring/targets"),
+  getPortfolioMonitoringDecision: (symbol: string) =>
+    request<MonitorTargetMonitoringCard>(
+      `/portfolio/monitoring/targets/${encodeURIComponent(symbol)}/decision`,
+    ),
+  setPortfolioMonitoringRiskPreference: (symbol: string, body: MonitorRiskPreferenceInput) =>
+    request<MonitorRiskPreference>(
+      `/portfolio/monitoring/risk-preferences/${encodeURIComponent(symbol)}`,
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
+  choosePortfolioMonitoringDecision: (
+    decisionId: string,
+    choiceId: string,
+    body: MonitorDecisionChoiceRequest,
+  ) => request<Record<string, unknown>>(
+    `/portfolio/monitoring/decisions/${encodeURIComponent(decisionId)}/choices/${encodeURIComponent(choiceId)}`,
+    { method: "POST", body: JSON.stringify(body) },
+  ),
+  createPortfolioMonitoringConditionDraft: (
+    decisionId: string,
+    body: MonitorConditionDraftRequest,
+  ) => request<MonitorConditionOrderDraft>(
+    `/portfolio/monitoring/decisions/${encodeURIComponent(decisionId)}/condition-order-drafts`,
+    { method: "POST", body: JSON.stringify(body) },
+  ),
+  validatePortfolioMonitoringConditionDraft: (draftId: string) =>
+    request<MonitorConditionOrderDraft>(
+      `/portfolio/monitoring/condition-order-drafts/${encodeURIComponent(draftId)}/validate`,
+      { method: "POST" },
+    ),
+  cancelPortfolioMonitoringConditionDraft: (draftId: string) =>
+    request<MonitorConditionOrderDraft>(
+      `/portfolio/monitoring/condition-order-drafts/${encodeURIComponent(draftId)}/cancel`,
+      { method: "POST" },
+    ),
   getPortfolioMonitoringAutopilot: () =>
     request<MonitorAutopilotConfig>("/portfolio/monitoring/autopilot"),
   configurePortfolioMonitoringAutopilot: (body: MonitorAutopilotUpdate) =>
@@ -639,6 +1683,18 @@ export const api = {
     }),
   deletePortfolioTrade: (tradeId: string) =>
     request<PortfolioReview>(`/portfolio/trades/${encodeURIComponent(tradeId)}`, { method: "DELETE" }),
+  reversePortfolioTrade: (tradeId: string) =>
+    request<PortfolioReview>(`/portfolio/trades/${encodeURIComponent(tradeId)}/reversal`, { method: "POST" }),
+  previewPortfolioReconciliation: (body: PortfolioReconciliationPreviewRequest) =>
+    request<PortfolioReconciliation>("/portfolio/reconciliation/preview", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  commitPortfolioReconciliation: (reconciliationId: string, expectedRevision: number) =>
+    request<PortfolioReconciliationCommit>(
+      `/portfolio/reconciliation/${encodeURIComponent(reconciliationId)}/commit`,
+      { method: "POST", body: JSON.stringify({ expected_revision: expectedRevision }) },
+    ),
   refreshPortfolioMarketData: (body: PortfolioMarketRefreshRequest = {}) =>
     request<PortfolioReview>("/portfolio/refresh-market-data", {
       method: "POST",
@@ -834,6 +1890,7 @@ export interface UpdateDataSourceSettingsRequest {
 export interface ResearchSettings {
   deep_report_enabled: boolean;
   equity_deep_research_enabled: boolean;
+  etf_deep_research_enabled: boolean;
   monitor_auto_deep_report_enabled: boolean;
   effective_monitor_auto_deep_report_enabled: boolean;
   deep_research_engine: "provider" | "codex_cli";
@@ -933,7 +1990,56 @@ export interface RecordPortfolioTradeRequest {
   quantity: number;
   price: number;
   trade_date?: string;
+  fees?: number;
+  taxes?: number;
+  broker_reported_pnl?: number;
+  idempotency_key?: string;
   notes?: string;
+}
+
+export interface PortfolioReconciliationPreviewRequest {
+  raw_text?: string;
+  holdings?: Array<Record<string, unknown>>;
+  trades?: Array<Record<string, unknown>>;
+  cash?: number | null;
+  cash_currency?: string;
+  broker_reported_pnl?: number | null;
+  source_label?: string;
+}
+
+export interface PortfolioReconciliationDiff {
+  symbol: string;
+  status: "added" | "removed" | "changed" | string;
+  changes: Record<string, { current?: number | null; broker?: number | null }>;
+}
+
+export interface PortfolioReconciliationPreview {
+  base_revision: number;
+  holding_diffs: PortfolioReconciliationDiff[];
+  missing_ledger_event_ids: string[];
+  extra_ledger_event_ids: string[];
+  suspicious_events: Array<Record<string, unknown>>;
+  broker_reported_pnl?: number | null;
+  computed_realized_pnl?: number | null;
+  unexplained_pnl?: number | null;
+  pnl_status: string;
+  requires_explicit_commit: boolean;
+  target_state: PortfolioStateSnapshot;
+}
+
+export interface PortfolioReconciliation {
+  reconciliation_id: string;
+  status: string;
+  base_revision: number;
+  request: PortfolioReconciliationPreviewRequest;
+  preview: PortfolioReconciliationPreview;
+  created_at: string;
+  committed_at?: string | null;
+}
+
+export interface PortfolioReconciliationCommit extends PortfolioReconciliation {
+  state: PortfolioStateSnapshot;
+  deduplicated: boolean;
 }
 
 export interface EditPortfolioHoldingRequest {
@@ -1106,6 +2212,17 @@ export interface PortfolioStateSnapshot {
   cash?: number | null;
   cash_currency?: string;
   updated_at?: string | null;
+  schema_version?: number;
+  revision?: number;
+  provenance?: Record<string, unknown>;
+  performance?: {
+    realized_pnl?: number | null;
+    cash_dividends?: number | null;
+    fees_and_taxes?: number | null;
+    broker_reported_pnl?: number | null;
+    status?: "broker_reported" | "exact" | "estimated" | "unavailable" | string;
+    unexplained_difference?: number | null;
+  };
 }
 
 export interface PortfolioTrade extends Record<string, unknown> {
@@ -1258,6 +2375,41 @@ export interface PortfolioDailyRun {
   input_outdated_reasons?: string[];
 }
 
+export interface PortfolioWeeklyRun {
+  run_id: string;
+  report_id: string;
+  run_key: string;
+  symbol: string;
+  security_name?: string;
+  week_start: string;
+  week_end: string;
+  status: "queued" | "running" | "cancelling" | "completed" | "completed_with_warnings" | "failed" | "cancelled" | string;
+  stage: string;
+  progress: { completed: number; total: number; percent: number };
+  refresh_policy: "ensure_fresh" | "force" | "reuse";
+  report_profile: string;
+  report_audience?: "user";
+  quality_status?: "passed" | "passed_with_gaps" | "failed_validation";
+  coverage_status?: "complete" | "partial" | "insufficient";
+  analysis_gate?: Record<string, unknown>;
+  warnings?: string[];
+  error?: string | null;
+  artifacts?: PortfolioDailyRunArtifact[];
+  action_ready_count?: number;
+  watch_only_count?: number;
+  previous_validation_count?: number;
+  scenario_change_count?: number;
+  valid_from?: string;
+  valid_until?: string;
+  review_due_at?: string;
+  source_valid_until?: string;
+  catalog_status?: string;
+  created_at: string;
+  completed_at?: string | null;
+  deduplicated?: boolean;
+  revision?: number;
+}
+
 export type MonitorProfileStatus = "drafting" | "pending_review" | "active" | "paused" | "expired" | "closed";
 export type MonitorAlertCue = "none" | "ymca_v1";
 export type MonitorRuleKind =
@@ -1301,6 +2453,19 @@ export interface MonitorPriceVolumeSnapshot {
   close_location: number | null;
   accelerated_decline: boolean;
   reason_codes: string[];
+  analysis_scope?: "live" | "historical";
+  data_as_of?: string | null;
+  volume_quality?: "verified" | "single_source" | "conflict" | "unavailable" | string;
+  volume_source_count?: number;
+  volume_sources?: string[];
+  volume_unit?: string | null;
+  interpretation?: {
+    bias: "bullish" | "bearish" | "mixed" | "neutral" | string;
+    meaning: string;
+    risk: string;
+    next_confirmation: string;
+    confidence: "high" | "medium" | "low" | string;
+  };
 }
 
 export type MonitorTargetAssessmentDecision =
@@ -1371,12 +2536,24 @@ export interface MonitorPlan {
   near_trigger_distance_bps: number;
   price_volume_policy?: MonitorPriceVolumePolicy;
   analysis_ref?: MonitorAnalysisRef;
+  source_horizon?: "daily" | "weekly" | "structural";
+  source_report_id?: string;
+  source_period?: Record<string, string>;
+  source_valid_until?: string;
+  review_due_at?: string;
   watch_scenarios?: MonitorWatchScenario[];
   market_rules: MonitorRule[];
   news_topics: Array<{ semantic_description: string; [key: string]: unknown }>;
   fundamental_monitor: { enabled: boolean; capability_status?: string; [key: string]: unknown };
   hard_valid_until: string;
   evidence_notes?: string[];
+  automation_policy?: {
+    activation_mode: "autonomous" | "manual_confirmation_required";
+    activated_by: "autopilot" | "daily_report" | "weekly_report" | "structural_report" | "report";
+    evidence_fingerprint?: string;
+    trade_execution: "forbidden";
+    trigger_type?: string;
+  };
 }
 
 export interface MonitorPlanVersion {
@@ -1390,6 +2567,7 @@ export interface MonitorPlanVersion {
   data_as_of?: string | null;
   created_at: string;
   activated_at?: string | null;
+  created_by?: "autopilot" | "monitor_planner" | string;
 }
 
 export interface MonitorProfile {
@@ -1424,6 +2602,16 @@ export interface MonitorProfile {
     price_change_pct?: number | null;
     trend?: "up" | "down" | "flat" | "unknown";
     price_volume?: MonitorPriceVolumeSnapshot | null;
+    historical_price_volume?: MonitorPriceVolumeSnapshot | null;
+    price_volume_backfill?: {
+      status: "queued" | "running" | "completed" | "failed" | string;
+      market_date?: string;
+      started_at?: string;
+      completed_at?: string;
+      refresh_status?: string;
+      deduplicated?: boolean;
+      error?: string;
+    } | null;
   } | null;
   plans?: MonitorPlanVersion[];
   display_plan?: MonitorPlanVersion | null;
@@ -1433,7 +2621,7 @@ export interface MonitorProfile {
 export interface MonitorAnalysisRef {
   snapshot_id: string;
   report_ref: string;
-  report_type: "single_stock_research" | "holding_analysis" | "daily_portfolio" | "monitor_research";
+  report_type: "single_stock_research" | "holding_analysis" | "daily_portfolio" | "weekly_review" | "monitor_research";
   title: string;
   revision: number;
   body_sha256: string;
@@ -1493,6 +2681,25 @@ export interface MonitorWatchScenario {
     coverage_status: "mapped" | "awaiting_data" | "ambiguous" | "unsupported";
     reason?: string;
     evidence_refs: string[];
+    research_condition?: {
+      source_text: string;
+      kind: string;
+      operator: string;
+      interval: "1d" | "1w";
+      value?: number;
+      lower?: number;
+      upper?: number;
+      baseline?: string;
+      threshold?: number;
+      consecutive?: number;
+      lookback?: number;
+      metric?: string;
+      unit?: string;
+    };
+    executable_mapping?: {
+      coverage_status: "mapped" | "awaiting_data" | "ambiguous" | "unsupported";
+      reason?: string;
+    };
   }>;
   entry_conditions?: MonitorConditionGroup;
   confirmation_conditions?: MonitorConditionGroup;
@@ -1505,7 +2712,197 @@ export interface MonitorWatchScenario {
   };
   automation_status?: "action_ready" | "watch_only";
   scenario_fingerprint?: string;
+  candidate_id?: string;
+  scenario_family_id?: string;
+  priority?: "normal" | "high";
+  calculation_basis?: {
+    method: string;
+    method_label: string;
+    formula: string;
+    summary: string;
+    recommended_value: number;
+    references: Array<{ label: string; value?: number; date?: string }>;
+  };
+  claim_ids?: string[];
+  interpretation?: {
+    price_only: string;
+    confirmed: string;
+    divergence: string;
+    invalidated: string;
+    insufficient_data: string;
+    bullish_case: string;
+    bearish_case: string;
+  };
+  mapping_status?: "mapped" | "partial";
+  change_type?: "new" | "unchanged" | "raised" | "lowered" | "modified" | "withdrawn" | "expired";
+  previous_candidate_id?: string | null;
+  change_details?: {
+    previous_level?: number;
+    current_level?: number;
+    delta?: number;
+    summary?: string;
+  };
 }
+
+export interface ReportMonitoringBundle {
+  schema_version: 1;
+  symbol: string;
+  instrument_type: "etf" | "company_equity";
+  horizon: "daily" | "weekly";
+  generated_at: string;
+  data_as_of: string;
+  valid_from: string;
+  valid_until: string;
+  review_due_at: string;
+  source_valid_until?: string;
+  expired_reason?: string | null;
+  early_invalidation_conditions?: string[];
+  price_basis: { adjustment: "raw"; currency: "CNY"; tick_size: number };
+  monitoring_status: "available" | "not_recommended" | "data_insufficient";
+  price_volume_context: {
+    policy: MonitorPriceVolumePolicy;
+    data_mode: "verified" | "single_source";
+    source_count: number;
+    sources: string[];
+    single_source_authorized: boolean;
+    warnings: string[];
+    refresh_attempted: boolean;
+    refresh_succeeded: boolean;
+  };
+  candidates: MonitorWatchScenario[];
+  scenario_changes: Array<{
+    scenario_family_id: string;
+    candidate_id?: string | null;
+    previous_candidate_id?: string | null;
+    change_type: "new" | "unchanged" | "raised" | "lowered" | "modified" | "withdrawn" | "expired";
+    change_details: Record<string, unknown>;
+    field_changes?: Array<{ field: string; before: unknown; after: unknown }>;
+    reason_claim_ids?: string[];
+  }>;
+  validation_errors: string[];
+  source: "structured_daily_report" | "structured_weekly_report";
+  source_report_id?: string;
+  source_period?: Record<string, string>;
+  activation_policy: "manual_confirmation_required";
+  trade_execution: "forbidden";
+}
+
+export type DailyMonitoringBundle = ReportMonitoringBundle & {
+  horizon: "daily";
+  source: "structured_daily_report";
+};
+
+export type WeeklyMonitoringBundle = ReportMonitoringBundle & {
+  horizon: "weekly";
+  source: "structured_weekly_report";
+};
+
+export interface WeeklyReviewSummary {
+  week_start: string;
+  week_end: string;
+  generated_at: string;
+  data_as_of: string;
+  valid_from: string;
+  valid_until: string;
+  review_due_at: string;
+  source_valid_until: string;
+  quality_status: "passed" | "passed_with_gaps" | "failed_validation";
+  coverage_status: "complete" | "partial" | "insufficient";
+  weekly_view: {
+    trend_stage: string;
+    trend_direction: string;
+    trend_strength: string;
+    week_return_pct: number;
+    relative_strength?: string;
+    volume_state?: string;
+    volatility_state?: string;
+    location_context?: string;
+    summary?: string;
+  };
+  previous_week_validation: Array<{
+    scenario_family_id: string;
+    outcome: string;
+    first_approach_at?: string | null;
+    first_trigger_at?: string | null;
+    invalidation_at?: string | null;
+    summary: string;
+  }>;
+  key_levels: Array<Record<string, unknown>>;
+  scenario_changes: ReportMonitoringBundle["scenario_changes"];
+  data_gaps: string[];
+}
+
+export interface StructuralMonitoringCandidate {
+  scenario_id: string;
+  label: string;
+  intent:
+    | "structural_invalidation"
+    | "major_support"
+    | "major_resistance"
+    | "breakout_confirmation"
+    | "trend_recovery"
+    | "research_review";
+  level?:
+    | { kind: "point"; price: number }
+    | { kind: "range"; low: number; high: number }
+    | null;
+  proximity_conditions: string[];
+  price_trigger_conditions: string[];
+  confirmation_conditions: string[];
+  volume_conditions: string[];
+  invalidation_conditions: string[];
+  observation_window: string;
+  recommended_action: string;
+  source_text: string;
+  section_id: string;
+  machine_expressible: boolean;
+  actionability: "action_ready" | "watch_only";
+  lineage: {
+    status: "complete" | "claim_not_resolved" | "claim_support_insufficient";
+    claim_support_status: "verified" | "triangulated" | "weak" | "conflicted" | "insufficient";
+    claim_ids: string[];
+    fact_ids: string[];
+    evidence_ids: string[];
+    reference_numbers: number[];
+  };
+}
+
+export interface StructuralMonitoringBundle {
+  schema_version: 1;
+  report_id: string;
+  report_revision: number;
+  symbol: string;
+  instrument_type: "etf" | "company_equity" | "index";
+  report_profile: string;
+  horizon: "structural";
+  generated_at: string;
+  data_as_of: string;
+  valid_from: string;
+  valid_until: string;
+  review_due_at: string;
+  price_basis: { adjustment: "raw"; currency: "CNY"; tick_size: number };
+  report_quality_status: "passed" | "passed_with_gaps";
+  monitoring_status: "available" | "not_recommended" | "data_insufficient";
+  activation_policy: "manual_confirmation_required";
+  trade_execution: "forbidden";
+  structural_context: {
+    trend_stage: "下降" | "震荡" | "筑底" | "上升" | "unknown";
+    trend_direction: "向上" | "向下" | "横盘" | "unknown";
+    trend_strength: "强" | "中" | "弱" | "unknown";
+    thesis_state: "intact" | "weakening" | "invalidated" | "unknown";
+    structural_levels: Array<Record<string, unknown>>;
+    thesis_invalidation_conditions: string[];
+    review_triggers: string[];
+  };
+  candidates: StructuralMonitoringCandidate[];
+  integrity: {
+    report_sha256: string;
+    references_sha256: string;
+    bundle_sha256: string;
+  };
+}
+
+export type MonitoringBundle = ReportMonitoringBundle | StructuralMonitoringBundle;
 
 export interface MonitorConditionGroup {
   operator: "all" | "any";
@@ -1554,6 +2951,13 @@ export interface MonitorDeliveryTarget {
   session_key: string;
   status: "active" | "revoked";
   created_at: string;
+}
+
+export interface FeishuDeliverySettings {
+  targets: MonitorDeliveryTarget[];
+  default_target_id?: string | null;
+  effective_target_id?: string | null;
+  requires_selection: boolean;
 }
 
 export interface BindMonitorDeliveryTargetRequest {
@@ -1722,6 +3126,189 @@ export interface MonitorAutopilotRun {
   blocked_reasons?: string[];
   validation_errors?: string[];
   detail_error?: string | null;
+  build_state?: {
+    status: "building" | "active" | "blocked" | "failed" | "cancelled";
+    stage: string;
+    stage_label: string;
+    progress_percent: number;
+    planner_status?: string;
+    item_status?: string;
+    attempt: number;
+    profile_id?: string | null;
+    plan_version?: number | null;
+    updated_at?: string | null;
+    terminal: boolean;
+    self_repair: {
+      policy: "bounded";
+      infrastructure_retry_limit: number;
+      infrastructure_retries_used: number;
+      agent_iteration_limit: number;
+      agent_token_budget: number;
+      strategy: "verified_market_first_no_model" | "continuity_then_multi_method";
+      full_report_retry_enabled: boolean;
+      circuit_open: boolean;
+      token_spend_allowed: boolean;
+    };
+  };
+}
+
+export type MonitorTargetProfileStatus =
+  | "building"
+  | "active"
+  | "watch_only"
+  | "blocked"
+  | "superseded";
+
+export interface MonitorTargetMonitoringCard {
+  symbol: string;
+  name: string;
+  profile_id?: string | null;
+  profile_status: MonitorTargetProfileStatus;
+  build_state: NonNullable<MonitorAutopilotRun["build_state"]>;
+  blockers: Array<{
+    code:
+      | "price_series_discontinuity_unverified"
+      | "adjustment_factor_unverified"
+      | "insufficient_post_event_history"
+      | "volume_unit_conflict"
+      | "no_qualified_level"
+      | "ai_selection_invalid"
+      | "recovery_circuit_open";
+    retryable: boolean;
+    detail?: string;
+  }>;
+  continuity: Record<string, unknown>;
+  level_summary: Array<Record<string, unknown>> | Record<string, Record<string, unknown>>;
+  volume_gate: Record<string, unknown>;
+  self_repair: Record<string, unknown>;
+  decision_id: string;
+  decision_revision: number;
+  evidence_fingerprint: string;
+  level_snapshot_id?: string | null;
+  decision_brief: MonitorDecisionBrief;
+  risk_assessment: MonitorRiskAssessment;
+  level_ladder: {
+    support: MonitorDecisionLevel[];
+    resistance: MonitorDecisionLevel[];
+  };
+  action_playbook: MonitorActionPlaybook;
+  available_choices: MonitorDecisionChoice[];
+  monitoring_thesis?: Record<string, unknown>;
+  scenario_comparison?: Record<string, unknown>;
+  risk_preference?: MonitorRiskPreference | null;
+  latest_draft?: MonitorConditionOrderDraft | null;
+  thesis_changed_at?: string | null;
+  selection_mode?: string;
+  selected: boolean;
+  updated_at?: string | null;
+}
+
+export interface MonitorDecisionChoice {
+  choice_id: string;
+  label: string;
+  description: string;
+  recommended: boolean;
+  eligible_draft_type?: "add" | "reduce";
+}
+
+export interface MonitorDecisionBrief {
+  headline: string;
+  market_state: string;
+  risk_level: string;
+  risk_direction: string;
+  recommended_choice_id: string;
+  recommended_action: string;
+  summary: string;
+  why_now: string[];
+  counter_evidence: string[];
+  next_confirmation: string;
+  invalidation: string;
+  data_status: "verified" | "partial" | "blocked";
+  confidence: "high" | "medium" | "low";
+  choices: MonitorDecisionChoice[];
+}
+
+export interface MonitorRiskAssessment {
+  risk_level: string;
+  risk_direction: string;
+  risk_probability?: number | null;
+  probability_status?: string;
+  risk_impact: string;
+  estimated_impact_pct?: number | null;
+  estimated_impact_amount?: number | null;
+  data_confidence: "high" | "medium" | "low";
+  basis?: Record<string, unknown>;
+}
+
+export interface MonitorDecisionLevel extends Record<string, unknown> {
+  candidate_id?: string;
+  role?: "T0" | "S1" | "S2" | "R1" | "R2" | string;
+  lower?: number;
+  upper?: number;
+  score?: number;
+  confidence?: string;
+  automation_status?: string;
+}
+
+export interface MonitorActionPlaybook {
+  do_now: string;
+  why: string;
+  if_holds: string;
+  if_breaks: string;
+  do_not: string;
+  review_deadline: string;
+  eligible_draft_types: string[];
+}
+
+export interface MonitorRiskPreferenceInput {
+  holding_period: "short_term" | "swing" | "long_term";
+  max_risk_amount?: number | null;
+  max_risk_pct?: number | null;
+  max_add_amount?: number | null;
+  max_position_amount?: number | null;
+  minimum_reward_risk?: number | null;
+  confirmation_intervals?: Array<"5m" | "30m" | "1d">;
+  max_buy_price?: number | null;
+  min_sell_price?: number | null;
+  slippage_bps?: number | null;
+  draft_valid_minutes?: number;
+  condition_order_permission: "only_alert" | "local_draft" | "broker_export";
+  sellable_quantity?: number | null;
+  intraday_added_quantity?: number | null;
+  default_reduce_fraction?: number | null;
+}
+
+export interface MonitorRiskPreference extends MonitorRiskPreferenceInput {
+  symbol: string;
+  revision: number;
+  configured_for_sizing: boolean;
+  updated_at: string;
+}
+
+export interface MonitorDecisionChoiceRequest {
+  decision_id: string;
+  choice_id: string;
+  decision_revision: number;
+  evidence_fingerprint: string;
+  idempotency_key: string;
+}
+
+export interface MonitorConditionDraftRequest {
+  choice_id: string;
+  decision_revision: number;
+  evidence_fingerprint: string;
+}
+
+export interface MonitorConditionOrderDraft extends Record<string, unknown> {
+  draft_id: string;
+  decision_id: string;
+  symbol: string;
+  side: "buy" | "sell";
+  status: "draft" | "validated" | "needs_risk_preferences" | "constraints_failed" | "stale" | "expired" | "cancelled" | string;
+  quantity?: number | null;
+  valid_until: string;
+  trade_execution: "forbidden";
+  order_submission: "forbidden";
 }
 
 export type MonitorRecommendationFeedback = "handled" | "continue_observing" | "ignored";
@@ -1897,6 +3484,16 @@ export interface StartPortfolioDailyRunRequest {
   refresh_policy?: "ensure_fresh" | "force" | "reuse";
   report_profile?: "master_with_holding_appendices";
   force_new?: boolean;
+}
+
+export interface StartPortfolioWeeklyRunsRequest {
+  week_end?: string;
+  symbols?: string[];
+  refresh_policy?: "ensure_fresh" | "force" | "reuse";
+  report_profile?: "weekly_review_v1";
+  report_audience?: "user";
+  force_new?: boolean;
+  single_source_authorized?: boolean;
 }
 
 export type PortfolioAnalysisScope = "holding" | "portfolio" | "market";

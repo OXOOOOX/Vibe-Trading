@@ -41,6 +41,10 @@ from src.channels.research_sessions import (
     warm_market_calendar,
 )
 from src.channels.utils import get_media_dir, safe_filename
+from src.reports.etf_report_readiness import (
+    etf_readiness_reason_label,
+    etf_report_presentation,
+)
 # logging_bridge not needed (using stdlib logging)
 
 if TYPE_CHECKING:
@@ -1317,15 +1321,50 @@ class FeishuChannel(BaseChannel):
         else:
             status_lines.append("- 个股日报：今天尚未生成")
         if deep_report:
-            quality_label = {
-                "passed": "证据完整，已通过校验",
-                "passed_with_gaps": "已完成，部分结论保留",
-                "failed_validation": "尚未形成正式报告",
-            }.get(str(deep_report.get("quality_status") or ""), "状态待确认")
-            status_lines.append(
-                f"- 穿透式深度研究：第 {deep_report.get('revision') or 1} 版 · "
-                f"{quality_label}"
+            readiness = dict(deep_report.get("etf_readiness") or {})
+            is_etf = (
+                str(deep_report.get("profile") or "") == "etf_deep_research"
+                or bool(readiness)
             )
+            if is_etf:
+                presentation = etf_report_presentation(readiness)
+                metrics = dict(readiness.get("metrics") or {})
+                status_lines.append(
+                    f"- {presentation['title_label']}：第 {deep_report.get('revision') or 1} 版 · "
+                    f"成分研究覆盖 {float(metrics.get('component_research_coverage') or 0.0):.1%}"
+                )
+                if readiness.get("reason_codes"):
+                    status_lines.append(
+                        "  - 尚待补充：" + "、".join(
+                            etf_readiness_reason_label(str(item))
+                            for item in readiness.get("reason_codes") or []
+                        )
+                    )
+            else:
+                quality_label = {
+                    "passed": "证据完整，已通过校验",
+                    "passed_with_gaps": "已完成，部分结论保留",
+                    "failed_validation": "尚未形成正式报告",
+                }.get(str(deep_report.get("quality_status") or ""), "状态待确认")
+                status_lines.append(
+                    f"- 穿透式深度研究：第 {deep_report.get('revision') or 1} 版 · "
+                    f"{quality_label}"
+                )
+            delta = dict(deep_report.get("history_delta") or {})
+            coverage = dict(deep_report.get("research_coverage") or {})
+            if delta.get("base_report_id"):
+                status_lines.append(
+                    "  - 与上次相比："
+                    f"新增 {len(delta.get('added') or [])} 项，"
+                    f"更新 {len(delta.get('updated') or [])} 项，"
+                    f"待复核 {len(delta.get('stale') or []) + len(delta.get('contradicted') or [])} 项"
+                )
+            if coverage:
+                status_lines.append(
+                    "  - 资料复用："
+                    f"确认复用 {int(coverage.get('reused_fact_count') or 0)} 项，"
+                    f"重新核验 {int(coverage.get('refreshed_fact_count') or 0)} 项"
+                )
         else:
             status_lines.append("- 穿透式深度研究：今天尚未生成")
         status_lines.append("发送或载入已有报告都不会重复生成；随后可直接继续提问。")

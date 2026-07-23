@@ -1,13 +1,14 @@
 ﻿import { useTranslation } from 'react-i18next';
 import { useEffect, useRef, useState, useMemo, useCallback, type FormEvent } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Send, Loader2, ArrowDown, Square, Download, Plus, Paperclip, X, Users, Target, ChevronDown, Pencil, Check, Play, OctagonX, Activity, Ban, CheckCircle2, Landmark, BookOpen } from "lucide-react";
+import { Send, Loader2, ArrowDown, Square, Download, Plus, Paperclip, X, Users, Target, ChevronDown, Pencil, Check, Play, OctagonX, Activity, Ban, CheckCircle2, Landmark, BookOpen, CalendarRange } from "lucide-react";
 import { toast } from "sonner";
 import { useAgentStore } from "@/stores/agent";
 import { useSSE } from "@/hooks/useSSE";
 import { ApiError, AUTH_REQUIRED_MESSAGE, api, isAuthRequiredError, type EquityResolutionOption, type GoalSnapshot, type MandateProposal, type MandateCommitted, type LiveAction, type LiveHalted, type LiveStatus } from "@/lib/api";
 import { isReportWorthyRun } from "@/lib/runReports";
 import { initialSessionTitle } from "@/lib/sessionTitle";
+import { deepReportTitle, etfReadinessMessage } from "@/lib/deepReportPresentation";
 import type { AgentMessage, ReportPreviewTarget, ToolCallEntry } from "@/types/agent";
 import { AgentAvatar } from "@/components/chat/AgentAvatar";
 import { WelcomeScreen, type WelcomeMode } from "@/components/chat/WelcomeScreen";
@@ -83,6 +84,7 @@ const ACTIVE_DEEP_REPORT_PHASES = new Set([
   "industry_evidence",
   "deterministic_calculation",
   "chapter_writing",
+  "monitoring_bundle",
   "compiling",
   "review",
   "repairing",
@@ -92,6 +94,7 @@ const ACTIVE_DEEP_REPORT_PHASES = new Set([
 
 function deepReportTaskStartedMessage(action: DeepReportTaskStarted["action"]): string {
   if (action === "refresh") return "正在使用最新可验证数据重新研究";
+  if (action === "enrich") return "正在补齐缺失资料并重新生成报告";
   if (action === "revise") return "正在重写指定报告章节";
   if (action === "repair") return "正在复用现有证据修复失败报告";
   if (action === "archive") return "正在保存报告到 Obsidian";
@@ -431,6 +434,8 @@ export function Agent() {
         const metrics = meta?.metrics as Record<string, number> | undefined;
         const reportId = meta?.report_id as string | undefined;
         const reportQualityStatus = meta?.report_quality_status as AgentMessage["reportQualityStatus"];
+        const reportProfile = meta?.report_profile as AgentMessage["reportProfile"];
+        const reportEtfReadiness = meta?.report_etf_readiness as AgentMessage["reportEtfReadiness"];
         const reportSymbol = meta?.report_symbol as string | undefined;
         const reportSecurityName = meta?.report_security_name as string | undefined;
         const reportDataAsOf = meta?.report_data_as_of as string | undefined;
@@ -445,10 +450,14 @@ export function Agent() {
         const reportParentId = meta?.report_parent_id as string | undefined;
         const reportRevisionMode = meta?.report_revision_mode as AgentMessage["reportRevisionMode"];
         const reportDeliveryKind = meta?.report_delivery_kind as AgentMessage["reportDeliveryKind"];
+        const reportResearchCoverage = meta?.report_research_coverage as AgentMessage["reportResearchCoverage"];
+        const reportHistoryDelta = meta?.report_history_delta as AgentMessage["reportHistoryDelta"];
         const reportMessageMeta = {
           runId,
           reportId,
           reportQualityStatus,
+          reportProfile,
+          reportEtfReadiness,
           reportSymbol,
           reportSecurityName,
           reportDataAsOf,
@@ -463,6 +472,8 @@ export function Agent() {
           reportParentId,
           reportRevisionMode,
           reportDeliveryKind,
+          reportResearchCoverage,
+          reportHistoryDelta,
         };
         const ts = new Date(m.created_at).getTime();
         if (m.role === "user") {
@@ -538,10 +549,18 @@ export function Agent() {
           const reportId = String(meta?.report_id || "");
           if (reportId) {
             const failedValidation = meta?.report_quality_status === "failed_validation";
+            const profile = String(meta?.report_profile || "") || undefined;
+            const readiness = meta?.report_etf_readiness as AgentMessage["reportEtfReadiness"];
             setReportPreviewTarget({
               reportId,
               artifactId: failedValidation ? "diagnostic" : "markdown",
-              title: `${String(meta?.report_security_name || meta?.report_symbol || "单股")}穿透式深度研究`,
+              title: deepReportTitle(
+                String(meta?.report_security_name || "") || undefined,
+                String(meta?.report_symbol || "") || undefined,
+                profile,
+                String(meta?.report_quality_status || ""),
+                readiness,
+              ),
             });
           }
           setReasoningActive(false);
@@ -712,7 +731,7 @@ export function Agent() {
         setDeepReportProgress((current) => ({
           reportId: String(d.report_id || current?.reportId || "") || undefined,
           phase: String(d.phase || current?.phase || "research"),
-          message: String(d.message || current?.message || "正在生成穿透式深度研究"),
+          message: String(d.message || current?.message || "正在生成深度研究报告"),
         }));
       },
 
@@ -722,14 +741,17 @@ export function Agent() {
         touch();
         const qualityStatus = String(d.quality_status || "passed_with_gaps");
         const failedValidation = qualityStatus === "failed_validation";
+        const profile = String(d.profile || "") || undefined;
+        const readiness = d.etf_readiness as AgentMessage["reportEtfReadiness"];
+        const readinessMessage = readiness ? etfReadinessMessage(readiness) : undefined;
         setDeepReportProgress({
           reportId: String(d.report_id || "") || undefined,
           phase: failedValidation ? "failed_validation" : "completed",
-          message: failedValidation
+          message: readinessMessage || (failedValidation
             ? "校验失败：仅生成诊断结果，未形成正式投资结论"
             : qualityStatus === "passed"
               ? "报告已完成并通过校验"
-              : "报告已完成，存在已标明的数据缺口",
+              : "报告已完成，存在已标明的数据缺口"),
           qualityStatus,
         });
         const reportId = String(d.report_id || "");
@@ -737,13 +759,20 @@ export function Agent() {
           setReportPreviewTarget({
             reportId,
             artifactId: failedValidation ? "diagnostic" : "markdown",
-            title: `${String(d.security_name || d.symbol || "单股")}穿透式深度研究`,
+            title: deepReportTitle(
+              String(d.security_name || "") || undefined,
+              String(d.symbol || "") || undefined,
+              profile,
+              qualityStatus,
+              readiness,
+            ),
           });
         }
         if (eventAttemptId && activeDeepReportAttemptRef.current === eventAttemptId) {
           activeDeepReportAttemptRef.current = null;
         }
-        if (qualityStatus === "failed_validation") toast.warning("报告尚未达到发布要求，可查看未发布原因");
+        if (readiness && readiness.status !== "penetration_ready") toast.warning(readinessMessage);
+        else if (qualityStatus === "failed_validation") toast.warning("报告尚未达到发布要求，可查看未发布原因");
         else if (qualityStatus === "passed_with_gaps") toast.warning("报告已完成，部分结论因公开证据不足而保留");
         else toast.success("穿透式深度研究已完成");
       },
@@ -773,7 +802,7 @@ export function Agent() {
         const isDeepReport = Boolean(d.report_id);
         const summary = String(
           isDeepReport
-            ? d.delivery_message || "穿透式深度研究已完成，请打开 Markdown 产物查看。"
+            ? d.delivery_message || "深度研究报告已生成，请打开 Markdown 产物查看。"
             : d.summary || "",
         );
         if (summary) s.addMessage({
@@ -784,6 +813,8 @@ export function Agent() {
           runId,
           reportId: String(d.report_id || "") || undefined,
           reportQualityStatus: (String(d.report_quality_status || "") || undefined) as AgentMessage["reportQualityStatus"],
+          reportProfile: (String(d.report_profile || "") || undefined) as AgentMessage["reportProfile"],
+          reportEtfReadiness: d.report_etf_readiness as AgentMessage["reportEtfReadiness"],
           reportSymbol: String(d.report_symbol || "") || undefined,
           reportSecurityName: String(d.report_security_name || "") || undefined,
           reportDataAsOf: String(d.report_data_as_of || "") || undefined,
@@ -800,6 +831,8 @@ export function Agent() {
           reportParentId: String(d.report_parent_id || "") || undefined,
           reportRevisionMode: (String(d.report_revision_mode || "") || undefined) as AgentMessage["reportRevisionMode"],
           reportDeliveryKind: (String(d.report_delivery_kind || "") || undefined) as AgentMessage["reportDeliveryKind"],
+          reportResearchCoverage: d.report_research_coverage as AgentMessage["reportResearchCoverage"],
+          reportHistoryDelta: d.report_history_delta as AgentMessage["reportHistoryDelta"],
         });
 
         // Detect Shadow Account id if render_shadow_report fired successfully this turn
@@ -1139,24 +1172,25 @@ export function Agent() {
       setDeepReportCandidates([]);
       setDeepReportProgress({ phase: "resolving", message: "正在确认上市公司与股票代码" });
       try {
-        const resolution = await api.resolveDeepReportEquity(normalizedPrompt);
+        const resolution = await api.resolveDeepReportInstrument(normalizedPrompt);
         const candidates = resolution.status === "resolved" && resolution.symbol && resolution.security_name
           ? [{
               symbol: resolution.symbol,
               security_name: resolution.security_name,
               market: resolution.market,
               source: resolution.source,
+              instrument_type: resolution.instrument_type,
             }]
           : resolution.options.slice(0, 5);
         if (candidates.length > 0) {
           setDeepReportCandidates(candidates);
           const message = candidates.length === 1
             ? `已找到 ${candidates[0].security_name}（${candidates[0].symbol}），请确认后开始研究`
-            : `已找到 ${candidates.length} 个候选，请选择正确的上市公司`;
+            : `已找到 ${candidates.length} 个候选，请选择正确的证券`;
           setDeepReportProgress({ phase: "identity_candidates", message });
           return;
         }
-        const message = "没有找到匹配的上市公司。请换用公司全称、常用简称或股票代码重试。";
+        const message = "没有找到匹配的证券。请换用名称、常用简称或准确代码重试。";
         setDeepReportProgress({ phase: "identity_gap", message });
         toast.error(message);
       } catch (error) {
@@ -1214,7 +1248,12 @@ export function Agent() {
         sid,
         finalPrompt,
         selectedDeepReportMode
-          ? { responseMode: "deep_report", reportProfile: "equity_deep_research" }
+          ? {
+              responseMode: "deep_report",
+              reportProfile: selectedResolution?.instrument_type === "etf"
+                ? "etf_deep_research"
+                : "equity_deep_research",
+            }
           : { responseMode: "chat" },
       );
       if (selectedDeepReportMode) {
@@ -1237,6 +1276,18 @@ export function Agent() {
     requestAnimationFrame(() => inputRef.current?.focus());
   }, []);
 
+  const handleWeeklyReportDraft = useCallback(() => {
+    setShowUploadMenu(false);
+    setGoalComposerActive(false);
+    setSwarmPreset(null);
+    setDeepReportMode(false);
+    setDeepReportProgress(null);
+    setDeepReportResolution(null);
+    setDeepReportCandidates([]);
+    setInput(t("welcome.quickStart.actions.weeklyReport.prompt"));
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }, [t]);
+
   const handleWelcomeModeSelect = useCallback((mode: WelcomeMode) => {
     setShowUploadMenu(false);
     setSwarmPreset(null);
@@ -1251,6 +1302,12 @@ export function Agent() {
   const confirmDeepReportCandidate = (candidate: EquityResolutionOption) => {
     const normalizedPrompt = input.trim();
     if (!normalizedPrompt || status === "streaming") return;
+    if (candidate.instrument_type === "index") {
+      const message = "已识别为指数；指数专用深度研究模板尚未开放，请改选上市公司或 ETF。";
+      setDeepReportProgress({ phase: "identity_gap", message });
+      toast.info(message);
+      return;
+    }
     const selection: DeepReportSelection = { request: normalizedPrompt, ...candidate };
     setDeepReportResolution(selection);
     setDeepReportCandidates([]);
@@ -1423,7 +1480,7 @@ export function Agent() {
   const handleDeepReportTaskStarted = useCallback((task: DeepReportTaskStarted) => {
     const sid = act().sessionId || sessionId;
     if (!sid) return;
-    const createsRevision = task.action === "refresh" || task.action === "revise" || task.action === "repair";
+    const createsRevision = task.action === "refresh" || task.action === "enrich" || task.action === "revise" || task.action === "repair";
     activeDeepReportAttemptRef.current = createsRevision ? task.attemptId : null;
     const wasAlreadyStreaming = act().status === "streaming";
     setupSSE(sid);
@@ -1730,7 +1787,7 @@ export function Agent() {
           {(deepReportMode || deepReportProgress) && (
             <div className="flex items-center gap-1">
               <span className="inline-flex max-w-full items-center gap-1.5 rounded-lg bg-cyan-500/10 px-2.5 py-1 text-xs font-medium text-cyan-700 dark:text-cyan-300">
-                {deepReportProgress && ["queued", "resolving", "financial_data", "financial_standardization", "industry_evidence", "deterministic_calculation", "chapter_writing", "compiling", "review", "repairing", "auditing", "pdf"].includes(deepReportProgress.phase) ? (
+                {deepReportProgress && ["queued", "resolving", "financial_data", "financial_standardization", "industry_evidence", "deterministic_calculation", "chapter_writing", "monitoring_bundle", "compiling", "review", "repairing", "auditing", "pdf"].includes(deepReportProgress.phase) ? (
                   <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
                 ) : (
                   <BookOpen className="h-3 w-3 shrink-0" />
@@ -2027,6 +2084,14 @@ export function Agent() {
                       inputRef.current?.focus();
                     }}
                   />
+                  <button
+                    type="button"
+                    onClick={handleWeeklyReportDraft}
+                    className="w-full px-3 py-2 text-left text-sm hover:bg-muted transition-colors flex items-center gap-2"
+                  >
+                    <CalendarRange className="h-4 w-4" />
+                    {t("agent.weeklyReport")}
+                  </button>
                   <SwarmTeamMenuItem
                     onSelect={() => {
                       setShowUploadMenu(false);

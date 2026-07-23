@@ -2,21 +2,25 @@ import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "path";
 
-const PROXY_PATHS = [
+export const PROXY_PATHS = [
   "/sessions",
   "/swarm/presets",
   "/swarm/runs",
   "/settings/llm",
   "/settings/data-sources",
   "/settings/research",
+  "/settings/feishu-delivery",
+  "/settings/codex-cli",
   "/channels",
   "/portfolio/review",
   "/portfolio/cash",
   "/portfolio/mandate",
   "/portfolio/monitor",
   "/portfolio/daily-runs",
+  "/portfolio/weekly-runs",
   "/portfolio/holdings",
   "/portfolio/trades",
+  "/portfolio/reconciliation",
   "/portfolio/refresh-market-data",
   "/portfolio/analysis-sessions",
   "/market-cache",
@@ -24,7 +28,7 @@ const PROXY_PATHS = [
   "/mandate",
   "/live",
   "/upload",
-  "/reports",
+  "/report-library",
   "/shadow-reports",
 ];
 
@@ -34,7 +38,7 @@ export default defineConfig(({ mode }) => {
   const apiProxy = { target: apiTarget, changeOrigin: true };
   const apiProxyWithHtmlFallback = {
     ...apiProxy,
-    bypass(req: { headers: { accept?: string } }) {
+    bypass(req: { headers: { accept?: string }; url?: string }) {
       if (req.headers.accept?.includes("text/html")) {
         return "/index.html";
       }
@@ -43,6 +47,7 @@ export default defineConfig(({ mode }) => {
 
   const previewProxy = {
     ...Object.fromEntries(PROXY_PATHS.map((p) => [p, apiProxy])),
+    "/reports": apiProxyWithHtmlFallback,
     "^/runs/[^/]+/?$": apiProxyWithHtmlFallback,
     "/runs": apiProxy,
     "/correlation": apiProxyWithHtmlFallback,
@@ -58,6 +63,7 @@ export default defineConfig(({ mode }) => {
       port: 5899,
       proxy: {
         ...Object.fromEntries(PROXY_PATHS.map((p) => [p, apiProxy])),
+        "/reports": apiProxyWithHtmlFallback,
         // SPA RunDetail page — only the two-segment ``/runs/{id}``
         // form should fall back to ``index.html`` on browser navigation.
         // ``/runs/{id}/code`` and ``/runs/{id}/pine`` are API-only and
