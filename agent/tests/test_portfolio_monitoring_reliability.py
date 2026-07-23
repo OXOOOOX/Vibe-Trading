@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -12,11 +13,55 @@ from src.portfolio.monitoring.runtime import MonitoringRuntime
 from src.portfolio.monitoring.store import MonitoringStore, StaleLeaderError
 from tests.test_portfolio_monitoring import (
     FakeMarketService,
+    _Calendar,
+    _RuntimeMarketService,
     _activate,
     _activate_single_cross_above,
     _closed_quote,
     _service,
 )
+
+
+def test_expired_weekly_source_blocks_runtime_evaluation_without_disabling_plan(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    service = _service(tmp_path, monkeypatch)
+    profile = _activate(service)
+    active_version = int(profile["active_plan_version"])
+    stored = service.store.get_plan(profile["profile_id"], active_version)
+    plan = stored["plan"]
+    plan.update(
+        source_horizon="weekly",
+        source_report_id="weekly-expired",
+        source_valid_until="2026-07-17T07:30:00+00:00",
+        review_due_at="2026-07-17T07:30:00+00:00",
+    )
+    with service.store.connect() as connection:
+        connection.execute(
+            "UPDATE monitor_plan_versions SET plan_json=? WHERE profile_id=? AND version=?",
+            (json.dumps(plan, ensure_ascii=False), profile["profile_id"], active_version),
+        )
+    monkeypatch.setenv("VIBE_TRADING_MONITORING_ENABLED", "1")
+    monkeypatch.setenv("VIBE_TRADING_MONITORING_MODE", "shadow")
+    monkeypatch.setenv("VIBE_TRADING_MONITOR_MAINTENANCE_ENABLED", "0")
+    runtime = MonitoringRuntime(
+        store=service.store,
+        market_service=_RuntimeMarketService(),
+        calendar=_Calendar(True, "cached_exchange_calendar"),
+        now_factory=lambda: datetime(2026, 7, 18, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    result = asyncio.run(runtime.run_once())
+    after = service.store.get_profile(profile["profile_id"])
+
+    assert result["source_review_due_profiles"] == 1
+    assert result["evaluated_profiles"] == 0
+    assert after["status"] == "active"
+    assert after["active_plan_version"] == active_version
+    assert "source_report_review_due" in after["blocked_reasons"]
+    assert service.store.pending_deliveries() == []
+    asyncio.run(runtime.stop())
 
 
 def _create_pending_delivery(service):
@@ -303,14 +348,14 @@ def test_future_schema_fails_closed_without_modifying_database(tmp_path) -> None
         connection.executescript(
             """
             CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO schema_meta(key,value) VALUES('schema_version','10');
+                INSERT INTO schema_meta(key,value) VALUES('schema_version','11');
             CREATE TABLE future_schema_marker (value TEXT NOT NULL);
             INSERT INTO future_schema_marker(value) VALUES('keep-me');
             """
         )
     before = path.read_bytes()
 
-    with pytest.raises(RuntimeError, match="newer than supported version 9"):
+    with pytest.raises(RuntimeError, match="newer than supported version 10"):
         MonitoringStore(path)
 
     assert path.read_bytes() == before
@@ -318,7 +363,7 @@ def test_future_schema_fails_closed_without_modifying_database(tmp_path) -> None
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "10"
+        ).fetchone()[0] == "11"
         assert connection.execute(
             "SELECT value FROM future_schema_marker"
         ).fetchone()[0] == "keep-me"

@@ -35,7 +35,18 @@ TARGET_INTENTS = {
 }
 PRICE_VOLUME_INTERVALS = {"5m"}
 PRICE_VOLUME_BASELINE_METHODS = {"same_time_bucket_median"}
-REPORT_TYPES = {"single_stock_research", "holding_analysis", "daily_portfolio", "monitor_research"}
+REPORT_TYPES = {
+    "single_stock_research",
+    "deep_research",
+    "equity_deep_research",
+    "etf_deep_research",
+    "index_deep_research",
+    "holding_analysis",
+    "daily_holding",
+    "daily_portfolio",
+    "weekly_review",
+    "monitor_research",
+}
 REPORT_QUALITY_STATUSES = {"ready", "data_limited", "conflicted", "invalidated"}
 APPROACH_DISTANCE_SOURCES = {"report", "atr20_default", "user"}
 VOLUME_CONFIRMATION_METRICS = {
@@ -58,6 +69,7 @@ CONDITION_KINDS = {
     "volume_ratio",
     "cumulative_volume",
     "cumulative_turnover",
+    "rolling_volume_ratio",
     "fund_flow",
     "sector_state",
 }
@@ -65,14 +77,38 @@ CONDITION_COMPARATORS = {
     "gte", "lte", "gt", "lt", "between", "positive", "negative", "equals",
 }
 CONDITION_METRICS = {
-    "volume_ratio": {"volume_ratio"},
+    "volume_ratio": {"volume_ratio", "confirmation_ratio"},
     "cumulative_volume": {"cumulative_volume", "cumulative_volume_ratio"},
     "cumulative_turnover": {"cumulative_amount", "cumulative_amount_ratio"},
+    "rolling_volume_ratio": {"volume"},
     "fund_flow": {"main", "large", "super_large"},
     "sector_state": {"change_pct"},
 }
 AUTOMATION_STATUSES = {"action_ready", "watch_only"}
 RECOMMENDATION_ACTIONS = {"observe", "add", "reduce", "exit"}
+MONITORING_STATUSES = {"available", "not_recommended", "data_insufficient"}
+MONITORING_CHANGE_TYPES = {
+    "new",
+    "unchanged",
+    "raised",
+    "lowered",
+    "modified",
+    "withdrawn",
+    "expired",
+}
+MONITORING_HORIZONS = {"daily", "weekly"}
+PLAN_SOURCE_HORIZONS = {*MONITORING_HORIZONS, "structural"}
+MONITORING_SOURCES = {"structured_daily_report", "structured_weekly_report"}
+MONITORING_MAPPING_STATUSES = {"mapped", "partial"}
+MONITORING_INTERPRETATION_KEYS = {
+    "price_only",
+    "confirmed",
+    "divergence",
+    "invalidated",
+    "insufficient_data",
+    "bullish_case",
+    "bearish_case",
+}
 SIZING_KINDS = {
     "units", "position_fraction", "cash_amount", "target_position_units", "default_policy",
 }
@@ -179,6 +215,11 @@ def _normalize_calculation_basis(value: Any, *, rule_index: int) -> dict[str, An
     if not isinstance(value, dict):
         raise PlanValidationError(f"market_rules[{rule_index}].calculation_basis must be an object")
     prefix = f"market_rules[{rule_index}].calculation_basis"
+    _reject_unknown_keys(
+        value,
+        {"method", "method_label", "formula", "summary", "recommended_value", "references"},
+        prefix,
+    )
     references = value.get("references") or []
     if not isinstance(references, list) or len(references) > 8:
         raise PlanValidationError(f"{prefix}.references must contain at most 8 items")
@@ -186,6 +227,11 @@ def _normalize_calculation_basis(value: Any, *, rule_index: int) -> dict[str, An
     for reference_index, raw_reference in enumerate(references):
         if not isinstance(raw_reference, dict):
             raise PlanValidationError(f"{prefix}.references[{reference_index}] must be an object")
+        _reject_unknown_keys(
+            raw_reference,
+            {"label", "value", "date"},
+            f"{prefix}.references[{reference_index}]",
+        )
         reference = {
             "label": _bounded_text(
                 raw_reference.get("label"),
@@ -377,6 +423,78 @@ def _scenario_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _normalize_research_condition(value: Any, *, field: str) -> dict[str, Any] | None:
+    """Preserve non-executable daily/weekly semantics beside runtime mappings."""
+
+    if value in (None, {}):
+        return None
+    if not isinstance(value, dict):
+        raise PlanValidationError(f"{field} must be an object")
+    _reject_unknown_keys(
+        value,
+        {
+            "source_text",
+            "kind",
+            "operator",
+            "interval",
+            "value",
+            "lower",
+            "upper",
+            "baseline",
+            "threshold",
+            "consecutive",
+            "lookback",
+            "metric",
+            "unit",
+        },
+        field,
+    )
+    interval = str(value.get("interval") or "")
+    if interval not in {"1d", "1w"}:
+        raise PlanValidationError(f"{field}.interval must be 1d or 1w")
+    normalized: dict[str, Any] = {
+        "source_text": _bounded_text(
+            value.get("source_text"), f"{field}.source_text", maximum=800
+        ),
+        "kind": _bounded_text(value.get("kind"), f"{field}.kind", maximum=80),
+        "operator": _bounded_text(
+            value.get("operator") or "gte", f"{field}.operator", maximum=24
+        ),
+        "interval": interval,
+    }
+    for numeric in ("value", "lower", "upper", "threshold"):
+        if value.get(numeric) is not None:
+            normalized[numeric] = _finite(value.get(numeric), f"{field}.{numeric}")
+    for integer in ("consecutive", "lookback"):
+        if value.get(integer) is not None:
+            normalized[integer] = _integer(
+                value.get(integer), f"{field}.{integer}", minimum=1, maximum=120
+            )
+    for text_field in ("baseline", "metric", "unit"):
+        if value.get(text_field):
+            normalized[text_field] = _bounded_text(
+                value.get(text_field), f"{field}.{text_field}", maximum=120
+            )
+    return normalized
+
+
+def _normalize_executable_mapping(value: Any, *, field: str) -> dict[str, Any] | None:
+    if value in (None, {}):
+        return None
+    if not isinstance(value, dict):
+        raise PlanValidationError(f"{field} must be an object")
+    _reject_unknown_keys(value, {"coverage_status", "reason"}, field)
+    status = str(value.get("coverage_status") or "")
+    if status not in SOURCE_CONDITION_STATUSES:
+        raise PlanValidationError(f"{field}.coverage_status is not allowed")
+    return {
+        "coverage_status": status,
+        "reason": _bounded_text(
+            value.get("reason"), f"{field}.reason", maximum=500, required=False
+        ),
+    }
+
+
 def _normalize_source_conditions(value: Any, *, prefix: str) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not value or len(value) > 24:
         raise PlanValidationError(f"{prefix}.source_conditions must contain between 1 and 24 items")
@@ -388,7 +506,16 @@ def _normalize_source_conditions(value: Any, *, prefix: str) -> list[dict[str, A
             raise PlanValidationError(f"{field} must be an object")
         _reject_unknown_keys(
             raw,
-            {"condition_id", "source_text", "role", "coverage_status", "reason", "evidence_refs"},
+            {
+                "condition_id",
+                "source_text",
+                "role",
+                "coverage_status",
+                "reason",
+                "evidence_refs",
+                "research_condition",
+                "executable_mapping",
+            },
             field,
         )
         condition_id = _bounded_text(raw.get("condition_id"), f"{field}.condition_id", maximum=80)
@@ -404,21 +531,36 @@ def _normalize_source_conditions(value: Any, *, prefix: str) -> list[dict[str, A
         refs = raw.get("evidence_refs") or []
         if not isinstance(refs, list) or len(refs) > 8:
             raise PlanValidationError(f"{field}.evidence_refs must contain at most 8 items")
-        normalized.append(
-            {
-                "condition_id": condition_id,
-                "source_text": _bounded_text(raw.get("source_text"), f"{field}.source_text", maximum=800),
-                "role": role,
-                "coverage_status": status,
-                "reason": _bounded_text(
-                    raw.get("reason"), f"{field}.reason", maximum=500, required=False
-                ),
-                "evidence_refs": [
-                    _bounded_text(item, f"{field}.evidence_refs", maximum=300)
-                    for item in refs
-                ],
-            }
+        research_condition = _normalize_research_condition(
+            raw.get("research_condition"), field=f"{field}.research_condition"
         )
+        executable_mapping = _normalize_executable_mapping(
+            raw.get("executable_mapping"), field=f"{field}.executable_mapping"
+        )
+        if executable_mapping and executable_mapping["coverage_status"] != status:
+            raise PlanValidationError(
+                f"{field}.executable_mapping coverage must match coverage_status"
+            )
+        item = {
+            "condition_id": condition_id,
+            "source_text": _bounded_text(
+                raw.get("source_text"), f"{field}.source_text", maximum=800
+            ),
+            "role": role,
+            "coverage_status": status,
+            "reason": _bounded_text(
+                raw.get("reason"), f"{field}.reason", maximum=500, required=False
+            ),
+            "evidence_refs": [
+                _bounded_text(item, f"{field}.evidence_refs", maximum=300)
+                for item in refs
+            ],
+        }
+        if research_condition is not None:
+            item["research_condition"] = research_condition
+        if executable_mapping is not None:
+            item["executable_mapping"] = executable_mapping
+        normalized.append(item)
     return normalized
 
 
@@ -475,7 +617,7 @@ def _normalize_condition_group(value: Any, *, field: str) -> dict[str, Any]:
                 raw.get("freshness_seconds", 900),
                 f"{prefix}.freshness_seconds",
                 minimum=60,
-                maximum=172800,
+                maximum=604800,
             ),
         }
         if kind in CONDITION_METRICS:
@@ -588,6 +730,16 @@ def _normalize_watch_scenarios(
                     "action_template",
                     "automation_status",
                     "scenario_fingerprint",
+                    "candidate_id",
+                    "scenario_family_id",
+                    "priority",
+                    "calculation_basis",
+                    "claim_ids",
+                    "interpretation",
+                    "mapping_status",
+                    "change_type",
+                    "previous_candidate_id",
+                    "change_details",
                 }
             )
         _reject_unknown_keys(
@@ -910,6 +1062,139 @@ def _normalize_watch_scenarios(
                 scenario_fingerprint=fingerprint,
                 **condition_groups,
             )
+            candidate_id = str(raw.get("candidate_id") or "").strip()
+            if candidate_id:
+                candidate_id = _bounded_text(
+                    candidate_id, f"{prefix}.candidate_id", maximum=80
+                )
+                if candidate_id != scenario_id:
+                    raise PlanValidationError(
+                        f"{prefix}.candidate_id must match scenario_id"
+                    )
+                family_id = _bounded_text(
+                    raw.get("scenario_family_id"),
+                    f"{prefix}.scenario_family_id",
+                    maximum=80,
+                )
+                priority = str(raw.get("priority") or "normal")
+                if priority not in {"normal", "high"}:
+                    raise PlanValidationError(f"{prefix}.priority is not allowed")
+                calculation_basis = _normalize_calculation_basis(
+                    raw.get("calculation_basis"), rule_index=index
+                )
+                if calculation_basis is None:
+                    raise PlanValidationError(
+                        f"{prefix}.calculation_basis is required"
+                    )
+                rule_basis = rule.get("calculation_basis")
+                if rule_basis is not None and calculation_basis != rule_basis:
+                    raise PlanValidationError(
+                        f"{prefix}.calculation_basis must match its price rule"
+                    )
+                raw_claim_ids = raw.get("claim_ids")
+                if (
+                    not isinstance(raw_claim_ids, list)
+                    or not raw_claim_ids
+                    or len(raw_claim_ids) > 16
+                ):
+                    raise PlanValidationError(
+                        f"{prefix}.claim_ids must contain between 1 and 16 items"
+                    )
+                claim_ids = [
+                    _bounded_text(item, f"{prefix}.claim_ids", maximum=120)
+                    for item in raw_claim_ids
+                ]
+                if len(set(claim_ids)) != len(claim_ids):
+                    raise PlanValidationError(f"{prefix}.claim_ids must be unique")
+                raw_interpretation = raw.get("interpretation")
+                if not isinstance(raw_interpretation, dict):
+                    raise PlanValidationError(
+                        f"{prefix}.interpretation must be an object"
+                    )
+                _reject_unknown_keys(
+                    raw_interpretation,
+                    MONITORING_INTERPRETATION_KEYS,
+                    f"{prefix}.interpretation",
+                )
+                if set(raw_interpretation) != MONITORING_INTERPRETATION_KEYS:
+                    raise PlanValidationError(
+                        f"{prefix}.interpretation must include every supported state"
+                    )
+                interpretation = {
+                    key: _bounded_text(
+                        raw_interpretation.get(key),
+                        f"{prefix}.interpretation.{key}",
+                        maximum=500,
+                    )
+                    for key in sorted(MONITORING_INTERPRETATION_KEYS)
+                }
+                derived_mapping_status = "partial" if required_pending else "mapped"
+                supplied_mapping_status = str(
+                    raw.get("mapping_status") or derived_mapping_status
+                )
+                if supplied_mapping_status not in MONITORING_MAPPING_STATUSES:
+                    raise PlanValidationError(
+                        f"{prefix}.mapping_status is not allowed"
+                    )
+                if supplied_mapping_status != derived_mapping_status:
+                    raise PlanValidationError(
+                        f"{prefix}.mapping_status does not match source-condition coverage"
+                    )
+                if (
+                    not calculation_basis["references"]
+                    and automation_status == "action_ready"
+                ):
+                    raise PlanValidationError(
+                        f"{prefix} cannot be action_ready without calculation references"
+                    )
+                change_type = str(raw.get("change_type") or "new")
+                if change_type not in MONITORING_CHANGE_TYPES:
+                    raise PlanValidationError(f"{prefix}.change_type is not allowed")
+                previous_candidate_id = _bounded_text(
+                    raw.get("previous_candidate_id"),
+                    f"{prefix}.previous_candidate_id",
+                    maximum=80,
+                    required=False,
+                )
+                if change_type != "new" and not previous_candidate_id:
+                    raise PlanValidationError(
+                        f"{prefix}.previous_candidate_id is required for a carried scenario"
+                    )
+                change_details = raw.get("change_details") or {}
+                if not isinstance(change_details, dict):
+                    raise PlanValidationError(
+                        f"{prefix}.change_details must be an object"
+                    )
+                _reject_unknown_keys(
+                    change_details,
+                    {"previous_level", "current_level", "delta", "summary"},
+                    f"{prefix}.change_details",
+                )
+                normalized_change_details: dict[str, Any] = {}
+                for field in ("previous_level", "current_level", "delta"):
+                    if change_details.get(field) is not None:
+                        normalized_change_details[field] = _finite(
+                            change_details.get(field),
+                            f"{prefix}.change_details.{field}",
+                        )
+                if change_details.get("summary"):
+                    normalized_change_details["summary"] = _bounded_text(
+                        change_details.get("summary"),
+                        f"{prefix}.change_details.summary",
+                        maximum=500,
+                    )
+                normalized_scenario.update(
+                    candidate_id=candidate_id,
+                    scenario_family_id=family_id,
+                    priority=priority,
+                    calculation_basis=calculation_basis,
+                    claim_ids=claim_ids,
+                    interpretation=interpretation,
+                    mapping_status=derived_mapping_status,
+                    change_type=change_type,
+                    previous_candidate_id=previous_candidate_id or None,
+                    change_details=normalized_change_details,
+                )
         normalized.append(normalized_scenario)
     return normalized
 
@@ -1127,6 +1412,36 @@ def validate_plan(payload: dict[str, Any], *, expected_symbol: str | None = None
     except ValueError as exc:
         raise PlanValidationError("hard_valid_until must be ISO-8601") from exc
 
+    source_valid_until_raw = str(plan.get("source_valid_until") or "").strip()
+    review_due_at_raw = str(plan.get("review_due_at") or "").strip()
+    if source_valid_until_raw or review_due_at_raw:
+        source_valid_until = _aware_iso_datetime(
+            source_valid_until_raw or review_due_at_raw,
+            "source_valid_until",
+        )
+        review_due_at = _aware_iso_datetime(
+            review_due_at_raw or source_valid_until_raw,
+            "review_due_at",
+        )
+        if review_due_at > source_valid_until:
+            raise PlanValidationError("review_due_at cannot exceed source_valid_until")
+        plan["source_valid_until"] = source_valid_until.isoformat()
+        plan["review_due_at"] = review_due_at.isoformat()
+        source_horizon = str(plan.get("source_horizon") or "")
+        if source_horizon not in PLAN_SOURCE_HORIZONS:
+            raise PlanValidationError("source_horizon must be daily, weekly, or structural")
+        plan["source_horizon"] = source_horizon
+        plan["source_report_id"] = _bounded_text(
+            plan.get("source_report_id"),
+            "source_report_id",
+            maximum=120,
+            required=False,
+        ) or None
+        source_period = plan.get("source_period") or {}
+        if not isinstance(source_period, dict):
+            raise PlanValidationError("source_period must be an object")
+        plan["source_period"] = copy.deepcopy(source_period)
+
     fundamental_monitor = plan.get("fundamental_monitor") or {"enabled": False}
     if not isinstance(fundamental_monitor, dict):
         raise PlanValidationError("fundamental_monitor must be an object")
@@ -1173,15 +1488,24 @@ def validate_plan(payload: dict[str, Any], *, expected_symbol: str | None = None
             {"activation_mode", "activated_by", "evidence_fingerprint", "trade_execution", "trigger_type"},
             "automation_policy",
         )
-        if str(automation_policy.get("activation_mode") or "") != "autonomous":
-            raise PlanValidationError("automation_policy.activation_mode must be autonomous")
-        if str(automation_policy.get("activated_by") or "") != "autopilot":
-            raise PlanValidationError("automation_policy.activated_by must be autopilot")
+        activation_mode = str(automation_policy.get("activation_mode") or "")
+        activated_by = str(automation_policy.get("activated_by") or "")
+        if activation_mode not in {"autonomous", "manual_confirmation_required"}:
+            raise PlanValidationError("automation_policy.activation_mode is not allowed")
+        expected_actors = (
+            {"autopilot"}
+            if activation_mode == "autonomous"
+            else {"daily_report", "weekly_report", "report"}
+        )
+        if activated_by not in expected_actors:
+            raise PlanValidationError(
+                "automation_policy.activated_by does not match activation_mode"
+            )
         if str(automation_policy.get("trade_execution") or "") != "forbidden":
             raise PlanValidationError("automation_policy.trade_execution must be forbidden")
         plan["automation_policy"] = {
-            "activation_mode": "autonomous",
-            "activated_by": "autopilot",
+            "activation_mode": activation_mode,
+            "activated_by": activated_by,
             "evidence_fingerprint": _bounded_text(
                 automation_policy.get("evidence_fingerprint"),
                 "automation_policy.evidence_fingerprint",
@@ -1199,6 +1523,515 @@ def validate_plan(payload: dict[str, Any], *, expected_symbol: str | None = None
     else:
         plan.pop("automation_policy", None)
     return plan
+
+
+def validate_monitoring_candidate(
+    payload: dict[str, Any],
+    *,
+    expected_symbol: str,
+    generated_at: str,
+    data_as_of: str,
+    valid_until: str,
+) -> dict[str, Any]:
+    """Validate one report candidate through the existing v5 plan contract."""
+
+    if not isinstance(payload, dict):
+        raise PlanValidationError("monitoring candidate must be an object")
+    trigger = payload.get("trigger")
+    if not isinstance(trigger, dict):
+        raise PlanValidationError("monitoring candidate.trigger must be an object")
+    candidate_id = _bounded_text(
+        payload.get("candidate_id") or payload.get("scenario_id"),
+        "monitoring candidate.candidate_id",
+        maximum=80,
+    )
+    client_rule_id = _bounded_text(
+        payload.get("client_rule_id") or f"daily-{candidate_id}",
+        "monitoring candidate.client_rule_id",
+        maximum=80,
+    )
+    trigger_kind = str(trigger.get("kind") or "")
+    parameters: dict[str, Any] = {
+        "interval": trigger.get("interval"),
+        "adjustment": "raw",
+        "confirmation_count": trigger.get("confirmation_count"),
+        "cooldown_minutes": 120,
+        "clear_hysteresis_bps": (
+            (payload.get("resolution_policy") or {}).get("rejection_hysteresis_bps", 30)
+            if isinstance(payload.get("resolution_policy"), dict)
+            else 30
+        ),
+    }
+    if trigger_kind.startswith("price_cross"):
+        parameters["threshold"] = trigger.get("threshold")
+    elif trigger_kind.startswith("price_zone"):
+        parameters.update(lower=trigger.get("lower"), upper=trigger.get("upper"))
+    rule = {
+        "client_rule_id": client_rule_id,
+        "kind": trigger_kind,
+        "severity": "critical" if payload.get("intent") == "stop_loss" else "warning",
+        "enabled": True,
+        "alert_cue": "none",
+        "target_intent": payload.get("intent"),
+        "target_level": 1,
+        "parameters": parameters,
+        "valid_until": valid_until,
+        "rationale": payload.get("rationale"),
+        "calculation_basis": payload.get("calculation_basis"),
+    }
+    scenario = copy.deepcopy(payload)
+    scenario["scenario_id"] = candidate_id
+    scenario["candidate_id"] = candidate_id
+    scenario["client_rule_id"] = client_rule_id
+    plan = {
+        "schema_version": 5,
+        "symbol": expected_symbol,
+        "data_mode": "verified",
+        "summary": "Daily report structured monitoring candidate validation",
+        "quote_tier": "active" if trigger.get("interval") == "1m" else "normal",
+        "near_trigger_tier": "active",
+        "near_trigger_distance_bps": (
+            (payload.get("approach_policy") or {}).get("distance_bps", 100)
+            if isinstance(payload.get("approach_policy"), dict)
+            else 100
+        ),
+        "price_volume_policy": dict(DEFAULT_PRICE_VOLUME_POLICY),
+        "analysis_ref": {
+            "snapshot_id": "daily-monitoring-contract",
+            "report_ref": f"daily-monitoring:{expected_symbol}:{candidate_id}",
+            "report_type": "holding_analysis",
+            "title": f"{expected_symbol} daily monitoring candidate",
+            "revision": 1,
+            "body_sha256": hashlib.sha256(candidate_id.encode("utf-8")).hexdigest(),
+            "quality_status": "ready",
+            "generated_at": generated_at,
+            "data_as_of": data_as_of,
+        },
+        "watch_scenarios": [scenario],
+        "market_rules": [rule],
+        "news_topics": [],
+        "fundamental_monitor": {"enabled": False, "capability_status": "monitoring_only"},
+        "hard_valid_until": valid_until,
+        "evidence_notes": [],
+        "automation_policy": {
+            "activation_mode": "manual_confirmation_required",
+            "activated_by": "daily_report",
+            "evidence_fingerprint": "",
+            "trade_execution": "forbidden",
+        },
+    }
+    normalized = validate_plan(plan, expected_symbol=expected_symbol)
+    return normalized["watch_scenarios"][0]
+
+
+def validate_monitoring_bundle(
+    payload: dict[str, Any],
+    *,
+    expected_symbol: str | None = None,
+    expected_horizon: str = "daily",
+) -> dict[str, Any]:
+    """Validate a shared daily/weekly MonitoringBundle and its runtime mappings."""
+
+    if not isinstance(payload, dict):
+        raise PlanValidationError("monitoring_bundle must be an object")
+    _reject_unknown_keys(
+        payload,
+        {
+            "schema_version",
+            "symbol",
+            "instrument_type",
+            "horizon",
+            "generated_at",
+            "data_as_of",
+            "valid_from",
+            "valid_until",
+            "review_due_at",
+            "source_valid_until",
+            "expired_reason",
+            "early_invalidation_conditions",
+            "price_basis",
+            "monitoring_status",
+            "price_volume_context",
+            "candidates",
+            "scenario_changes",
+            "validation_errors",
+            "source",
+            "source_report_id",
+            "source_period",
+            "activation_policy",
+            "trade_execution",
+            "level_snapshot_id",
+            "selection_mode",
+            "price_conversion",
+        },
+        "monitoring_bundle",
+    )
+    schema_version = _integer(payload.get("schema_version"), "monitoring_bundle.schema_version")
+    if schema_version not in {1, 2}:
+        raise PlanValidationError("monitoring_bundle.schema_version must be 1 or 2")
+    level_snapshot_id = _bounded_text(
+        payload.get("level_snapshot_id"),
+        "monitoring_bundle.level_snapshot_id",
+        maximum=160,
+        required=schema_version >= 2,
+    )
+    selection_mode = _bounded_text(
+        payload.get("selection_mode"),
+        "monitoring_bundle.selection_mode",
+        maximum=80,
+        required=schema_version >= 2,
+    )
+    if selection_mode and selection_mode not in {
+        "algorithm_candidates_ai_selected",
+        "deterministic_fallback",
+        "report_candidate_validated",
+    }:
+        raise PlanValidationError("monitoring_bundle.selection_mode is not allowed")
+    price_conversion = payload.get("price_conversion") or {}
+    if schema_version >= 2:
+        if not isinstance(price_conversion, dict):
+            raise PlanValidationError("monitoring_bundle.price_conversion must be an object")
+        _reject_unknown_keys(
+            price_conversion,
+            {"analysis_basis", "runtime_basis", "events"},
+            "monitoring_bundle.price_conversion",
+        )
+        if str(price_conversion.get("runtime_basis") or "") != "raw":
+            raise PlanValidationError("monitoring_bundle runtime price basis must be raw")
+        if not isinstance(price_conversion.get("events") or [], list):
+            raise PlanValidationError("monitoring_bundle.price_conversion.events must be a list")
+    symbol = _bounded_text(payload.get("symbol"), "monitoring_bundle.symbol", maximum=32).upper()
+    if expected_symbol and symbol != expected_symbol.upper():
+        raise PlanValidationError("monitoring_bundle symbol does not match the source report")
+    instrument_type = str(payload.get("instrument_type") or "")
+    if instrument_type not in {"etf", "company_equity"}:
+        raise PlanValidationError("monitoring_bundle.instrument_type is not allowed")
+    horizon = str(payload.get("horizon") or "")
+    if horizon not in MONITORING_HORIZONS or horizon != expected_horizon:
+        raise PlanValidationError(
+            f"monitoring_bundle.horizon must be {expected_horizon}"
+        )
+    generated_at = _aware_iso_datetime(
+        payload.get("generated_at"), "monitoring_bundle.generated_at"
+    )
+    data_as_of = _aware_iso_datetime(
+        payload.get("data_as_of"), "monitoring_bundle.data_as_of"
+    )
+    valid_from = _aware_iso_datetime(
+        payload.get("valid_from"), "monitoring_bundle.valid_from"
+    )
+    valid_until = _aware_iso_datetime(
+        payload.get("valid_until"), "monitoring_bundle.valid_until"
+    )
+    review_due_at = _aware_iso_datetime(
+        payload.get("review_due_at"), "monitoring_bundle.review_due_at"
+    )
+    source_valid_until = _aware_iso_datetime(
+        payload.get("source_valid_until") or payload.get("valid_until"),
+        "monitoring_bundle.source_valid_until",
+    )
+    if valid_until <= valid_from or not valid_from <= review_due_at <= valid_until:
+        raise PlanValidationError("monitoring_bundle validity window is invalid")
+    if source_valid_until < valid_from or source_valid_until > valid_until:
+        raise PlanValidationError("monitoring_bundle source validity window is invalid")
+    early_invalidation_conditions = payload.get("early_invalidation_conditions") or []
+    if not isinstance(early_invalidation_conditions, list) or len(early_invalidation_conditions) > 16:
+        raise PlanValidationError(
+            "monitoring_bundle.early_invalidation_conditions must be a list"
+        )
+    expired_reason = _bounded_text(
+        payload.get("expired_reason"),
+        "monitoring_bundle.expired_reason",
+        maximum=500,
+        required=False,
+    )
+
+    price_basis = payload.get("price_basis")
+    if not isinstance(price_basis, dict):
+        raise PlanValidationError("monitoring_bundle.price_basis must be an object")
+    _reject_unknown_keys(
+        price_basis,
+        {"adjustment", "currency", "tick_size"},
+        "monitoring_bundle.price_basis",
+    )
+    if str(price_basis.get("adjustment") or "") != "raw":
+        raise PlanValidationError("monitoring_bundle price basis must use raw prices")
+    if str(price_basis.get("currency") or "") != "CNY":
+        raise PlanValidationError("monitoring_bundle price currency must be CNY")
+    normalized_price_basis = {
+        "adjustment": "raw",
+        "currency": "CNY",
+        "tick_size": _finite(
+            price_basis.get("tick_size"),
+            "monitoring_bundle.price_basis.tick_size",
+            minimum=0.000001,
+        ),
+    }
+
+    status = str(payload.get("monitoring_status") or "")
+    if status not in MONITORING_STATUSES:
+        raise PlanValidationError("monitoring_bundle.monitoring_status is not allowed")
+    context = payload.get("price_volume_context")
+    if not isinstance(context, dict):
+        raise PlanValidationError("monitoring_bundle.price_volume_context must be an object")
+    _reject_unknown_keys(
+        context,
+        {
+            "policy",
+            "data_mode",
+            "source_count",
+            "sources",
+            "single_source_authorized",
+            "warnings",
+            "refresh_attempted",
+            "refresh_succeeded",
+        },
+        "monitoring_bundle.price_volume_context",
+    )
+    data_mode = str(context.get("data_mode") or "verified")
+    if data_mode not in DATA_MODES:
+        raise PlanValidationError("monitoring_bundle price-volume data mode is not allowed")
+    source_count = _integer(
+        context.get("source_count", 0),
+        "monitoring_bundle.price_volume_context.source_count",
+        minimum=0,
+        maximum=20,
+    )
+    sources = context.get("sources") or []
+    warnings = context.get("warnings") or []
+    if not isinstance(sources, list) or len(sources) > 20:
+        raise PlanValidationError("monitoring_bundle price-volume sources are invalid")
+    if not isinstance(warnings, list) or len(warnings) > 20:
+        raise PlanValidationError("monitoring_bundle price-volume warnings are invalid")
+    authorized = context.get("single_source_authorized", False)
+    refresh_attempted = context.get("refresh_attempted", True)
+    refresh_succeeded = context.get("refresh_succeeded", status != "data_insufficient")
+    if not all(isinstance(item, bool) for item in (authorized, refresh_attempted, refresh_succeeded)):
+        raise PlanValidationError("monitoring_bundle price-volume flags must be booleans")
+    normalized_context = {
+        "policy": _normalize_price_volume_policy(context.get("policy")),
+        "data_mode": data_mode,
+        "source_count": source_count,
+        "sources": [
+            _bounded_text(item, "monitoring_bundle.price_volume_context.sources", maximum=80)
+            for item in sources
+        ],
+        "single_source_authorized": authorized,
+        "warnings": [
+            _bounded_text(item, "monitoring_bundle.price_volume_context.warnings", maximum=500)
+            for item in warnings
+        ],
+        "refresh_attempted": refresh_attempted,
+        "refresh_succeeded": refresh_succeeded,
+    }
+
+    raw_candidates = payload.get("candidates") or []
+    if not isinstance(raw_candidates, list) or len(raw_candidates) > 12:
+        raise PlanValidationError("monitoring_bundle.candidates must contain at most 12 items")
+    normalized_candidates = [
+        validate_monitoring_candidate(
+            item,
+            expected_symbol=symbol,
+            generated_at=generated_at.isoformat(),
+            data_as_of=data_as_of.isoformat(),
+            valid_until=valid_until.isoformat(),
+        )
+        for item in raw_candidates
+    ]
+    if status == "available" and not normalized_candidates:
+        raise PlanValidationError("available monitoring_bundle requires at least one candidate")
+    if status != "available" and normalized_candidates:
+        raise PlanValidationError("unavailable monitoring_bundle must not contain candidates")
+    if data_mode == "single_source" and not authorized and any(
+        item.get("automation_status") == "action_ready" for item in normalized_candidates
+    ):
+        raise PlanValidationError(
+            "single-source candidates require explicit authorization before action_ready"
+        )
+    raw_changes = payload.get("scenario_changes") or []
+    if not isinstance(raw_changes, list) or len(raw_changes) > 24:
+        raise PlanValidationError("monitoring_bundle.scenario_changes must be a list")
+    scenario_changes: list[dict[str, Any]] = []
+    for index, raw_change in enumerate(raw_changes):
+        prefix = f"monitoring_bundle.scenario_changes[{index}]"
+        if not isinstance(raw_change, dict):
+            raise PlanValidationError(f"{prefix} must be an object")
+        _reject_unknown_keys(
+            raw_change,
+            {
+                "scenario_family_id",
+                "candidate_id",
+                "previous_candidate_id",
+                "change_type",
+                "change_details",
+                "field_changes",
+                "reason_claim_ids",
+            },
+            prefix,
+        )
+        change_type = str(raw_change.get("change_type") or "")
+        if change_type not in MONITORING_CHANGE_TYPES:
+            raise PlanValidationError(f"{prefix}.change_type is not allowed")
+        candidate_id = _bounded_text(
+            raw_change.get("candidate_id"),
+            f"{prefix}.candidate_id",
+            maximum=80,
+            required=False,
+        )
+        previous_candidate_id = _bounded_text(
+            raw_change.get("previous_candidate_id"),
+            f"{prefix}.previous_candidate_id",
+            maximum=80,
+            required=False,
+        )
+        if change_type == "new" and not candidate_id:
+            raise PlanValidationError(f"{prefix}.candidate_id is required for new scenarios")
+        if change_type != "new" and not previous_candidate_id:
+            raise PlanValidationError(
+                f"{prefix}.previous_candidate_id is required for carried or withdrawn scenarios"
+            )
+        details = raw_change.get("change_details") or {}
+        if not isinstance(details, dict):
+            raise PlanValidationError(f"{prefix}.change_details must be an object")
+        _reject_unknown_keys(
+            details,
+            {"previous_level", "current_level", "delta", "summary"},
+            f"{prefix}.change_details",
+        )
+        normalized_details: dict[str, Any] = {}
+        for field in ("previous_level", "current_level", "delta"):
+            if details.get(field) is not None:
+                normalized_details[field] = _finite(
+                    details.get(field), f"{prefix}.change_details.{field}"
+                )
+        if details.get("summary"):
+            normalized_details["summary"] = _bounded_text(
+                details.get("summary"), f"{prefix}.change_details.summary", maximum=500
+            )
+        raw_field_changes = raw_change.get("field_changes") or []
+        if not isinstance(raw_field_changes, list) or len(raw_field_changes) > 32:
+            raise PlanValidationError(f"{prefix}.field_changes must be a list")
+        field_changes: list[dict[str, Any]] = []
+        for field_index, raw_field_change in enumerate(raw_field_changes):
+            change_field = f"{prefix}.field_changes[{field_index}]"
+            if not isinstance(raw_field_change, dict):
+                raise PlanValidationError(f"{change_field} must be an object")
+            _reject_unknown_keys(raw_field_change, {"field", "before", "after"}, change_field)
+            field_changes.append(
+                {
+                    "field": _bounded_text(
+                        raw_field_change.get("field"), f"{change_field}.field", maximum=160
+                    ),
+                    "before": copy.deepcopy(raw_field_change.get("before")),
+                    "after": copy.deepcopy(raw_field_change.get("after")),
+                }
+            )
+        reason_claim_ids = raw_change.get("reason_claim_ids") or []
+        if not isinstance(reason_claim_ids, list) or len(reason_claim_ids) > 16:
+            raise PlanValidationError(f"{prefix}.reason_claim_ids must be a list")
+        scenario_changes.append(
+            {
+                "scenario_family_id": _bounded_text(
+                    raw_change.get("scenario_family_id"),
+                    f"{prefix}.scenario_family_id",
+                    maximum=80,
+                ),
+                "candidate_id": candidate_id or None,
+                "previous_candidate_id": previous_candidate_id or None,
+                "change_type": change_type,
+                "change_details": normalized_details,
+                "field_changes": field_changes,
+                "reason_claim_ids": [
+                    _bounded_text(item, f"{prefix}.reason_claim_ids", maximum=120)
+                    for item in reason_claim_ids
+                ],
+            }
+        )
+    validation_errors = payload.get("validation_errors") or []
+    if not isinstance(validation_errors, list) or len(validation_errors) > 24:
+        raise PlanValidationError("monitoring_bundle.validation_errors must be a list")
+    expected_source = (
+        "structured_weekly_report" if horizon == "weekly" else "structured_daily_report"
+    )
+    source = str(payload.get("source") or expected_source)
+    if source not in MONITORING_SOURCES or source != expected_source:
+        raise PlanValidationError(f"monitoring_bundle.source must be {expected_source}")
+    if str(payload.get("activation_policy") or "manual_confirmation_required") != "manual_confirmation_required":
+        raise PlanValidationError("monitoring_bundle activation requires manual confirmation")
+    if str(payload.get("trade_execution") or "forbidden") != "forbidden":
+        raise PlanValidationError("monitoring_bundle.trade_execution must be forbidden")
+    source_period = payload.get("source_period") or {}
+    if not isinstance(source_period, dict):
+        raise PlanValidationError("monitoring_bundle.source_period must be an object")
+    _reject_unknown_keys(
+        source_period,
+        {"week_start", "week_end", "label"},
+        "monitoring_bundle.source_period",
+    )
+    normalized_source_period = {
+        key: _bounded_text(
+            value, f"monitoring_bundle.source_period.{key}", maximum=80
+        )
+        for key, value in source_period.items()
+        if value not in (None, "")
+    }
+    return {
+        "schema_version": schema_version,
+        "symbol": symbol,
+        "instrument_type": instrument_type,
+        "horizon": horizon,
+        "generated_at": generated_at.isoformat(),
+        "data_as_of": data_as_of.isoformat(),
+        "valid_from": valid_from.isoformat(),
+        "valid_until": valid_until.isoformat(),
+        "review_due_at": review_due_at.isoformat(),
+        "source_valid_until": source_valid_until.isoformat(),
+        "expired_reason": expired_reason or None,
+        "early_invalidation_conditions": [
+            _bounded_text(
+                item,
+                "monitoring_bundle.early_invalidation_conditions",
+                maximum=500,
+            )
+            for item in early_invalidation_conditions
+        ],
+        "price_basis": normalized_price_basis,
+        "monitoring_status": status,
+        "price_volume_context": normalized_context,
+        "candidates": normalized_candidates,
+        "scenario_changes": scenario_changes,
+        "validation_errors": [
+            _bounded_text(item, "monitoring_bundle.validation_errors", maximum=1000)
+            for item in validation_errors
+        ],
+        "source": source,
+        "source_report_id": _bounded_text(
+            payload.get("source_report_id"),
+            "monitoring_bundle.source_report_id",
+            maximum=120,
+            required=False,
+        ) or None,
+        "source_period": normalized_source_period,
+        "activation_policy": "manual_confirmation_required",
+        "trade_execution": "forbidden",
+        **(
+            {
+                "level_snapshot_id": level_snapshot_id,
+                "selection_mode": selection_mode,
+                "price_conversion": {
+                    "analysis_basis": _bounded_text(
+                        price_conversion.get("analysis_basis"),
+                        "monitoring_bundle.price_conversion.analysis_basis",
+                        maximum=80,
+                    ),
+                    "runtime_basis": "raw",
+                    "events": list(price_conversion.get("events") or []),
+                },
+            }
+            if schema_version >= 2
+            else {}
+        ),
+    }
 
 
 def validate_plan_for_activation(
@@ -1221,6 +2054,18 @@ def validate_plan_for_activation(
         raise PlanValidationError(
             "hard_valid_until must be between 30 and 365 days in the future"
         )
+
+    if plan.get("source_valid_until") or plan.get("review_due_at"):
+        source_valid_until = _aware_iso_datetime(
+            plan.get("source_valid_until"), "source_valid_until"
+        )
+        review_due_at = _aware_iso_datetime(
+            plan.get("review_due_at"), "review_due_at"
+        )
+        if source_valid_until <= current or review_due_at <= current:
+            raise PlanValidationError(
+                "source report has reached its review deadline; generate or select a fresh report"
+            )
 
     for index, rule in enumerate(plan.get("market_rules") or []):
         rule_valid_until = _aware_iso_datetime(

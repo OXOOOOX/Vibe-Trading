@@ -18,6 +18,7 @@ from .models import (
     CONDITION_METRICS,
     DEFAULT_PRICE_VOLUME_POLICY,
     PlanValidationError,
+    validate_monitoring_bundle,
     validate_plan,
 )
 from .planner import MonitoringPlanner
@@ -27,6 +28,20 @@ class MonitorPlannerClient(Protocol):
     model_id: str
 
     def complete(self, messages: list[dict[str, str]]) -> str: ...
+
+
+class DeterministicMarketRepairError(PlanValidationError):
+    """Stable failure reasons for the no-model monitoring repair path."""
+
+    def __init__(
+        self,
+        reasons: list[str],
+        *,
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
+        self.reasons = list(dict.fromkeys(str(reason) for reason in reasons if reason))
+        self.evidence = dict(evidence or {})
+        super().__init__(", ".join(self.reasons) or "deterministic_market_repair_failed")
 
 
 class ChatMonitorPlannerClient:
@@ -105,6 +120,107 @@ class ReportDrivenMonitoringPlanner:
         self.client = client or ChatMonitorPlannerClient()
         self.model_id = f"report-driven:{self.client.model_id}"
 
+    @staticmethod
+    def _promote_closed_daily_conditions(
+        candidates: list[dict[str, Any]],
+        *,
+        allow_action_ready: bool,
+    ) -> dict[str, int]:
+        """Compile report-preserved daily semantics into deterministic v5 checks."""
+
+        mapped_conditions = 0
+        promoted_candidates = 0
+        for candidate in candidates:
+            source_conditions = candidate.get("source_conditions") or []
+            confirmation_group = candidate.setdefault(
+                "confirmation_conditions", {"operator": "all", "conditions": []}
+            )
+            invalidation_group = candidate.setdefault(
+                "invalidation_conditions", {"operator": "all", "conditions": []}
+            )
+            executable_source_ids = {
+                str(condition.get("source_condition_id") or "")
+                for group in (confirmation_group, invalidation_group)
+                for condition in group.get("conditions") or []
+                if isinstance(condition, dict)
+            }
+            candidate_mapped = False
+            for source in source_conditions:
+                if not isinstance(source, dict):
+                    continue
+                research = source.get("research_condition")
+                source_id = str(source.get("condition_id") or "")
+                if (
+                    not isinstance(research, dict)
+                    or not source_id
+                    or source_id in executable_source_ids
+                ):
+                    continue
+                kind = str(research.get("kind") or "")
+                runtime_condition: dict[str, Any] | None = None
+                if kind == "daily_close":
+                    runtime_condition = {
+                        "kind": "price_compare",
+                        "operator": str(research.get("operator") or "gte"),
+                        "value": research.get("value"),
+                        "interval": "1d",
+                        "consecutive": int(research.get("consecutive") or 1),
+                        "lookback_bars": 1,
+                        "freshness_seconds": 345600,
+                        "unit": str(research.get("unit") or "CNY"),
+                    }
+                elif (
+                    kind == "daily_volume_ratio"
+                    and str(research.get("baseline") or "") == "previous_5_day_average"
+                    and str(research.get("metric") or "volume") == "volume"
+                ):
+                    runtime_condition = {
+                        "kind": "rolling_volume_ratio",
+                        "operator": str(research.get("operator") or "gte"),
+                        "value": research.get("threshold"),
+                        "interval": "1d",
+                        "consecutive": 1,
+                        "lookback_bars": int(research.get("lookback") or 5),
+                        "freshness_seconds": 345600,
+                        "metric": "volume",
+                        "unit": "ratio",
+                    }
+                if runtime_condition is None:
+                    continue
+                runtime_condition.update(
+                    condition_id=f"runtime_{_sha([source_id, research])[:20]}",
+                    source_condition_id=source_id,
+                )
+                target_group = (
+                    invalidation_group
+                    if str(source.get("role") or "required") == "invalidation"
+                    else confirmation_group
+                )
+                target_group.setdefault("conditions", []).append(runtime_condition)
+                source["coverage_status"] = "mapped"
+                source["reason"] = "已由自主监控的闭合日线确定性条件执行器映射。"
+                source["executable_mapping"] = {
+                    "coverage_status": "mapped",
+                    "reason": "使用已验证原始日线收盘与成交量计算，不以分钟量价替代。",
+                }
+                executable_source_ids.add(source_id)
+                mapped_conditions += 1
+                candidate_mapped = True
+            required_pending = any(
+                str(source.get("role") or "required") == "required"
+                and str(source.get("coverage_status") or "") != "mapped"
+                for source in source_conditions
+                if isinstance(source, dict)
+            )
+            candidate["mapping_status"] = "partial" if required_pending else "mapped"
+            if candidate_mapped and not required_pending and allow_action_ready:
+                candidate["automation_status"] = "action_ready"
+                promoted_candidates += 1
+        return {
+            "mapped_condition_count": mapped_conditions,
+            "promoted_candidate_count": promoted_candidates,
+        }
+
     def market_evidence(self, holding: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         symbol = normalize_symbol(str(holding.get("symbol") or holding.get("code") or "")).upper()
         quote = self.market_planner._actionable_quote(symbol)  # constrained verified/raw accessor
@@ -176,6 +292,46 @@ class ReportDrivenMonitoringPlanner:
             "data_as_of": (quote or {}).get("bar_time"),
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
+        # Feed the same structural snapshot identity into autonomous dedupe and
+        # circuit-breaking that the eventual planner consumes.  This prevents
+        # a changed tail, volume contract, adjustment factor, or method version
+        # from being mistaken for a repeat of an already-blocked input.
+        structural_builder = getattr(self.market_planner, "build", None)
+        if callable(structural_builder):
+            _plan, structural_evidence, structural_blocked = structural_builder(holding)
+        else:  # lightweight test/adapter implementations may expose quote access only
+            structural_evidence, structural_blocked = {}, []
+        level_snapshot = dict(structural_evidence.get("level_snapshot") or {})
+        candidate_catalog = []
+        for candidate in level_snapshot.get("level_candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            candidate_catalog.append({
+                "candidate_id": candidate.get("candidate_id"),
+                "level_type": candidate.get("level_type"),
+                "lower": candidate.get("lower"),
+                "upper": candidate.get("upper"),
+                "representative_value": candidate.get("representative_value"),
+                "invalidation": (candidate.get("invalidation") or {}).get("value"),
+                "score": candidate.get("score"),
+                "confidence": candidate.get("confidence"),
+                "automation_status": candidate.get("automation_status"),
+                "method_ids": list(candidate.get("method_ids") or []),
+            })
+        evidence["structural_snapshot"] = {
+            key: structural_evidence.get(key)
+            for key in (
+                "level_snapshot_id",
+                "daily_tail_hash",
+                "volume_signature",
+                "adjustment_factor_revision",
+                "method_registry_version",
+                "continuity",
+                "selection_mode",
+            )
+        }
+        evidence["structural_snapshot"]["candidate_catalog"] = candidate_catalog
+        evidence["structural_snapshot"]["blocked_reasons"] = list(structural_blocked)
         return evidence, list(dict.fromkeys(blocked))
 
     def build(
@@ -281,6 +437,8 @@ class ReportDrivenMonitoringPlanner:
         )
         manifest = {
             "planner_mode": "report_driven_strict_json",
+            "source": "legacy_extraction",
+            "legacy_extraction": True,
             "prompt_version": self.prompt_version,
             "report_snapshot": {
                 key: analysis_snapshot.get(key)
@@ -303,6 +461,704 @@ class ReportDrivenMonitoringPlanner:
             "data_as_of": evidence.get("data_as_of"),
         }
         return plan, manifest, research_candidate
+
+    def build_from_verified_market_repair(
+        self,
+        *,
+        holding: dict[str, Any],
+        report_snapshot: dict[str, Any],
+        autonomous: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any], None]:
+        """Repair an empty structural bundle from verified raw market evidence.
+
+        This is deliberately deterministic and does not call the report-planner
+        model. Numeric levels come only from the shared, continuity-safe,
+        versioned structural engine.
+        """
+
+        plan, evidence, blocked = self.market_planner.build(holding)
+        reasons = list(blocked)
+        if str(evidence.get("data_mode") or "") != "verified":
+            reasons.append("deterministic_market_repair_requires_verified_market")
+        if int(evidence.get("daily_bar_count") or 0) < 20:
+            reasons.append("deterministic_market_repair_insufficient_daily_history")
+        if str(evidence.get("threshold_method") or "") != "multi_method_level_evidence":
+            reasons.append("no_qualified_level")
+        if plan is None and not reasons:
+            reasons.append("deterministic_market_repair_no_plan")
+        if reasons:
+            raise DeterministicMarketRepairError(reasons, evidence=evidence)
+
+        raw_bundle = report_snapshot.get("monitoring_bundle")
+        bundle = raw_bundle if isinstance(raw_bundle, dict) else {}
+        now = datetime.now(timezone.utc)
+        review_due_at = (now + timedelta(days=7)).isoformat()
+        source_valid_until = (now + timedelta(days=30)).isoformat()
+        repaired_plan = json.loads(json.dumps(plan, ensure_ascii=False))
+        repaired_plan.update(
+            summary=(
+                "原结构报告没有可执行点位；系统已基于连续性安全的多周期量价结构"
+                "确定性生成观察计划。仅用于提醒和复核，不执行交易。"
+            ),
+            source_horizon="structural",
+            source_report_id=str(bundle.get("report_id") or report_snapshot.get("source_id") or "") or None,
+            source_valid_until=source_valid_until,
+            review_due_at=review_due_at,
+        )
+        repaired_plan["evidence_notes"] = [
+            "自动修复未重跑完整深度报告，也未调用模型生成价格点位。",
+            "所有阈值均由连续性安全的多周期量价结构候选确定性计算。",
+            "原报告继续作为研究背景；本修复只补齐行情监控层，不补写基本面结论。",
+            *list(repaired_plan.get("evidence_notes") or []),
+        ]
+        analysis_ref = {
+            "snapshot_id": str(
+                report_snapshot.get("snapshot_id") or "deterministic-market-repair"
+            ),
+            "report_ref": report_snapshot["report_ref"],
+            "report_type": report_snapshot["report_type"],
+            "title": report_snapshot["title"],
+            "revision": int(report_snapshot.get("revision") or 1),
+            "body_sha256": report_snapshot["body_sha256"],
+            "quality_status": report_snapshot["quality_status"],
+            "generated_at": report_snapshot["generated_at"],
+            "data_as_of": report_snapshot["data_as_of"],
+        }
+        # The shared planner already produced schema-v5 scenarios, including
+        # zone entries, original-timeframe invalidation and risk-preference
+        # sizing gates.  Preserve those semantics during deterministic repair;
+        # rebuilding every rule as a single threshold would collapse zones and
+        # silently reintroduce the legacy system-default sizing policy.
+        scenarios = json.loads(
+            json.dumps(repaired_plan.get("watch_scenarios") or [], ensure_ascii=False)
+        )
+        for scenario in scenarios:
+            refs = [
+                "verified_market_consensus",
+                f"daily_tail_sha256:{evidence['daily_tail_hash']}",
+                *list(scenario.get("evidence_refs") or []),
+            ]
+            scenario["evidence_refs"] = list(dict.fromkeys(refs))
+        repaired_plan.update(
+            schema_version=5,
+            analysis_ref=analysis_ref,
+            watch_scenarios=scenarios,
+            automation_policy={
+                "activation_mode": (
+                    "autonomous" if autonomous else "manual_confirmation_required"
+                ),
+                "activated_by": "autopilot" if autonomous else "report",
+                "evidence_fingerprint": _sha(evidence),
+                "trade_execution": "forbidden",
+                "trigger_type": "deterministic_market_repair",
+            },
+        )
+        repaired_plan = validate_plan(repaired_plan, expected_symbol=str(evidence["symbol"]))
+
+        report_ref = {
+            key: report_snapshot.get(key)
+            for key in (
+                "snapshot_id",
+                "report_ref",
+                "report_type",
+                "symbol",
+                "title",
+                "revision",
+                "body_sha256",
+                "quality_status",
+                "generated_at",
+                "data_as_of",
+            )
+        }
+        manifest = {
+            "planner_mode": "deterministic_multi_method_market_repair",
+            "planner_model_id": self.market_planner.model_id,
+            "source": "verified_market_consensus",
+            "legacy_extraction": False,
+            "report_snapshot": report_ref,
+            "source_report_snapshot_id": report_snapshot.get("snapshot_id"),
+            "monitoring_bundle_sha256": _sha(bundle),
+            "market_evidence": evidence,
+            "data_as_of": evidence.get("data_as_of"),
+            "requires_manual_activation": not autonomous,
+            "autonomous_report_approval": {
+                "approved": bool(autonomous),
+                "basis": "selected_autonomous_holding_verified_market_repair",
+            },
+            "repair_strategy": "continuity_then_multi_method_no_model",
+            "model_calls": 0,
+            "source_horizon": "structural",
+            "source_report_id": bundle.get("report_id"),
+            "source_valid_until": source_valid_until,
+            "review_due_at": review_due_at,
+            "trade_execution": "forbidden",
+        }
+        return repaired_plan, manifest, None
+
+    def build_from_monitoring_bundle(
+        self,
+        *,
+        holding: dict[str, Any],
+        report_snapshot: dict[str, Any],
+        autonomous: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any], None]:
+        """Build a draft deterministically from a shared daily/weekly bundle."""
+
+        symbol = normalize_symbol(str(holding.get("symbol") or holding.get("code") or "")).upper()
+        raw_bundle = report_snapshot.get("monitoring_bundle")
+        horizon = str((raw_bundle or {}).get("horizon") or "daily") if isinstance(raw_bundle, dict) else "daily"
+        bundle = validate_monitoring_bundle(
+            raw_bundle,
+            expected_symbol=symbol,
+            expected_horizon=horizon,
+        )
+        if bundle["monitoring_status"] != "available" or not bundle["candidates"]:
+            raise PlanValidationError(
+                f"structured monitoring bundle is {bundle['monitoring_status']}"
+            )
+        market_evidence, blocked = self.market_evidence(holding)
+        if blocked:
+            raise PlanValidationError(", ".join(blocked))
+        now = datetime.now(timezone.utc)
+        review_due_at = datetime.fromisoformat(
+            str(bundle["review_due_at"]).replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+        source_valid_until = datetime.fromisoformat(
+            str(bundle["source_valid_until"]).replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+        if now >= review_due_at or now >= source_valid_until:
+            raise PlanValidationError(
+                "source report has reached its review deadline; generate a fresh report"
+            )
+        # The plan/rule envelope has a platform-level 30-day minimum.  The
+        # shorter report lifecycle remains authoritative through the separate
+        # source deadlines, which the runtime checks before evaluating rules.
+        # This keeps a weekly report activatable without letting it outlive its
+        # next mandatory report review.
+        plan_envelope_until = (now + timedelta(days=90)).isoformat()
+        hard_valid_until = plan_envelope_until
+        rule_valid_until = plan_envelope_until
+        candidates = json.loads(json.dumps(bundle["candidates"], ensure_ascii=False))
+        data_mode = str(bundle["price_volume_context"]["data_mode"] or "verified")
+        mapping_summary = self._promote_closed_daily_conditions(
+            candidates,
+            allow_action_ready=(
+                data_mode == "verified"
+                or bool(bundle["price_volume_context"].get("single_source_authorized"))
+            ),
+        )
+        structural = dict(market_evidence.get("structural_snapshot") or {})
+        algorithm_catalog = [
+            dict(item)
+            for item in structural.get("candidate_catalog") or []
+            if isinstance(item, dict)
+        ]
+        algorithm_matches: list[dict[str, Any]] = []
+        report_level_disagreements: list[dict[str, Any]] = []
+        for candidate in candidates:
+            trigger = dict(candidate.get("trigger") or {})
+            kind = str(trigger.get("kind") or "")
+            report_lower = trigger.get("lower")
+            report_upper = trigger.get("upper")
+            report_value = trigger.get("threshold")
+            expected_side = (
+                "resistance" if kind == "price_cross_above"
+                else "support" if kind == "price_cross_below"
+                else None
+            )
+            matched: dict[str, Any] | None = None
+            for algorithm in algorithm_catalog:
+                if expected_side and algorithm.get("level_type") != expected_side:
+                    continue
+                try:
+                    lower = float(algorithm["lower"])
+                    upper = float(algorithm["upper"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                width = max(upper - lower, float(bundle["price_basis"]["tick_size"]) * 2)
+                admissible = [(lower, upper)]
+                invalidation = algorithm.get("invalidation")
+                if invalidation is not None:
+                    invalidation_value = float(invalidation)
+                    admissible.append(
+                        (invalidation_value - width * 0.5, invalidation_value + width * 0.5)
+                    )
+                if report_value is not None:
+                    value = float(report_value)
+                    agrees = any(low <= value <= high for low, high in admissible)
+                elif report_lower is not None and report_upper is not None:
+                    zone_lower, zone_upper = float(report_lower), float(report_upper)
+                    agrees = any(
+                        zone_lower <= high and zone_upper >= low
+                        for low, high in admissible
+                    )
+                else:
+                    agrees = False
+                if agrees:
+                    matched = algorithm
+                    break
+
+            basis = dict(candidate.get("calculation_basis") or {})
+            fact_evidence_ready = bool(
+                candidate.get("claim_ids") and basis.get("references")
+            )
+            if matched and fact_evidence_ready:
+                algorithm_matches.append({
+                    "report_candidate_id": candidate.get("candidate_id"),
+                    "algorithm_candidate_id": matched.get("candidate_id"),
+                    "score": matched.get("score"),
+                    "confidence": matched.get("confidence"),
+                })
+                if matched.get("automation_status") == "action_ready":
+                    candidate["priority"] = "high"
+                else:
+                    candidate["automation_status"] = "watch_only"
+            else:
+                candidate["automation_status"] = "watch_only"
+                report_level_disagreements.append({
+                    "report_candidate_id": candidate.get("candidate_id"),
+                    "reason": (
+                        "fact_evidence_incomplete"
+                        if not fact_evidence_ready
+                        else "outside_algorithm_candidate_tolerance"
+                    ),
+                })
+        autonomous_report_approval = bool(
+            autonomous
+            and horizon == "weekly"
+            and data_mode == "verified"
+            and any(
+                candidate.get("automation_status") == "action_ready"
+                and candidate.get("mapping_status") == "mapped"
+                for candidate in candidates
+            )
+        )
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for candidate in candidates:
+            grouped.setdefault(str(candidate["trigger"]["kind"]), []).append(candidate)
+        for kind, values in grouped.items():
+            if kind not in {"price_cross_above", "price_cross_below"}:
+                for candidate in values:
+                    candidate["target_level"] = 1
+                continue
+            values.sort(
+                key=lambda item: float(item["trigger"]["threshold"]),
+                reverse=kind == "price_cross_below",
+            )
+            for level, candidate in enumerate(values, start=1):
+                candidate["target_level"] = min(level, 4)
+
+        rules: list[dict[str, Any]] = []
+        scenarios: list[dict[str, Any]] = []
+        for candidate in candidates:
+            trigger = candidate["trigger"]
+            parameters = {
+                "interval": trigger["interval"],
+                "adjustment": "raw",
+                "confirmation_count": trigger["confirmation_count"],
+                "cooldown_minutes": 120,
+                "clear_hysteresis_bps": candidate["resolution_policy"]["rejection_hysteresis_bps"],
+            }
+            if str(trigger["kind"]).startswith("price_cross"):
+                parameters["threshold"] = trigger["threshold"]
+            else:
+                parameters.update(lower=trigger["lower"], upper=trigger["upper"])
+            rules.append(
+                {
+                    "client_rule_id": candidate["client_rule_id"],
+                    "kind": trigger["kind"],
+                    "severity": "critical" if candidate["intent"] == "stop_loss" else "warning",
+                    "enabled": bool(
+                        candidate.get("automation_status") == "action_ready"
+                        and candidate.get("mapping_status") == "mapped"
+                    ),
+                    "alert_cue": "none",
+                    "target_intent": candidate["intent"],
+                    "target_level": candidate.pop("target_level"),
+                    "parameters": parameters,
+                    "valid_until": rule_valid_until,
+                    "rationale": candidate["rationale"],
+                    "calculation_basis": candidate["calculation_basis"],
+                }
+            )
+            scenarios.append(candidate)
+
+        analysis_ref = {
+            "snapshot_id": str(report_snapshot.get("snapshot_id") or "daily-monitoring-snapshot"),
+            "report_ref": report_snapshot["report_ref"],
+            "report_type": report_snapshot["report_type"],
+            "title": report_snapshot["title"],
+            "revision": int(report_snapshot.get("revision") or 1),
+            "body_sha256": report_snapshot["body_sha256"],
+            "quality_status": report_snapshot["quality_status"],
+            "generated_at": report_snapshot["generated_at"],
+            "data_as_of": report_snapshot["data_as_of"],
+        }
+        plan = validate_plan(
+            {
+                "schema_version": 5,
+                "symbol": symbol,
+                "data_mode": bundle["price_volume_context"]["data_mode"],
+                "summary": f"来自{horizon}结构化候选：{len(scenarios)} 个场景",
+                "quote_tier": (
+                    "active"
+                    if any(rule["parameters"]["interval"] == "1m" for rule in rules)
+                    else "normal"
+                ),
+                "near_trigger_tier": "active",
+                "near_trigger_distance_bps": max(
+                    item["approach_policy"]["distance_bps"] for item in scenarios
+                ),
+                "price_volume_policy": bundle["price_volume_context"]["policy"],
+                "analysis_ref": analysis_ref,
+                "watch_scenarios": scenarios,
+                "market_rules": rules,
+                "news_topics": [],
+                "fundamental_monitor": {"enabled": False, "capability_status": "monitoring_only"},
+                "hard_valid_until": hard_valid_until,
+                "source_horizon": horizon,
+                "source_report_id": bundle.get("source_report_id"),
+                "source_period": bundle.get("source_period") or {},
+                "source_valid_until": bundle["source_valid_until"],
+                "review_due_at": bundle["review_due_at"],
+                "evidence_notes": bundle["price_volume_context"]["warnings"],
+                "automation_policy": {
+                    "activation_mode": (
+                        "autonomous"
+                        if autonomous_report_approval
+                        else "manual_confirmation_required"
+                    ),
+                    "activated_by": (
+                        "autopilot" if autonomous_report_approval else f"{horizon}_report"
+                    ),
+                    "evidence_fingerprint": _sha(bundle),
+                    "trade_execution": "forbidden",
+                    "trigger_type": f"{horizon}_monitoring_bundle",
+                },
+            },
+            expected_symbol=symbol,
+        )
+        manifest = {
+            "planner_mode": "structured_monitoring_bundle",
+            "source": bundle["source"],
+            "legacy_extraction": False,
+            "report_snapshot": {
+                key: report_snapshot.get(key)
+                for key in (
+                    "snapshot_id",
+                    "report_ref",
+                    "report_type",
+                    "symbol",
+                    "title",
+                    "revision",
+                    "body_sha256",
+                    "quality_status",
+                    "generated_at",
+                    "data_as_of",
+                    "catalog_report_id",
+                    "catalog_family_id",
+                    "report_quality_status",
+                    "coverage_status",
+                )
+            },
+            "monitoring_bundle_sha256": _sha(bundle),
+            "market_evidence": market_evidence,
+            "data_as_of": market_evidence.get("data_as_of"),
+            "requires_manual_activation": not autonomous_report_approval,
+            "autonomous_report_approval": {
+                "approved": autonomous_report_approval,
+                "authority": "selected_ai_autonomous_holding" if autonomous else "manual_job",
+                "data_mode": data_mode,
+                **mapping_summary,
+                "trade_execution": "forbidden",
+            },
+            "algorithm_candidate_validation": {
+                "level_snapshot_id": structural.get("level_snapshot_id"),
+                "matches": algorithm_matches,
+                "disagreements": report_level_disagreements,
+            },
+            "source_horizon": horizon,
+            "source_report_id": bundle.get("source_report_id"),
+            "source_period": bundle.get("source_period") or {},
+            "source_valid_until": bundle["source_valid_until"],
+            "review_due_at": bundle["review_due_at"],
+            "trade_execution": "forbidden",
+        }
+        return plan, manifest, None
+
+    def build_from_structural_monitoring_bundle(
+        self,
+        *,
+        holding: dict[str, Any],
+        report_snapshot: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], None]:
+        """Adapt a compiler-owned Deep Report hand-off into a review draft.
+
+        Structural bundles deliberately have a different schema from daily and
+        weekly bundles.  This adapter preserves their evidence lineage and raw
+        levels, maps only deterministic price shapes, and leaves every result
+        behind the report's manual-confirmation boundary.
+        """
+
+        symbol = normalize_symbol(
+            str(holding.get("symbol") or holding.get("code") or "")
+        ).upper()
+        raw_bundle = report_snapshot.get("monitoring_bundle")
+        if not isinstance(raw_bundle, dict):
+            raise PlanValidationError("structural monitoring bundle is required")
+        bundle = json.loads(json.dumps(raw_bundle, ensure_ascii=False))
+        if str(bundle.get("symbol") or "").upper() != symbol:
+            raise PlanValidationError("structural monitoring bundle symbol does not match holding")
+        if str(bundle.get("horizon") or "") != "structural":
+            raise PlanValidationError("structural monitoring bundle horizon must be structural")
+        if str(bundle.get("trade_execution") or "") != "forbidden":
+            raise PlanValidationError("structural monitoring bundle must forbid trade execution")
+        if str(bundle.get("activation_policy") or "") != "manual_confirmation_required":
+            raise PlanValidationError("structural monitoring bundle requires manual confirmation")
+
+        now = datetime.now(timezone.utc)
+        review_due_at = self._aware_iso(bundle.get("review_due_at"), "review_due_at")
+        source_valid_until = self._aware_iso(
+            bundle.get("valid_until"),
+            "valid_until",
+        )
+        if now >= datetime.fromisoformat(review_due_at) or now >= datetime.fromisoformat(
+            source_valid_until
+        ):
+            raise PlanValidationError(
+                "source report has reached its review deadline; generate a fresh report"
+            )
+        plan_envelope_until = (now + timedelta(days=90)).isoformat()
+        if str(bundle.get("monitoring_status") or "") != "available":
+            raise PlanValidationError(
+                f"structural monitoring bundle is {bundle.get('monitoring_status') or 'unknown'}"
+            )
+
+        market_evidence, blocked = self.market_evidence(holding)
+        if blocked:
+            raise PlanValidationError(", ".join(blocked))
+        current_price = float(market_evidence["last_price"])
+        intent_map = {
+            "structural_invalidation": "stop_loss",
+            "major_support": "watch",
+            "major_resistance": "watch",
+            "breakout_confirmation": "breakout",
+            "trend_recovery": "watch",
+            "research_review": "watch",
+        }
+        upward_intents = {
+            "major_resistance",
+            "breakout_confirmation",
+            "trend_recovery",
+        }
+        rules: list[dict[str, Any]] = []
+        scenarios: list[dict[str, Any]] = []
+        unmapped: list[dict[str, Any]] = []
+        for index, raw in enumerate(bundle.get("candidates") or []):
+            if not isinstance(raw, dict):
+                continue
+            level = raw.get("level") if isinstance(raw.get("level"), dict) else None
+            scenario_id = str(raw.get("scenario_id") or f"structural-{index + 1}")
+            if level is None or str(level.get("kind") or "") not in {"point", "range"}:
+                unmapped.append(
+                    {
+                        "scenario_id": scenario_id,
+                        "reason": "structural_level_not_machine_expressible",
+                    }
+                )
+                continue
+            intent = str(raw.get("intent") or "research_review")
+            target_intent = intent_map.get(intent, "watch")
+            client_rule_id = f"structural-{scenario_id}"[:80]
+            if level["kind"] == "range":
+                lower = float(level["low"])
+                upper = float(level["high"])
+                trigger = {
+                    "kind": "price_zone_enter",
+                    "lower": lower,
+                    "upper": upper,
+                    "interval": "5m",
+                    "confirmation_count": 2,
+                }
+                original_level = {
+                    "kind": "zone",
+                    "lower": lower,
+                    "upper": upper,
+                    "unit": "CNY",
+                    "adjustment": "raw",
+                    "source_text": str(raw.get("source_text") or raw.get("label") or ""),
+                }
+                parameters = {
+                    "lower": lower,
+                    "upper": upper,
+                    "interval": "5m",
+                    "adjustment": "raw",
+                    "confirmation_count": 2,
+                    "cooldown_minutes": 120,
+                    "clear_hysteresis_bps": 30,
+                }
+            else:
+                threshold = float(level["price"])
+                kind = (
+                    "price_cross_above"
+                    if intent in upward_intents
+                    else "price_cross_below"
+                    if intent in {"structural_invalidation", "major_support"}
+                    else "price_cross_above"
+                    if threshold >= current_price
+                    else "price_cross_below"
+                )
+                trigger = {
+                    "kind": kind,
+                    "threshold": threshold,
+                    "interval": "5m",
+                    "confirmation_count": 2,
+                }
+                original_level = {
+                    "kind": "price",
+                    "value": threshold,
+                    "unit": "CNY",
+                    "adjustment": "raw",
+                    "source_text": str(raw.get("source_text") or raw.get("label") or ""),
+                }
+                parameters = {
+                    "threshold": threshold,
+                    "interval": "5m",
+                    "adjustment": "raw",
+                    "confirmation_count": 2,
+                    "cooldown_minutes": 120,
+                    "clear_hysteresis_bps": 30,
+                }
+            lineage = raw.get("lineage") if isinstance(raw.get("lineage"), dict) else {}
+            evidence_refs = [
+                str(value)
+                for key in ("claim_ids", "fact_ids", "evidence_ids")
+                for value in lineage.get(key) or []
+                if str(value).strip()
+            ][:8]
+            if not evidence_refs:
+                evidence_refs = [str(raw.get("source_text") or scenario_id)[:300]]
+            action_ready = bool(
+                raw.get("machine_expressible")
+                and raw.get("actionability") == "action_ready"
+                and lineage.get("status") == "complete"
+            )
+            rules.append(
+                {
+                    "client_rule_id": client_rule_id,
+                    "kind": trigger["kind"],
+                    "severity": "critical" if target_intent == "stop_loss" else "warning",
+                    "enabled": action_ready,
+                    "alert_cue": "none",
+                    "target_intent": target_intent,
+                    "target_level": min(index + 1, 4),
+                    "parameters": parameters,
+                    "valid_until": plan_envelope_until,
+                    "rationale": str(raw.get("source_text") or raw.get("label") or scenario_id),
+                }
+            )
+            scenarios.append(
+                {
+                    "scenario_id": scenario_id,
+                    "client_rule_id": client_rule_id,
+                    "label": str(raw.get("label") or intent),
+                    "intent": target_intent,
+                    "evidence_refs": evidence_refs,
+                    "original_level": original_level,
+                    "trigger": trigger,
+                    "approach_policy": {
+                        "distance_bps": 100,
+                        "source": "report",
+                        "check_interval": "1m",
+                    },
+                    "volume_confirmation": {
+                        "metric": "same_bucket_5m_volume_ratio",
+                        "comparator": "gte",
+                        "threshold": DEFAULT_PRICE_VOLUME_POLICY["expansion_ratio"],
+                        "min_samples": DEFAULT_PRICE_VOLUME_POLICY["min_samples"],
+                        "mode": "classify_only",
+                        "unit": "ratio",
+                    },
+                    "resolution_policy": {
+                        "rejection_hysteresis_bps": 30,
+                        "max_observation_bars": 6,
+                        "close_action": "unresolved",
+                    },
+                    "rationale": "；".join(
+                        [
+                            str(raw.get("source_text") or raw.get("label") or scenario_id),
+                            *[str(value) for value in raw.get("volume_conditions") or []],
+                        ]
+                    )[:1200],
+                }
+            )
+        if not scenarios:
+            raise PlanValidationError("structural monitoring bundle has no price-level scenarios")
+
+        analysis_ref = {
+            key: report_snapshot[key]
+            for key in (
+                "snapshot_id",
+                "report_ref",
+                "report_type",
+                "title",
+                "revision",
+                "body_sha256",
+                "quality_status",
+                "generated_at",
+                "data_as_of",
+            )
+        }
+        plan = validate_plan(
+            {
+                "schema_version": 4,
+                "symbol": symbol,
+                "data_mode": str(market_evidence.get("data_mode") or "verified"),
+                "summary": (
+                    f"来自结构性报告的 {len(scenarios)} 个点位场景；"
+                    "仅生成待审观察草案，不自动交易。"
+                ),
+                "quote_tier": "normal",
+                "near_trigger_tier": "active",
+                "near_trigger_distance_bps": 100,
+                "price_volume_policy": dict(DEFAULT_PRICE_VOLUME_POLICY),
+                "analysis_ref": analysis_ref,
+                "watch_scenarios": scenarios,
+                "market_rules": rules,
+                "news_topics": [],
+                "fundamental_monitor": {"enabled": False, "capability_status": "monitoring_only"},
+                "hard_valid_until": plan_envelope_until,
+                "source_horizon": "structural",
+                "source_report_id": bundle.get("report_id"),
+                "source_period": (report_snapshot.get("metadata") or {}).get("report_period") or {},
+                "source_valid_until": source_valid_until,
+                "review_due_at": review_due_at,
+                "evidence_notes": [
+                    "结构性报告点位保持原值；量价仅作分类确认。",
+                    f"未映射无点位场景 {len(unmapped)} 个。",
+                ],
+            },
+            expected_symbol=symbol,
+        )
+        manifest = {
+            "planner_mode": "structural_monitoring_bundle",
+            "source": "structured_deep_report",
+            "legacy_extraction": False,
+            "report_snapshot": analysis_ref,
+            "monitoring_bundle_sha256": _sha(bundle),
+            "market_evidence": market_evidence,
+            "data_as_of": market_evidence.get("data_as_of"),
+            "requires_manual_activation": True,
+            "source_horizon": "structural",
+            "source_report_id": bundle.get("report_id"),
+            "source_valid_until": source_valid_until,
+            "review_due_at": review_due_at,
+            "unmapped_candidates": unmapped,
+            "enabled_candidate_count": sum(1 for rule in rules if rule["enabled"]),
+            "trade_execution": "forbidden",
+        }
+        return plan, manifest, None
 
     def finalize_research_snapshot(
         self,

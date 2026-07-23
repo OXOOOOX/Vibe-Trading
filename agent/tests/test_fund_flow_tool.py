@@ -35,6 +35,12 @@ class TestSuccessEnvelope:
 
         payload = json.loads(text)
         assert payload["ok"] is True
+        assert payload["schema_version"] == 2
+        assert payload["metric_family"] == "secondary_market_order_size_net_flow"
+        assert payload["unit"] == "CNY"
+        assert payload["entity_identification"] is False
+        assert payload["actor_inference"] == "unsupported"
+        assert "ETF subscriptions or redemptions" in payload["not_equivalent_to"]
         assert payload["market"] == "stock"
         assert payload["source"] == "eastmoney"
         assert payload["period"] == "daily"
@@ -50,6 +56,25 @@ class TestSuccessEnvelope:
             "large": 60.0,
             "super_large": 40.0,
         }
+
+    def test_proxy_flow_labels_subject_and_data_symbol(self):
+        with patch(
+            "src.tools.fund_flow_tool.resolve_secid", return_value="1.588000"
+        ), patch(
+            "src.tools.fund_flow_tool.get_json", return_value=_DAILY_PAYLOAD
+        ):
+            text = FundFlowTool().execute(
+                codes=["588000.SH"],
+                period="daily",
+                _subject_symbol="588870.SH",
+                _relationship="fund_flow_reference",
+            )
+
+        payload = json.loads(text)
+        item = payload["data"]["588000.SH"]
+        assert item["subject_symbol"] == "588870.SH"
+        assert item["data_symbol"] == "588000.SH"
+        assert item["relationship"] == "fund_flow_reference"
 
     def test_days_cap_keeps_most_recent_rows(self):
         with patch(

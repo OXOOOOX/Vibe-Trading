@@ -8,6 +8,7 @@ import {
   type MonitorPlan,
   type MonitorPlanVersion,
   type MonitorProfile,
+  type MonitorTargetMonitoringCard,
   type PortfolioHolding,
   type PortfolioMonitoringStatus,
 } from "@/lib/api";
@@ -229,12 +230,128 @@ describe("PortfolioMonitorPanel reliable controls", () => {
       automatic_trading: "forbidden",
     });
     vi.spyOn(api, "listPortfolioMonitoringAutopilotRuns").mockResolvedValue({ runs: [] });
+    vi.spyOn(api, "listPortfolioMonitoringTargets").mockResolvedValue({ targets: [] });
     vi.spyOn(api, "listPortfolioMonitorRecommendations").mockResolvedValue({ recommendations: [] });
     vi.spyOn(api, "listPortfolioMonitorReportCandidates").mockImplementation(async (symbol) => ({
       symbol,
       candidates: [],
     }));
     vi.spyOn(api, "configurePortfolioMonitoringAutopilot");
+  });
+
+  it("explains weekly report provenance, review deadline, and watch-only degradation", async () => {
+    const weeklyPlan = makePlan({
+      source_horizon: "weekly",
+      source_report_id: "weekly_588870_20260717",
+      source_period: { week_start: "2026-07-13", week_end: "2026-07-17", label: "2026-07-13 至 2026-07-17" },
+      source_valid_until: "2026-07-24T07:30:00+00:00",
+      review_due_at: "2026-07-24T07:30:00+00:00",
+      analysis_ref: {
+        snapshot_id: "weekly-snapshot",
+        report_ref: "weekly:run:json",
+        report_type: "weekly_review",
+        title: "科创板芯片ETF周度复盘",
+        revision: 1,
+        body_sha256: "a".repeat(64),
+        quality_status: "data_limited",
+        generated_at: "2026-07-18T01:00:00+00:00",
+        data_as_of: "2026-07-17T07:00:00+00:00",
+      },
+      watch_scenarios: [{
+        scenario_id: "weekly-watch",
+        client_rule_id: "weekly-rule",
+        label: "周度阻力突破",
+        intent: "breakout",
+        evidence_refs: ["claim-1"],
+        original_level: { kind: "price", value: 1.85, unit: "CNY", adjustment: "raw" },
+        trigger: { kind: "price_cross_above", threshold: 1.85, interval: "1m", confirmation_count: 1 },
+        approach_policy: { distance_bps: 100, source: "report", check_interval: "1m" },
+        volume_confirmation: { metric: "same_bucket_5m_volume_ratio", comparator: "gte", threshold: 1.5, min_samples: 5, mode: "classify_only", unit: "ratio" },
+        resolution_policy: { rejection_hysteresis_bps: 30, max_observation_bars: 6, close_action: "unresolved" },
+        rationale: "等待日线确认",
+        source_conditions: [{
+          condition_id: "daily-close",
+          source_text: "日线收盘确认",
+          role: "required",
+          coverage_status: "awaiting_data",
+          reason: "分钟价格不能替代日线收盘",
+          evidence_refs: ["claim-1"],
+        }],
+        automation_status: "watch_only",
+      }],
+    });
+    const profile = makeProfile("active", [makeVersion(1, "active", weeklyPlan)]);
+    vi.mocked(api.listPortfolioMonitors).mockResolvedValue({ profiles: [profile] });
+    vi.mocked(api.getPortfolioMonitor).mockResolvedValue(profile);
+
+    renderPanel();
+
+    expect(await screen.findByText("来源：正式周报")).toBeInTheDocument();
+    expect(screen.getByText("科创板芯片ETF周度复盘")).toBeInTheDocument();
+    expect(screen.getByText("2026-07-13 至 2026-07-17")).toBeInTheDocument();
+    expect(screen.getByText(/action_ready 0 · watch_only 1 · 未自动映射条件 1/)).toBeInTheDocument();
+    expect(screen.getByText(/计划仍须人工确认/)).toBeInTheDocument();
+  });
+
+  it("shows that an AI-approved weekly plan is active in shadow without implying auto-trading", async () => {
+    const weeklyPlan = makePlan({
+      source_horizon: "weekly",
+      source_report_id: "weekly_588870_20260717",
+      source_valid_until: "2026-07-24T07:30:00+00:00",
+      review_due_at: "2026-07-24T07:30:00+00:00",
+      automation_policy: {
+        activation_mode: "autonomous",
+        activated_by: "autopilot",
+        trade_execution: "forbidden",
+        trigger_type: "weekly_monitoring_bundle",
+      },
+    });
+    const profile = makeProfile("active", [makeVersion(2, "active", weeklyPlan)]);
+    vi.mocked(api.listPortfolioMonitors).mockResolvedValue({ profiles: [profile] });
+    vi.mocked(api.getPortfolioMonitor).mockResolvedValue(profile);
+
+    renderPanel();
+
+    expect(await screen.findByText(/AI 已完成证据门禁判断并自动启用 shadow 监测/)).toBeInTheDocument();
+    expect(screen.getByText(/所有进退仍由人工决定/)).toBeInTheDocument();
+    expect(screen.queryByText(/该计划仍须人工确认后启用/)).not.toBeInTheDocument();
+  });
+
+  it("shows a masked semantic explanation for the current price-volume regime", async () => {
+    const profile = makeProfile();
+    if (!profile.last_quote) throw new Error("fixture must include a quote");
+    profile.last_quote.price_volume = {
+      status: "ready",
+      regime: "bearish_expansion",
+      volume_state: "expanded",
+      volume_ratio: 3.11,
+      baseline_samples: 10,
+      three_bar_return_bps: -196.52,
+      latest_return_bps: -34.25,
+      close_location: 0.1429,
+      accelerated_decline: false,
+      reason_codes: ["bearish_expansion", "volume_expanded"],
+      interpretation: {
+        bias: "bearish",
+        meaning: "价格下行且成交量显著高于同时间基准，主动卖盘占优。",
+        risk: "单根放量也可能包含恐慌换手。",
+        next_confirmation: "观察后续K线是否止跌并收回支撑位。",
+        confidence: "high",
+      },
+    };
+    vi.mocked(api.listPortfolioMonitors).mockResolvedValue({ profiles: [profile] });
+    vi.mocked(api.getPortfolioMonitor).mockResolvedValue(profile);
+
+    renderPanel();
+
+    const trigger = await screen.findByRole("button", { name: "下跌放量，查看量价含义" });
+    fireEvent.mouseEnter(trigger);
+    const tooltip = await screen.findByTestId("price-volume-meaning-tooltip");
+    expect(tooltip).toHaveClass("backdrop-blur-md");
+    expect(within(tooltip).getByText(/当前偏向：/)).toBeInTheDocument();
+    expect(within(tooltip).getByText("偏空")).toBeInTheDocument();
+    expect(within(tooltip).getByText(/主动卖盘占优/)).toBeInTheDocument();
+    expect(within(tooltip).getByText(/不会自动改写报告点位或触发交易/)).toBeInTheDocument();
   });
 
   it("enables autonomous monitoring once while keeping the runtime in shadow", async () => {
@@ -258,7 +375,7 @@ describe("PortfolioMonitorPanel reliable controls", () => {
       selected_symbols: ["588870.SH"],
       change_source: "user_toggle",
       daily_close_enabled: true,
-      delivery_target_id: undefined,
+      delivery_target_id: null,
       runtime_mode: "shadow",
     });
     expect(await screen.findByRole("switch", { name: "关闭自主监控" })).toHaveAttribute(
@@ -284,7 +401,7 @@ describe("PortfolioMonitorPanel reliable controls", () => {
     const unsupported = await screen.findByLabelText("自主监控暂不支持的标的");
     expect(unsupported).toHaveTextContent("AAPL");
     expect(unsupported).toHaveTextContent("仍保留在持仓矩阵选择中");
-    expect(screen.getByText(/自主监控已纳入 1 只/)).toBeInTheDocument();
+    expect(screen.getByText(/自主服务可纳入 1 只/)).toBeInTheDocument();
 
     await user.click(screen.getByRole("switch", { name: "开启自主监控" }));
 
@@ -293,7 +410,7 @@ describe("PortfolioMonitorPanel reliable controls", () => {
       selected_symbols: ["588870.SH"],
       change_source: "user_toggle",
       daily_close_enabled: true,
-      delivery_target_id: undefined,
+      delivery_target_id: null,
       runtime_mode: "shadow",
     });
     await waitFor(() => {
@@ -374,7 +491,7 @@ describe("PortfolioMonitorPanel reliable controls", () => {
 
     const toggle = await screen.findByRole("switch", { name: "开启自主监控" });
     expect(toggle).toBeEnabled();
-    expect(screen.getByText(/当前矩阵已选 1 \/ 共 2 只；自主监控已纳入 1 只：科创50指/)).toBeInTheDocument();
+    expect(screen.getByText(/当前已设普通监控 1 只、AI 自主 1 只 \/ 共 2 只；自主服务可纳入 1 只：科创50指/)).toBeInTheDocument();
     expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
     expect(api.configurePortfolioMonitoringAutopilot).not.toHaveBeenCalled();
   });
@@ -499,8 +616,177 @@ describe("PortfolioMonitorPanel reliable controls", () => {
 
     expect(await screen.findByLabelText("科创50指（588870） · holdings_changed")).toBeInTheDocument();
     expect((await screen.findAllByText("科创50指（588870）")).length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText(/这不是第二套监控/)).toBeInTheDocument();
+    expect(screen.getByText(/蓝色普通监控标的在这里选择报告并生成草案/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "手动生成覆盖草案" })).toBeInTheDocument();
+  });
+
+  it("keeps a selected autonomous holding visible while its first monitor profile is being built", async () => {
+    vi.mocked(api.listPortfolioMonitors).mockResolvedValue({ profiles: [] });
+    vi.mocked(api.getPortfolioMonitoringAutopilot).mockResolvedValue({
+      config_id: "default",
+      enabled: true,
+      selected_symbols: ["000651.SZ"],
+      activation_mode: "autonomous",
+      research_policy: "if_needed",
+      trigger_types: [
+        "report_ready", "holdings_changed", "scheduled_close", "approaching",
+        "invalidated", "material_evidence_changed",
+      ],
+      daily_close_enabled: true,
+      delivery_target_id: null,
+      runtime_mode: "shadow",
+      revision: 2,
+      automatic_trading: "forbidden",
+    });
+    vi.mocked(api.listPortfolioMonitoringAutopilotRuns).mockResolvedValue({
+      runs: [{
+        trigger_id: "run-gree-building",
+        symbol: "000651.SZ",
+        trigger_type: "holdings_changed",
+        status: "running",
+        payload: { holding_name: "格力电器" },
+        planner_job_id: "planner-gree-building",
+        created_at: "2026-07-22T03:30:56Z",
+        build_state: {
+          status: "building",
+          stage: "structural_report_refresh_requested",
+          stage_label: "刷新结构化研究",
+          progress_percent: 50,
+          planner_status: "researching",
+          item_status: "researching",
+          attempt: 1,
+          profile_id: null,
+          plan_version: null,
+          updated_at: "2026-07-22T03:31:00Z",
+          terminal: false,
+          self_repair: {
+            policy: "bounded",
+            infrastructure_retry_limit: 1,
+            infrastructure_retries_used: 0,
+            agent_iteration_limit: 0,
+            agent_token_budget: 0,
+            strategy: "verified_market_first_no_model",
+            full_report_retry_enabled: false,
+            circuit_open: false,
+            token_spend_allowed: false,
+          },
+        },
+      }],
+    });
+
+    renderPanel(
+      [{ name: "格力电器", code: "000651", symbol: "000651.SZ", quantity: 100 }],
+      new Set(["000651.SZ"]),
+    );
+
+    expect(await screen.findByRole("article", {
+      name: "格力电器 000651 自动监控准备中",
+    })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "格力电器 000651，正在建档" })).toBeInTheDocument();
+    expect(screen.getByText("已纳入 AI 自主监控范围")).toBeInTheDocument();
+    expect(screen.getByText(/不会假装已经开始行情监控/)).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "监控档案建立进度" })).toHaveAttribute("aria-valuenow", "50");
+    expect(screen.getAllByText("刷新结构化研究").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText(/多周期量价结构引擎重算候选/)).toBeInTheDocument();
+  });
+
+  it("shows the active AI decision brief and records a dynamic choice", async () => {
+    const user = userEvent.setup();
+    const profile = makeProfile("active", [makeVersion(1, "active", makePlan())]);
+    vi.mocked(api.listPortfolioMonitors).mockResolvedValue({ profiles: [profile] });
+    const card: MonitorTargetMonitoringCard = {
+      symbol: "588870.SH",
+      name: "科创50指",
+      profile_id: profile.profile_id,
+      profile_status: "active",
+      build_state: {
+        status: "active",
+        stage: "ready",
+        stage_label: "监控档案已建立",
+        progress_percent: 100,
+        attempt: 1,
+        terminal: true,
+        self_repair: {
+          policy: "bounded",
+          infrastructure_retry_limit: 1,
+          infrastructure_retries_used: 0,
+          agent_iteration_limit: 2,
+          agent_token_budget: 12000,
+          strategy: "continuity_then_multi_method",
+          full_report_retry_enabled: false,
+          circuit_open: false,
+          token_spend_allowed: false,
+        },
+      },
+      blockers: [],
+      continuity: { status: "continuous" },
+      level_summary: [],
+      volume_gate: { status: "ready" },
+      self_repair: {},
+      decision_id: "decision-1234567890",
+      decision_revision: 1,
+      evidence_fingerprint: "a".repeat(64),
+      decision_brief: {
+        headline: "支撑测试中，尚未确认失效",
+        market_state: "testing_support",
+        risk_level: "medium",
+        risk_direction: "downside",
+        recommended_choice_id: "wait_confirmation",
+        recommended_action: "observe",
+        summary: "AI建议：等待确认。触达点位本身不是买卖指令。",
+        why_now: ["价格已进入支撑区。", "日线尚未确认失效。", "量价确认不足。"],
+        counter_evidence: ["仍可能属于正常波动。"],
+        next_confirmation: "收复S1上沿并通过量价门禁。",
+        invalidation: "日线结构变化后重算。",
+        data_status: "verified",
+        confidence: "high",
+        choices: [
+          { choice_id: "wait_confirmation", label: "等待确认", description: "等待完成K线。", recommended: true },
+          { choice_id: "inspect_structural_risk", label: "查看结构风险", description: "展开风险。", recommended: false },
+        ],
+      },
+      risk_assessment: {
+        risk_level: "medium",
+        risk_direction: "downside",
+        risk_probability: null,
+        risk_impact: "medium",
+        estimated_impact_pct: 0.05,
+        estimated_impact_amount: 500,
+        data_confidence: "high",
+      },
+      level_ladder: {
+        support: [{ candidate_id: "s1", role: "S1", lower: 2.3, upper: 2.4, score: 82 }],
+        resistance: [{ candidate_id: "r1", role: "R1", lower: 2.8, upper: 2.9, score: 78 }],
+      },
+      action_playbook: {
+        do_now: "等待确认",
+        why: "尚未完成确认",
+        if_holds: "评估机会草稿",
+        if_breaks: "等待日线确认",
+        do_not: "不要机械加仓",
+        review_deadline: "下一根完成K线",
+        eligible_draft_types: [],
+      },
+      available_choices: [
+        { choice_id: "wait_confirmation", label: "等待确认", description: "等待完成K线。", recommended: true },
+        { choice_id: "inspect_structural_risk", label: "查看结构风险", description: "展开风险。", recommended: false },
+      ],
+      selected: true,
+    };
+    vi.mocked(api.listPortfolioMonitoringTargets).mockResolvedValue({ targets: [card] });
+    const choose = vi.spyOn(api, "choosePortfolioMonitoringDecision").mockResolvedValue({ status: "recorded" });
+
+    renderPanel([{ name: "科创50指", code: "588870", symbol: "588870.SH", quantity: 2100 }]);
+
+    expect(await screen.findByLabelText("科创50指 AI 决策摘要")).toBeInTheDocument();
+    expect(screen.getByText("支撑测试中，尚未确认失效")).toBeInTheDocument();
+    expect(screen.getByText("不输出伪精确概率")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "AI 推荐 · 等待确认" }));
+    await waitFor(() => expect(choose).toHaveBeenCalledWith(
+      card.decision_id,
+      "wait_confirmation",
+      expect.objectContaining({ evidence_fingerprint: card.evidence_fingerprint }),
+    ));
   });
 
   it("limits the run summary to the current scope and explains planner gate failures", async () => {
@@ -577,15 +863,15 @@ describe("PortfolioMonitorPanel reliable controls", () => {
       new Set(["588870.SH"]),
     );
 
-    expect(await screen.findByText("范围内记录 6 条 · 已显示 4 条")).toBeInTheDocument();
-    expect(screen.getByLabelText("最近自动运行列表")).not.toHaveTextContent("原方案失效");
+    expect(await screen.findByText("范围内记录 6 条 · 已显示 2 条")).toBeInTheDocument();
+    expect(screen.getByLabelText("最近自动运行列表")).not.toHaveTextContent("收盘复核");
     expect(screen.getByRole("link", { name: "去持仓矩阵选择" })).toHaveAttribute("href", "#portfolio-holdings");
 
     await user.click(screen.getByRole("button", { name: "查看全部 6 条" }));
 
     expect(screen.getByText("范围内记录 6 条 · 已显示 6 条")).toBeInTheDocument();
-    expect(screen.getByLabelText("最近自动运行列表")).toHaveTextContent("原方案失效");
-    expect(screen.getByRole("button", { name: "收起，仅看最新 4 条" })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByLabelText("最近自动运行列表")).toHaveTextContent("收盘复核");
+    expect(screen.getByRole("button", { name: "收起，仅看最新 2 条" })).toHaveAttribute("aria-expanded", "true");
   });
 
   it("shows holding names in recent monitoring events", async () => {
@@ -609,6 +895,66 @@ describe("PortfolioMonitorPanel reliable controls", () => {
 
     expect(await screen.findByText("科创50指（588870） 数据源已恢复")).toBeInTheDocument();
     expect(screen.getByText("科创50指（588870）")).toBeInTheDocument();
+  });
+
+  it("shows only the latest two events by default and expands or collapses the full list", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.listPortfolioMonitorEvents).mockResolvedValue({
+      events: [
+        {
+          event_id: "event-latest",
+          profile_id: "profile-1",
+          symbol: "588870.SH",
+          plan_version: 1,
+          kind: "data_source_recovered",
+          status: "resolved",
+          severity: "info",
+          title: "最新事件标题",
+          summary: "最新事件摘要",
+          facts: {},
+          first_seen_at: "2026-07-16T08:00:00Z",
+        },
+        {
+          event_id: "event-second",
+          profile_id: "profile-1",
+          symbol: "588870.SH",
+          plan_version: 1,
+          kind: "data_source_unavailable",
+          status: "resolved",
+          severity: "warning",
+          title: "第二条事件标题",
+          summary: "第二条事件摘要",
+          facts: {},
+          first_seen_at: "2026-07-16T07:00:00Z",
+        },
+        {
+          event_id: "event-oldest",
+          profile_id: "profile-1",
+          symbol: "588870.SH",
+          plan_version: 1,
+          kind: "data_source_unavailable",
+          status: "resolved",
+          severity: "warning",
+          title: "折叠中的旧事件",
+          summary: "折叠中的旧事件摘要",
+          facts: {},
+          first_seen_at: "2026-07-16T06:00:00Z",
+        },
+      ],
+    });
+
+    renderPanel([{ name: "科创50指", code: "588870", symbol: "588870.SH", quantity: 2100 }]);
+
+    expect(await screen.findByText("最新事件摘要")).toBeInTheDocument();
+    expect(screen.getByText("第二条事件摘要")).toBeInTheDocument();
+    expect(screen.getByLabelText("最近事件列表")).not.toHaveTextContent("折叠中的旧事件摘要");
+
+    await user.click(screen.getByRole("button", { name: "展开全部 3 条" }));
+    expect(screen.getByLabelText("最近事件列表")).toHaveTextContent("折叠中的旧事件摘要");
+    expect(screen.getByRole("button", { name: "收起，仅看最新 2 条" })).toHaveAttribute("aria-expanded", "true");
+
+    await user.click(screen.getByRole("button", { name: "收起，仅看最新 2 条" }));
+    expect(screen.getByLabelText("最近事件列表")).not.toHaveTextContent("折叠中的旧事件摘要");
   });
 
   it("keeps numeric blanks as drafts, blocks activation, and protects unsaved close", async () => {

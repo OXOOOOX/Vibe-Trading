@@ -339,6 +339,40 @@ class MonitorRecommendationAcknowledgePayload(BaseModel):
     feedback_status: Literal["handled", "continue_observing", "ignored"]
 
 
+class MonitorRiskPreferencePayload(BaseModel):
+    holding_period: Literal["short_term", "swing", "long_term"]
+    max_risk_amount: float | None = Field(default=None, ge=0)
+    max_risk_pct: float | None = Field(default=None, ge=0, le=1)
+    max_add_amount: float | None = Field(default=None, ge=0)
+    max_position_amount: float | None = Field(default=None, ge=0)
+    minimum_reward_risk: float | None = Field(default=None, ge=0, le=20)
+    confirmation_intervals: list[Literal["5m", "30m", "1d"]] = Field(
+        default_factory=lambda: ["5m", "1d"], min_length=1, max_length=3
+    )
+    max_buy_price: float | None = Field(default=None, gt=0)
+    min_sell_price: float | None = Field(default=None, gt=0)
+    slippage_bps: float | None = Field(default=None, ge=0, le=1000)
+    draft_valid_minutes: int = Field(default=30, ge=5, le=10080)
+    condition_order_permission: Literal["only_alert", "local_draft", "broker_export"] = "only_alert"
+    sellable_quantity: float | None = Field(default=None, ge=0)
+    intraday_added_quantity: float | None = Field(default=None, ge=0)
+    default_reduce_fraction: float | None = Field(default=None, gt=0, le=1)
+
+
+class MonitorDecisionChoicePayload(BaseModel):
+    decision_id: str = Field(min_length=8, max_length=80)
+    choice_id: str = Field(min_length=2, max_length=80)
+    decision_revision: int = Field(ge=1)
+    evidence_fingerprint: str = Field(min_length=32, max_length=128)
+    idempotency_key: str = Field(min_length=8, max_length=128)
+
+
+class MonitorConditionDraftPayload(BaseModel):
+    choice_id: str = Field(min_length=2, max_length=80)
+    decision_revision: int = Field(ge=1)
+    evidence_fingerprint: str = Field(min_length=32, max_length=128)
+
+
 class DeliveryTargetPayload(BaseModel):
     channel: Literal["feishu"] = "feishu"
     chat_id: str = Field(min_length=2, max_length=200)
@@ -439,7 +473,8 @@ def register_portfolio_monitor_routes(
             result = await asyncio.to_thread(
                 get_service().create_draft_batch,
                 payload.symbols,
-                payload.delivery_target_id,
+                payload.delivery_target_id
+                or get_service().store.get_default_delivery_target_id(),
                 force_fresh=payload.force_fresh,
                 allow_single_source=payload.allow_single_source,
             )
@@ -478,7 +513,10 @@ def register_portfolio_monitor_routes(
                 payload.symbols,
                 report_refs=payload.report_refs,
                 research_policy=payload.research_policy,
-                delivery_target_id=payload.delivery_target_id,
+                delivery_target_id=(
+                    payload.delivery_target_id
+                    or get_service().store.get_default_delivery_target_id()
+                ),
                 force_fresh=payload.force_fresh,
                 activation_mode=payload.activation_mode,
                 trigger_type=payload.trigger_type,
@@ -834,6 +872,85 @@ def register_portfolio_monitor_routes(
         runtime = get_runtime()
         return _status_with_effects(get_service(), runtime.status())
 
+    @app.get("/portfolio/monitoring/targets", dependencies=dependency)
+    async def list_portfolio_monitoring_targets():
+        return {"targets": get_service().list_monitoring_targets()}
+
+    @app.get("/portfolio/monitoring/target-cards", dependencies=dependency)
+    async def list_portfolio_monitoring_target_cards():
+        return {"targets": get_service().list_monitoring_targets()}
+
+    @app.get("/portfolio/monitoring/targets/{symbol}/decision", dependencies=dependency)
+    async def get_portfolio_monitoring_target_decision(symbol: str):
+        try:
+            return get_service().get_target_decision(symbol)
+        except KeyError as exc:
+            raise _error(404, "monitor_target_not_found", "monitor target not found") from exc
+
+    @app.put("/portfolio/monitoring/risk-preferences/{symbol}", dependencies=dependency)
+    async def put_portfolio_monitoring_risk_preference(
+        symbol: str,
+        payload: MonitorRiskPreferencePayload,
+    ):
+        try:
+            return get_service().set_risk_preference(symbol, payload.model_dump())
+        except ValueError as exc:
+            raise _error(422, "monitor_risk_preference_invalid", str(exc)) from exc
+
+    @app.post(
+        "/portfolio/monitoring/decisions/{decision_id}/choices/{choice_id}",
+        dependencies=dependency,
+    )
+    async def choose_portfolio_monitoring_decision(
+        decision_id: str,
+        choice_id: str,
+        payload: MonitorDecisionChoicePayload,
+    ):
+        if payload.decision_id != decision_id or payload.choice_id != choice_id:
+            raise _error(422, "monitor_decision_path_mismatch", "decision or choice path does not match payload")
+        try:
+            return get_service().record_decision_choice(**payload.model_dump())
+        except ValueError as exc:
+            raise _error(409, "monitor_decision_stale", str(exc)) from exc
+
+    @app.post(
+        "/portfolio/monitoring/decisions/{decision_id}/condition-order-drafts",
+        dependencies=dependency,
+    )
+    async def create_portfolio_monitoring_condition_order_draft(
+        decision_id: str,
+        payload: MonitorConditionDraftPayload,
+    ):
+        try:
+            return get_service().create_condition_order_draft(
+                decision_id=decision_id,
+                **payload.model_dump(),
+            )
+        except ValueError as exc:
+            raise _error(409, "monitor_condition_draft_not_eligible", str(exc)) from exc
+
+    @app.post(
+        "/portfolio/monitoring/condition-order-drafts/{draft_id}/validate",
+        dependencies=dependency,
+    )
+    async def validate_portfolio_monitoring_condition_order_draft(draft_id: str):
+        try:
+            return get_service().validate_condition_order_draft(draft_id)
+        except KeyError as exc:
+            raise _error(404, "monitor_condition_draft_not_found", "condition-order draft not found") from exc
+        except ValueError as exc:
+            raise _error(409, "monitor_condition_draft_invalid", str(exc)) from exc
+
+    @app.post(
+        "/portfolio/monitoring/condition-order-drafts/{draft_id}/cancel",
+        dependencies=dependency,
+    )
+    async def cancel_portfolio_monitoring_condition_order_draft(draft_id: str):
+        try:
+            return get_service().cancel_condition_order_draft(draft_id)
+        except KeyError as exc:
+            raise _error(404, "monitor_condition_draft_not_found", "condition-order draft not found") from exc
+
     @app.get("/portfolio/monitoring/autopilot", dependencies=dependency)
     async def get_portfolio_monitoring_autopilot():
         return get_service().get_autopilot_config()
@@ -854,9 +971,12 @@ def register_portfolio_monitor_routes(
                 "disabling autonomous monitoring requires an explicit user action source",
             )
         try:
+            config_payload = payload.model_dump(exclude={"change_source"}, exclude_none=True)
+            if "delivery_target_id" in payload.model_fields_set:
+                config_payload["delivery_target_id"] = payload.delivery_target_id
             return await asyncio.to_thread(
                 service.set_autopilot_config,
-                payload.model_dump(exclude={"change_source"}, exclude_none=True),
+                config_payload,
             )
         except ValueError as exc:
             raise _error(422, "monitor_autopilot_invalid", str(exc)) from exc

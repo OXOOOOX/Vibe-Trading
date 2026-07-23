@@ -122,10 +122,13 @@ def _percentile(values: list[float], ratio: float) -> float | None:
 class MonitoringStore:
     """Durable domain store. All episode/event/outbox changes are atomic."""
 
-    SUPPORTED_SCHEMA_VERSION = 9
+    SUPPORTED_SCHEMA_VERSION = 10
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or monitoring_db_path()
+        # Ephemeral progress is shared by the API service and runtime in the
+        # same process; durable monitoring facts remain in SQLite.
+        self.price_volume_backfills: dict[str, dict[str, Any]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         current_schema_version = self._read_existing_schema_version()
         if current_schema_version > self.SUPPORTED_SCHEMA_VERSION:
@@ -508,6 +511,43 @@ class MonitoringStore:
                     FOREIGN KEY(episode_id) REFERENCES monitor_watch_episodes(episode_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS monitor_risk_preferences (
+                    symbol TEXT PRIMARY KEY,
+                    preference_json TEXT NOT NULL,
+                    preference_sha256 TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS monitor_decision_choices (
+                    choice_record_id TEXT PRIMARY KEY,
+                    decision_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    choice_id TEXT NOT NULL,
+                    decision_revision INTEGER NOT NULL,
+                    evidence_fingerprint TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    choice_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS monitor_condition_order_drafts (
+                    draft_id TEXT PRIMARY KEY,
+                    decision_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    draft_json TEXT NOT NULL,
+                    draft_sha256 TEXT NOT NULL,
+                    evidence_fingerprint TEXT NOT NULL,
+                    valid_until TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    cancelled_at TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS monitor_planner_job_items (
                     job_id TEXT NOT NULL,
                     symbol TEXT NOT NULL,
@@ -717,6 +757,10 @@ class MonitoringStore:
                     ON monitor_evidence_bundles(symbol, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_monitor_recommendations_recent
                     ON monitor_recommendations(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_monitor_decision_choices_recent
+                    ON monitor_decision_choices(symbol, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_monitor_condition_drafts_recent
+                    ON monitor_condition_order_drafts(symbol, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_monitor_watch_episode_active
                     ON monitor_watch_episodes(profile_id, plan_version, state, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_monitor_profile_outcomes_created
@@ -890,7 +934,7 @@ class MonitoringStore:
                    WHERE status='pending_review'"""
             )
             connection.execute(
-                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '9')"
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '10')"
             )
 
     @staticmethod
@@ -955,6 +999,16 @@ class MonitoringStore:
                 "price_volume": (
                     dict(payload["price_volume"])
                     if isinstance(payload.get("price_volume"), dict)
+                    else None
+                ),
+                "historical_price_volume": (
+                    dict(payload["historical_price_volume"])
+                    if isinstance(payload.get("historical_price_volume"), dict)
+                    else None
+                ),
+                "price_volume_backfill": (
+                    dict(payload["price_volume_backfill"])
+                    if isinstance(payload.get("price_volume_backfill"), dict)
                     else None
                 ),
             })
@@ -1202,6 +1256,56 @@ class MonitoringStore:
             rows = connection.execute("SELECT * FROM delivery_targets ORDER BY created_at DESC").fetchall()
         return [dict(row) for row in rows]
 
+    def get_default_delivery_target_id(self) -> str | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM schema_meta WHERE key='default_feishu_delivery_target_id'"
+            ).fetchone()
+            target_id = str(row["value"] or "").strip() if row else ""
+            if not target_id:
+                return None
+            target = connection.execute(
+                "SELECT status,channel FROM delivery_targets WHERE target_id=?",
+                (target_id,),
+            ).fetchone()
+        if not target or target["status"] != "active" or target["channel"] != "feishu":
+            return None
+        return target_id
+
+    def set_default_delivery_target(self, target_id: str | None) -> dict[str, Any]:
+        normalized = str(target_id or "").strip()
+        with self.transaction() as connection:
+            if normalized:
+                target = connection.execute(
+                    "SELECT * FROM delivery_targets WHERE target_id=?",
+                    (normalized,),
+                ).fetchone()
+                if not target or target["status"] != "active" or target["channel"] != "feishu":
+                    raise ValueError("default Feishu delivery target is not active")
+            connection.execute(
+                """INSERT INTO schema_meta(key,value) VALUES('default_feishu_delivery_target_id',?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (normalized,),
+            )
+        return self.get_delivery_settings()
+
+    def get_delivery_settings(self) -> dict[str, Any]:
+        targets = [
+            item for item in self.list_targets()
+            if item.get("channel") == "feishu"
+        ]
+        active = [item for item in targets if item.get("status") == "active"]
+        default_target_id = self.get_default_delivery_target_id()
+        effective_target_id = default_target_id or (
+            str(active[0].get("target_id") or "") if len(active) == 1 else None
+        )
+        return {
+            "targets": targets,
+            "default_target_id": default_target_id,
+            "effective_target_id": effective_target_id,
+            "requires_selection": len(active) > 1 and not default_target_id,
+        }
+
     def get_target(self, target_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute(
@@ -1219,6 +1323,8 @@ class MonitoringStore:
             row = connection.execute("SELECT * FROM delivery_targets WHERE target_id=?", (target_id,)).fetchone()
         if not row:
             raise KeyError(target_id)
+        if self.get_default_delivery_target_id() == target_id:
+            self.set_default_delivery_target(None)
         return dict(row)
 
     def create_batch(self, symbols: list[str], delivery_target_id: str | None) -> str:
@@ -1348,6 +1454,31 @@ class MonitoringStore:
                 (snapshot_id,),
             ).fetchone()
         return self._report_snapshot(row) if row else None
+
+    def list_report_snapshots(
+        self,
+        *,
+        report_type: str | None = None,
+        since: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        clauses = ["1=1"]
+        params: list[Any] = []
+        if report_type:
+            clauses.append("report_type=?")
+            params.append(report_type)
+        if since:
+            clauses.append("generated_at>=?")
+            params.append(since)
+        params.append(max(1, min(int(limit), 2000)))
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM monitor_report_snapshots WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY generated_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._report_snapshot(row) for row in rows]
 
     def create_planner_job(
         self,
@@ -1496,7 +1627,7 @@ class MonitoringStore:
         with self.connect() as connection:
             connection.execute(
                 """UPDATE monitor_planner_jobs SET status=?,started_at=COALESCE(started_at,?),
-                   completed_at=COALESCE(?,completed_at),updated_at=? WHERE job_id=?""",
+                   completed_at=?,updated_at=? WHERE job_id=?""",
                 (status, now, completed_at, now, job_id),
             )
 
@@ -1549,6 +1680,56 @@ class MonitoringStore:
                     symbol.upper(),
                 ),
             )
+
+    def requeue_planner_item_for_report(
+        self,
+        job_id: str,
+        symbol: str,
+        *,
+        report_ref: str,
+        progress: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Resume a planner item after its asynchronous report refresh finishes."""
+
+        now = utc_now()
+        normalized_symbol = symbol.upper()
+        with self.transaction() as connection:
+            job = connection.execute(
+                "SELECT report_refs_json FROM monitor_planner_jobs WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+            item = connection.execute(
+                """SELECT 1 FROM monitor_planner_job_items
+                   WHERE job_id=? AND symbol=?""",
+                (job_id, normalized_symbol),
+            ).fetchone()
+            if not job or not item:
+                raise KeyError(f"{job_id}:{normalized_symbol}")
+            report_refs = _loads(job["report_refs_json"], {})
+            report_refs[normalized_symbol] = report_ref
+            connection.execute(
+                """UPDATE monitor_planner_jobs SET status='queued',cancel_requested=0,
+                   report_refs_json=?,completed_at=NULL,updated_at=? WHERE job_id=?""",
+                (_json(report_refs), now, job_id),
+            )
+            connection.execute(
+                """UPDATE monitor_planner_job_items SET status='queued',report_ref=?,
+                   report_snapshot_id=NULL,research_snapshot_id=NULL,research_date=NULL,
+                   profile_id=NULL,plan_version=NULL,attempt=attempt+1,
+                   blocked_reasons_json='[]',validation_errors_json='[]',progress_json=?,
+                   error=NULL,started_at=NULL,completed_at=NULL,updated_at=?
+                   WHERE job_id=? AND symbol=?""",
+                (
+                    report_ref,
+                    _json(progress or {}),
+                    now,
+                    job_id,
+                    normalized_symbol,
+                ),
+            )
+        result = self.get_planner_job(job_id)
+        assert result is not None
+        return result
 
     def retry_planner_item(self, job_id: str, symbol: str) -> dict[str, Any]:
         now = utc_now()
@@ -2255,6 +2436,19 @@ class MonitoringStore:
                        profile_revision=profile_revision+1,updated_at=? WHERE profile_id=?""",
                 (now, now, profile_id),
             )
+            if reason == "level_method_migration" and version:
+                connection.execute(
+                    """UPDATE monitor_plan_versions SET status='superseded',
+                           superseded_at=COALESCE(superseded_at, ?)
+                       WHERE profile_id=? AND version=? AND status='active'""",
+                    (now, profile_id, version),
+                )
+                connection.execute(
+                    """UPDATE monitor_rules SET enabled=0,confirmation_progress=0,
+                           cooldown_until=NULL,updated_at=?
+                       WHERE profile_id=? AND plan_version=?""",
+                    (now, profile_id, version),
+                )
             connection.execute(
                 """UPDATE monitor_watch_episodes SET state='unresolved',phase='unresolved',
                        outcome=?,resolved_at=?,result_notified=1,updated_at=?
@@ -3077,11 +3271,11 @@ class MonitoringStore:
         actual: Any = None
         if metric == "same_bucket_5m_volume_ratio" and isinstance(price_volume, dict):
             if str(price_volume.get("status") or "") != "ready":
-                return "insufficient_evidence", price_volume.get("volume_ratio")
+                return "insufficient_evidence", price_volume.get("confirmation_ratio") or price_volume.get("volume_ratio")
             samples = price_volume.get("baseline_samples")
             if isinstance(samples, (int, float)) and samples < int(policy.get("min_samples") or 1):
                 return "insufficient_evidence", price_volume.get("volume_ratio")
-            actual = price_volume.get("volume_ratio")
+            actual = price_volume.get("confirmation_ratio") or price_volume.get("volume_ratio")
         elif metric == "same_clock_cumulative_volume_ratio":
             evidence = quote.get("cumulative_volume_evidence")
             if not isinstance(evidence, dict) or str(evidence.get("status") or "") != "ready":
@@ -3569,7 +3763,13 @@ class MonitoringStore:
                     active is not None
                     and int(plan.get("schema_version") or 1) >= 5
                     and isinstance(compound, dict)
+                    and str(
+                        compound.get("automation_status")
+                        or scenario.get("automation_status")
+                        or ""
+                    ) == "action_ready"
                     and compound.get("confirmation_met")
+                    and not compound.get("evidence_pending")
                 ):
                     refreshed = connection.execute(
                         "SELECT * FROM monitor_watch_episodes WHERE episode_id=?",
@@ -5509,7 +5709,7 @@ class MonitoringStore:
                 """UPDATE monitor_autopilot_triggers SET status=?,
                        planner_job_id=COALESCE(?,planner_job_id),
                        evidence_fingerprint=COALESCE(?,evidence_fingerprint),
-                       started_at=COALESCE(started_at,?),completed_at=COALESCE(?,completed_at),
+                       started_at=COALESCE(started_at,?),completed_at=?,
                        error=?,updated_at=? WHERE trigger_id=?""",
                 (
                     status, planner_job_id, evidence_fingerprint, started,
@@ -5793,6 +5993,174 @@ class MonitoringStore:
             ).fetchone()
         assert row is not None
         return self._recommendation(row)
+
+    def get_risk_preference(self, symbol: str) -> dict[str, Any] | None:
+        normalized = str(symbol or "").upper()
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM monitor_risk_preferences WHERE symbol=?",
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        preference = _loads(value.pop("preference_json", "{}"), {})
+        return {**value, **preference}
+
+    def save_risk_preference(self, symbol: str, preference: dict[str, Any]) -> dict[str, Any]:
+        normalized = str(symbol or "").upper()
+        now = utc_now()
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT revision,created_at FROM monitor_risk_preferences WHERE symbol=?",
+                (normalized,),
+            ).fetchone()
+            revision = int(existing["revision"] or 0) + 1 if existing else 1
+            payload = {
+                **preference,
+                "symbol": normalized,
+                "revision": revision,
+                "updated_at": now,
+            }
+            connection.execute(
+                """INSERT INTO monitor_risk_preferences(
+                       symbol,preference_json,preference_sha256,revision,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(symbol) DO UPDATE SET
+                       preference_json=excluded.preference_json,
+                       preference_sha256=excluded.preference_sha256,
+                       revision=excluded.revision,
+                       updated_at=excluded.updated_at""",
+                (
+                    normalized,
+                    _json(payload),
+                    _hash(payload),
+                    revision,
+                    str(existing["created_at"]) if existing else now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """UPDATE monitor_condition_order_drafts
+                   SET status='stale',updated_at=?
+                   WHERE symbol=? AND status IN ('draft','validated','needs_risk_preferences')""",
+                (now, normalized),
+            )
+        value = self.get_risk_preference(normalized)
+        assert value is not None
+        return value
+
+    def record_decision_choice(self, payload: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        record = {
+            **payload,
+            "choice_record_id": str(payload.get("choice_record_id") or uuid.uuid4().hex),
+            "created_at": str(payload.get("created_at") or now),
+        }
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT choice_json FROM monitor_decision_choices WHERE idempotency_key=?",
+                (record["idempotency_key"],),
+            ).fetchone()
+            if existing is not None:
+                return _loads(existing["choice_json"], {})
+            connection.execute(
+                """INSERT INTO monitor_decision_choices(
+                       choice_record_id,decision_id,symbol,choice_id,decision_revision,
+                       evidence_fingerprint,idempotency_key,status,choice_json,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    record["choice_record_id"], record["decision_id"], record["symbol"],
+                    record["choice_id"], int(record["decision_revision"]),
+                    record["evidence_fingerprint"], record["idempotency_key"],
+                    record.get("status") or "recorded", _json(record), record["created_at"],
+                ),
+            )
+        return record
+
+    def save_condition_order_draft(self, draft: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        payload = {
+            **draft,
+            "draft_id": str(draft.get("draft_id") or uuid.uuid4().hex),
+            "created_at": str(draft.get("created_at") or now),
+            "updated_at": now,
+        }
+        with self.transaction() as connection:
+            connection.execute(
+                """UPDATE monitor_condition_order_drafts
+                   SET status='stale',updated_at=?
+                   WHERE symbol=? AND side=? AND status IN ('draft','validated','needs_risk_preferences')""",
+                (now, payload["symbol"], payload["side"]),
+            )
+            connection.execute(
+                """INSERT INTO monitor_condition_order_drafts(
+                       draft_id,decision_id,symbol,side,status,draft_json,draft_sha256,
+                       evidence_fingerprint,valid_until,created_at,updated_at,cancelled_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    payload["draft_id"], payload["decision_id"], payload["symbol"],
+                    payload["side"], payload["status"], _json(payload), _hash(payload),
+                    payload["evidence_fingerprint"], payload["valid_until"],
+                    payload["created_at"], now, payload.get("cancelled_at"),
+                ),
+            )
+        return payload
+
+    def get_condition_order_draft(self, draft_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM monitor_condition_order_drafts WHERE draft_id=?",
+                (draft_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        payload = _loads(value.pop("draft_json", "{}"), {})
+        return {**payload, **value}
+
+    def latest_condition_order_draft(self, symbol: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT * FROM monitor_condition_order_drafts
+                   WHERE symbol=? ORDER BY created_at DESC LIMIT 1""",
+                (str(symbol or "").upper(),),
+            ).fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        payload = _loads(value.pop("draft_json", "{}"), {})
+        return {**payload, **value}
+
+    def update_condition_order_draft_status(
+        self,
+        draft_id: str,
+        status: str,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT draft_json FROM monitor_condition_order_drafts WHERE draft_id=?",
+                (draft_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(draft_id)
+            payload = _loads(row["draft_json"], {})
+            payload.update(
+                status=status,
+                updated_at=now,
+                cancelled_at=now if status == "cancelled" else payload.get("cancelled_at"),
+            )
+            connection.execute(
+                """UPDATE monitor_condition_order_drafts
+                   SET status=?,draft_json=?,draft_sha256=?,updated_at=?,cancelled_at=?
+                   WHERE draft_id=?""",
+                (
+                    status, _json(payload), _hash(payload), now,
+                    payload.get("cancelled_at"), draft_id,
+                ),
+            )
+        return payload
 
     def metrics(self) -> dict[str, Any]:
         price_volume_window_hours = 24

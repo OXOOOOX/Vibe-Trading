@@ -206,6 +206,48 @@ class CompoundConditionEvaluator:
                 condition.get("freshness_seconds") or 900
             )
 
+        if kind == "rolling_volume_ratio" and interval == "1d":
+            lookback = int(condition.get("lookback_bars") or 5)
+            if len(rows) < lookback + 1:
+                fact.update(
+                    reason="closed_daily_volume_baseline_unavailable",
+                    required_bars=lookback + 1,
+                    available_bars=len(rows),
+                )
+                return None, fact
+            latest = rows[-1]
+            if not evidence_is_fresh(latest.get("bar_time")):
+                fact.update(reason="stale_closed_bar", data_as_of=latest.get("bar_time"))
+                return None, fact
+            current = _number(latest.get("volume"))
+            baseline_values = [
+                _number(row.get("volume")) for row in rows[-(lookback + 1):-1]
+            ]
+            if (
+                current is None
+                or any(value is None for value in baseline_values)
+                or not baseline_values
+            ):
+                fact["reason"] = "daily_volume_unavailable"
+                return None, fact
+            baseline = sum(float(value) for value in baseline_values if value is not None) / len(
+                baseline_values
+            )
+            if baseline <= 0:
+                fact["reason"] = "daily_volume_baseline_invalid"
+                return None, fact
+            ratio = current / baseline
+            fact.update(
+                value=ratio,
+                current_volume=current,
+                baseline_volume=baseline,
+                baseline_sessions=[row.get("session_date") for row in rows[-(lookback + 1):-1]],
+                session_date=latest.get("session_date"),
+                data_as_of=latest.get("bar_time"),
+                unit="ratio",
+            )
+            return _compare(ratio, operator, condition), fact
+
         if kind in {"cumulative_volume", "cumulative_turnover"} and interval == "1d":
             field = "volume" if kind == "cumulative_volume" else "amount"
             if len(rows) < consecutive:

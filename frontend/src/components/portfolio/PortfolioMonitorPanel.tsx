@@ -35,6 +35,7 @@ import {
   api,
   type MonitorDeliveryBindingAttempt,
   type MonitorDeliveryTarget,
+  type MonitorDecisionChoice,
   type MonitorEffectAvailability,
   type MonitorEvent,
   type MonitorAutopilotConfig,
@@ -51,6 +52,7 @@ import {
   type MonitorRule,
   type MonitorTargetAssessment,
   type MonitorTargetIntent,
+  type MonitorTargetMonitoringCard,
   type PortfolioHolding,
   type PortfolioMonitoringStatus,
 } from "@/lib/api";
@@ -93,8 +95,24 @@ const PRICE_VOLUME_REGIME_LABELS: Record<string, string> = {
   bullish_contraction: "上涨缩量",
   bearish_expansion: "下跌放量",
   bearish_contraction: "下跌缩量",
+  high_volume_absorption: "放量承接",
+  high_volume_rejection: "放量受阻",
   high_volume_stall: "放量滞涨",
+  low_volume_balance: "缩量平衡",
   neutral: "量价中性",
+};
+
+const PRICE_VOLUME_BIAS_LABELS: Record<string, string> = {
+  bullish: "偏多",
+  bearish: "偏空",
+  mixed: "多空分歧",
+  neutral: "中性",
+};
+
+const PRICE_VOLUME_CONFIDENCE_LABELS: Record<string, string> = {
+  high: "高",
+  medium: "中",
+  low: "低",
 };
 
 const VOLUME_STATE_LABELS: Record<string, string> = {
@@ -117,6 +135,8 @@ const PRICE_VOLUME_REASON_LABELS: Record<string, string> = {
   insufficient_recent_bars: "连续闭合 5 分钟 K 线不足",
   recent_bar_values_invalid: "近期 K 线价格或成交量无效",
   volume_conflict: "成交量来源冲突",
+  volume_status_not_actionable: "成交量尚未形成可用共识",
+  volume_unavailable: "成交量来源不可用",
   volume_unit_unknown: "成交量单位未知",
   volume_unit_conflict: "成交量单位冲突",
   volume_missing: "成交量缺失",
@@ -190,9 +210,25 @@ function blockedReasonLabel(reason: string): string {
     fresh_refresh_failed: "主动刷新行情失败，请稍后重试",
     fresh_refresh_interrupted: "主动刷新超过时间预算，请稍后重试",
     fresh_refresh_partial: "主动刷新只完成了一部分，当前证据仍不足",
+    source_report_review_due: "来源周报已到复核时间，监控评估已暂停，等待新周报或人工复核",
     raw_price_basis_unavailable: "缺少可比较的原始价格口径",
     quote_provenance_missing: "行情缺少可追溯来源",
     verified_price_missing: "已校验行情中缺少有效价格",
+    structural_report_refresh_failed_validation: "刷新后的结构化研究仍未通过监控点位门禁",
+    structural_report_refresh_retry_exhausted: "结构化研究的一次自动修复额度已耗尽",
+    structural_report_refresh_queue_failed: "结构化研究任务入队失败",
+    report_has_no_qualified_monitoring_points: "报告没有形成合格的监控点位",
+    deterministic_market_repair_requires_verified_market: "自动修复未取得双源校验行情",
+    deterministic_market_repair_insufficient_daily_history: "自动修复缺少至少 20 个交易日的双源日线",
+    deterministic_market_repair_no_reproducible_range: "自动修复无法形成可复算的近 20 日价格区间",
+    deterministic_market_repair_no_plan: "自动修复未能生成确定性监控计划",
+    price_series_discontinuity_unverified: "检测到未验证的价格折算断点",
+    adjustment_factor_unverified: "折算因子尚未通过官方或双源校验",
+    insufficient_post_event_history: "断点后的同口径历史数据不足",
+    volume_unit_conflict: "成交量单位或双源口径仍有冲突",
+    no_qualified_level: "多方法引擎尚未形成合格点位",
+    ai_selection_invalid: "AI 选择未通过候选编号与数字白名单校验",
+    recovery_circuit_open: "相同输入连续受阻，自动修复熔断已打开",
   };
   return labels[reason] || reason;
 }
@@ -392,10 +428,119 @@ const AUTOPILOT_RUN_STATUS_LABELS: Record<string, string> = {
   cancelled: "已取消",
 };
 
-const AUTOPILOT_RUN_PREVIEW_LIMIT = 4;
+const AUTOPILOT_RUN_PREVIEW_LIMIT = 2;
+const RECENT_EVENT_PREVIEW_LIMIT = 2;
+
+type MonitorCarouselTarget =
+  | {
+    key: string;
+    kind: "profile";
+    symbol: string;
+    profile: MonitorProfile;
+    card: MonitorTargetMonitoringCard | null;
+  }
+  | {
+    key: string;
+    kind: "pending_autopilot";
+    symbol: string;
+    run: MonitorAutopilotRun | null;
+    card: MonitorTargetMonitoringCard | null;
+  };
+
+function MonitorDecisionCard({
+  card,
+  busy,
+  onChoice,
+  onValidateDraft,
+  onCancelDraft,
+}: {
+  card: MonitorTargetMonitoringCard;
+  busy: string | null;
+  onChoice: (choice: MonitorDecisionChoice) => void;
+  onValidateDraft: (draftId: string) => void;
+  onCancelDraft: (draftId: string) => void;
+}) {
+  const brief = card.decision_brief;
+  const risk = card.risk_assessment;
+  const draft = card.latest_draft;
+  const riskTone = ["severe", "high"].includes(brief.risk_level)
+    ? "border-red-500/40 bg-red-500/[0.04]"
+    : ["medium", "warning"].includes(brief.risk_level)
+      ? "border-amber-500/40 bg-amber-500/[0.04]"
+      : "border-cyan-500/30 bg-cyan-500/[0.03]";
+  return (
+    <section aria-label={`${card.name} AI 决策摘要`} className={cn("grid gap-3 rounded-md border p-3", riskTone)}>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <strong className="text-sm">{brief.headline}</strong>
+            <span className="rounded-full border px-2 py-0.5 text-[10px]">风险 {brief.risk_level}</span>
+            <span className="rounded-full border px-2 py-0.5 text-[10px] text-muted-foreground">置信度 {brief.confidence}</span>
+          </div>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">{brief.summary}</p>
+        </div>
+        <span className="text-[10px] text-muted-foreground">{brief.data_status === "verified" ? "证据已验证" : brief.data_status === "partial" ? "部分证据待补" : "数据受阻"}</span>
+      </div>
+      <ol className="grid gap-1 text-xs leading-5">
+        {brief.why_now.slice(0, 3).map((item, index) => <li key={`${index}-${item}`}>{index + 1}. {item}</li>)}
+      </ol>
+      <div className="grid gap-2 rounded border bg-background/70 p-2.5 text-[11px] leading-5 sm:grid-cols-2">
+        <p><strong>下一确认：</strong>{brief.next_confirmation}</p>
+        <p><strong>当前判断失效：</strong>{brief.invalidation}</p>
+        <p><strong>持仓影响：</strong>{risk.estimated_impact_pct != null ? `${(risk.estimated_impact_pct * 100).toFixed(2)}%` : "样本或持仓数据不足"}{risk.estimated_impact_amount != null ? ` / 约 ¥${risk.estimated_impact_amount.toFixed(2)}` : ""}</p>
+        <p><strong>概率：</strong>{risk.risk_probability != null ? `${(risk.risk_probability * 100).toFixed(1)}%` : "不输出伪精确概率"}</p>
+      </div>
+      <div className="flex flex-wrap gap-1.5" aria-label="AI 决策选择">
+        {card.available_choices.slice(0, 3).map((choice) => (
+          <button
+            key={choice.choice_id}
+            type="button"
+            disabled={busy === `decision:${card.decision_id}`}
+            onClick={() => onChoice(choice)}
+            title={choice.description}
+            className={cn(
+              "rounded-md border px-2.5 py-1.5 text-xs disabled:opacity-50",
+              choice.recommended
+                ? "border-cyan-500/50 bg-cyan-500/10 font-medium text-cyan-800 dark:text-cyan-200"
+                : "bg-background hover:bg-muted",
+            )}
+          >
+            {choice.recommended ? "AI 推荐 · " : ""}{choice.label}
+          </button>
+        ))}
+      </div>
+      <div className="flex flex-wrap gap-1.5 text-[10px] text-muted-foreground">
+        {[...(card.level_ladder.support || []), ...(card.level_ladder.resistance || [])].slice(0, 5).map((level, index) => (
+          <span key={String(level.candidate_id || `${level.role}-${index}`)} className="rounded border bg-background/70 px-2 py-1">
+            {level.role || "结构"} {level.lower != null && level.upper != null ? `${level.lower}–${level.upper}` : "待计算"} · {level.score ?? "--"}分
+          </span>
+        ))}
+      </div>
+      {draft ? (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded border bg-background/80 p-2 text-xs">
+          <span>
+            本地条件单草稿 · {draft.side === "buy" ? "买入" : "卖出"} · {draft.status}
+            {draft.quantity != null ? ` · ${draft.quantity} 股` : " · 数量待风险设置"}
+          </span>
+          <span className="flex gap-1.5">
+            {draft.status === "draft" ? <button type="button" onClick={() => onValidateDraft(draft.draft_id)} className="rounded border px-2 py-1 hover:bg-muted">校验草稿</button> : null}
+            {!['cancelled', 'expired', 'stale'].includes(draft.status) ? <button type="button" onClick={() => onCancelDraft(draft.draft_id)} className="rounded border px-2 py-1 text-muted-foreground hover:bg-muted">撤销草稿</button> : null}
+          </span>
+          <span className="w-full text-[10px] text-muted-foreground">只保存在本应用，真实订单提交被禁止；触发不保证成交。</span>
+        </div>
+      ) : null}
+    </section>
+  );
+}
 
 function monitorAutopilotRunDetail(run: MonitorAutopilotRun): string {
   const detail = String(run.detail_error || run.validation_errors?.[0] || run.error || "");
+  if (detail.includes("autopilot_recovery_circuit_open")) {
+    return "相同输入已连续受阻，自动修复已熔断；等待新报告、持仓或证据变化后再尝试。";
+  }
+  if (detail.includes("structural_report_refresh_retry_exhausted")) {
+    return "结构化研究的一次自动修复额度已耗尽，已停止继续调用模型。";
+  }
   if (detail.includes("already above its invalidation level") || detail.includes("already below its invalidation level")) {
     return "当前价已经越过方案失效位，本次没有启用；等待新证据后重新计算。";
   }
@@ -416,11 +561,18 @@ function monitorAutopilotRunDetail(run: MonitorAutopilotRun): string {
   return "";
 }
 
-function monitorSymbolDisplayName(symbol: string, holdingNames: ReadonlyMap<string, string>): string {
+function monitorSymbolName(symbol: string, holdingNames: ReadonlyMap<string, string>): string {
   const normalizedSymbol = symbol.trim().toUpperCase();
   const code = normalizedSymbol.split(".")[0];
   const name = holdingNames.get(normalizedSymbol) || holdingNames.get(code) || "";
-  return name ? `${name}（${code}）` : symbol;
+  return name || symbol;
+}
+
+function monitorSymbolDisplayName(symbol: string, holdingNames: ReadonlyMap<string, string>): string {
+  const normalizedSymbol = symbol.trim().toUpperCase();
+  const code = normalizedSymbol.split(".")[0];
+  const name = monitorSymbolName(symbol, holdingNames);
+  return name === symbol ? symbol : `${name}（${code}）`;
 }
 
 function isAutopilotEligibleSymbol(symbol: string): boolean {
@@ -556,6 +708,12 @@ function nearestPriceTarget(
 function targetDistancePercentage(target: PriceTarget | null, currentPrice: number | null): number | null {
   if (!target || currentPrice == null || currentPrice === 0) return null;
   return ((target.value - currentPrice) / currentPrice) * 100;
+}
+
+function formatTargetDistancePercentage(value: number | null): string {
+  if (value == null || !Number.isFinite(value)) return "距现价 --";
+  const prefix = value > 0 ? "+" : "";
+  return `距现价 ${prefix}${value.toFixed(2)}%`;
 }
 
 function compactTargetLabel(target: PriceTarget): string {
@@ -1208,6 +1366,86 @@ function PointBasisTooltip({
         >
           <div className="mb-0.5 font-semibold">{label} · 点位依据</div>
           <div className="text-muted-foreground">{basis}</div>
+        </div>
+      ), document.body) : null}
+    </>
+  );
+}
+
+function PriceVolumeMeaningTooltip({
+  label,
+  interpretation,
+  children,
+}: {
+  label: string;
+  interpretation: NonNullable<MonitorPriceVolumeSnapshot["interpretation"]>;
+  children: ReactNode;
+}) {
+  const tooltipId = useId();
+  const [position, setPosition] = useState<{
+    left: number;
+    top: number;
+    width: number;
+    placement: "top" | "bottom";
+  } | null>(null);
+  const show = (element: HTMLButtonElement) => {
+    const bounds = element.getBoundingClientRect();
+    const width = Math.min(360, Math.max(260, window.innerWidth - 24));
+    const left = Math.min(
+      window.innerWidth - width - 12,
+      Math.max(12, bounds.left + bounds.width / 2 - width / 2),
+    );
+    const placement = bounds.top >= 250 ? "top" : "bottom";
+    setPosition({
+      left,
+      top: placement === "top" ? bounds.top - 8 : bounds.bottom + 8,
+      width,
+      placement,
+    });
+  };
+  return (
+    <>
+      <button
+        type="button"
+        aria-label={`${label}，查看量价含义`}
+        aria-describedby={position ? tooltipId : undefined}
+        className="inline-flex cursor-help items-center gap-1 rounded outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
+        onMouseEnter={(event) => show(event.currentTarget)}
+        onMouseLeave={() => setPosition(null)}
+        onFocus={(event) => show(event.currentTarget)}
+        onBlur={() => setPosition(null)}
+      >
+        {children}
+        <Info className="h-3 w-3 opacity-65" aria-hidden="true" />
+      </button>
+      {position ? createPortal((
+        <div
+          id={tooltipId}
+          role="tooltip"
+          data-testid="price-volume-meaning-tooltip"
+          className="pointer-events-none fixed z-[100] rounded-lg border border-border/70 bg-popover/85 p-3 text-left text-[11px] leading-5 text-popover-foreground shadow-2xl backdrop-blur-md"
+          style={{
+            left: position.left,
+            top: position.top,
+            width: position.width,
+            transform: position.placement === "top" ? "translateY(-100%)" : undefined,
+          }}
+        >
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <span className="font-semibold">{label} · 量价含义</span>
+            <span className="rounded border px-1.5 py-0.5 text-[10px] text-muted-foreground">
+              置信度 {PRICE_VOLUME_CONFIDENCE_LABELS[interpretation.confidence] || interpretation.confidence}
+            </span>
+          </div>
+          <dl className="grid gap-1.5">
+            <div><dt className="inline font-medium">当前偏向：</dt><dd className="inline text-muted-foreground">{PRICE_VOLUME_BIAS_LABELS[interpretation.bias] || interpretation.bias}</dd></div>
+            <div><dt className="inline font-medium">代表含义：</dt><dd className="inline text-muted-foreground">{interpretation.meaning}</dd></div>
+            <div><dt className="inline font-medium">主要风险：</dt><dd className="inline text-muted-foreground">{interpretation.risk}</dd></div>
+            <div><dt className="inline font-medium">下一步确认：</dt><dd className="inline text-muted-foreground">{interpretation.next_confirmation}</dd></div>
+          </dl>
+          <div className="mt-2 border-t pt-2 text-[10px] text-muted-foreground">
+            这是量价分类解释，不会自动改写报告点位或触发交易。
+          </div>
         </div>
       ), document.body) : null}
     </>
@@ -2091,9 +2329,13 @@ function MonitorTargetGlyph({
   return (
     <span
       className="grid min-w-0 gap-1"
+      data-target-side={targetIsHigher ? "right" : "left"}
       aria-label={`${compactTargetLabel(target)}，目标价 ${formatMonitorPrice(target.value)}${distance == null ? "" : `，距离 ${Math.abs(distance).toFixed(2)}%`}`}
     >
-      <span className="flex min-w-0 items-center gap-1.5">
+      <span className={cn(
+        "flex min-w-0 items-center gap-1.5",
+        targetIsHigher ? "justify-start" : "flex-row-reverse justify-end",
+      )}>
         <span className="relative h-2.5 w-8 shrink-0" aria-hidden="true">
           <span className="absolute inset-x-0 top-1 h-px bg-muted-foreground/30" />
           <span className={cn(
@@ -2307,16 +2549,322 @@ function MonitorCarouselRow({
   );
 }
 
-function MonitorPriceVolumeSnapshotCard({
+function pendingAutopilotStatus(
+  run: MonitorAutopilotRun | null,
+  card: MonitorTargetMonitoringCard | null = null,
+): {
+  label: string;
+  detail: string;
+  tone: string;
+  working: boolean;
+} {
+  if (card?.profile_status === "blocked") {
+    return {
+      label: "建档受阻",
+      detail: card.blockers.map((blocker) => blockedReasonLabel(blocker.code)).join("；") || "数据门禁未通过，价格观察档案尚未激活。",
+      tone: "border-amber-500/40 bg-amber-500/10 text-amber-800 dark:text-amber-200",
+      working: false,
+    };
+  }
+  if (!run) {
+    return {
+      label: "等待建档",
+      detail: "已进入 AI 自主监控范围，等待系统创建首个监控计划。",
+      tone: "border-cyan-500/40 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300",
+      working: true,
+    };
+  }
+  if (run.status === "queued" || run.status === "running") {
+    return {
+      label: run.status === "queued" ? "等待研究" : "正在建档",
+      detail: "系统正在补齐研究证据、生成监控点位并执行启用门禁。",
+      tone: "border-cyan-500/40 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300",
+      working: true,
+    };
+  }
+  if (run.status === "completed") {
+    return {
+      label: "正在核对",
+      detail: "任务记录已结束但监控档案尚未生成；系统会自动对账并恢复未完成步骤。",
+      tone: "border-amber-500/40 bg-amber-500/10 text-amber-800 dark:text-amber-200",
+      working: true,
+    };
+  }
+  if (run.status === "blocked") {
+    return {
+      label: "建档受阻",
+      detail: monitorAutopilotRunDetail(run) || "数据或语义门禁未通过，尚未启用监控。",
+      tone: "border-amber-500/40 bg-amber-500/10 text-amber-800 dark:text-amber-200",
+      working: false,
+    };
+  }
+  if (run.status === "failed") {
+    return {
+      label: "建档失败",
+      detail: monitorAutopilotRunDetail(run) || "自动建档失败，错误已保留供排查。",
+      tone: "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-300",
+      working: false,
+    };
+  }
+  return {
+    label: "等待重建",
+    detail: "当前任务已取消；标的仍在自主范围内，后续有效触发会重新建档。",
+    tone: "border-slate-500/40 bg-slate-500/10 text-slate-700 dark:text-slate-300",
+    working: false,
+  };
+}
+
+function MonitorPendingCarouselRow({
   symbol,
-  snapshot,
-  enabled,
+  displayName,
+  selected,
+  run,
+  card,
+  onSelect,
 }: {
   symbol: string;
-  snapshot?: MonitorPriceVolumeSnapshot | null;
-  enabled: boolean;
+  displayName: string;
+  selected: boolean;
+  run: MonitorAutopilotRun | null;
+  card: MonitorTargetMonitoringCard | null;
+  onSelect: () => void;
 }) {
-  if (!snapshot && !enabled) return null;
+  const [code, marketLabel = ""] = symbol.trim().toUpperCase().split(".");
+  const pending = pendingAutopilotStatus(run, card);
+  const stageLabel = card?.build_state?.stage_label || run?.build_state?.stage_label || pending.label;
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      aria-current={selected ? "true" : undefined}
+      aria-label={`${displayName} ${code}，${pending.label}`}
+      className={cn(
+        "grid min-w-[17rem] grid-cols-[minmax(0,1fr)_auto_auto] grid-rows-2 items-center gap-x-3 gap-y-1 rounded-md border px-3 py-2 text-left transition-colors",
+        "lg:min-w-0 lg:grid-cols-[minmax(5.25rem,1fr)_minmax(3.7rem,.7fr)_minmax(4.2rem,.75fr)_minmax(6.5rem,1.1fr)_2.75rem] lg:grid-rows-1 lg:gap-x-2",
+        selected
+          ? "border-cyan-500/70 bg-cyan-500/[0.07] shadow-[inset_3px_0_0_rgba(6,182,212,0.85)]"
+          : "border-border/80 bg-background/55 hover:border-cyan-500/35 hover:bg-muted/35",
+      )}
+    >
+      <span className="min-w-0 self-start lg:self-center">
+        <span className="block truncate text-xs font-semibold">{displayName}</span>
+        <span className="mt-0.5 flex items-center gap-1 font-mono text-[10px] text-muted-foreground">
+          <span>{code}</span>
+          {marketLabel ? <span>{marketLabel}</span> : null}
+        </span>
+      </span>
+      <span className="col-start-2 row-start-1 justify-self-end font-mono text-xs text-muted-foreground lg:col-start-2 lg:justify-self-start">--</span>
+      <span className="col-start-2 row-start-2 justify-self-end text-[10px] text-muted-foreground lg:col-start-3 lg:row-start-1 lg:justify-self-start">--</span>
+      <span className="col-start-1 row-start-2 truncate text-[10px] font-medium text-muted-foreground lg:col-start-4 lg:row-start-1">
+        {stageLabel}
+      </span>
+      <span className="col-start-3 row-span-2 row-start-1 grid h-9 w-9 place-items-center justify-self-center rounded-full border border-cyan-500/30 bg-cyan-500/5 lg:col-start-5 lg:row-span-1">
+        {pending.working
+          ? <Loader2 className="h-4 w-4 animate-spin text-cyan-600" aria-hidden="true" />
+          : <AlertTriangle className="h-4 w-4 text-amber-600" aria-hidden="true" />}
+      </span>
+    </button>
+  );
+}
+
+function MonitorPendingTargetCard({
+  symbol,
+  displayName,
+  run,
+  card,
+  onShowUsage,
+}: {
+  symbol: string;
+  displayName: string;
+  run: MonitorAutopilotRun | null;
+  card: MonitorTargetMonitoringCard | null;
+  onShowUsage: (jobId: string) => void;
+}) {
+  const [code, marketLabel = ""] = symbol.trim().toUpperCase().split(".");
+  const pending = pendingAutopilotStatus(run, card);
+  const blockedReasons = card?.blockers.map((blocker) => blockedReasonLabel(blocker.code))
+    || run?.blocked_reasons?.map(blockedReasonLabel)
+    || [];
+  const buildState = card?.build_state || run?.build_state;
+  const progressPercent = Math.max(0, Math.min(100, buildState?.progress_percent ?? (
+    run?.status === "running" ? 50 : run?.status === "queued" ? 10 : 100
+  )));
+  const buildSteps = [
+    { threshold: 5, label: "排队" },
+    { threshold: 15, label: "行情刷新" },
+    { threshold: 30, label: "连续性" },
+    { threshold: 50, label: "结构计算" },
+    { threshold: 65, label: "AI情景" },
+    { threshold: 75, label: "行动剧本" },
+    { threshold: 85, label: "规则映射" },
+    { threshold: 95, label: "门禁验证" },
+    { threshold: 100, label: "完成" },
+  ];
+  const selfRepair = card?.self_repair || buildState?.self_repair;
+  const continuityStatus = String(card?.continuity?.status || "未检查");
+  const volumeStatus = String(card?.volume_gate?.status || "待取证");
+  const levelEntries = card
+    ? (Array.isArray(card.level_summary) ? card.level_summary : Object.values(card.level_summary || {}))
+    : [];
+  return (
+    <article
+      aria-label={`${displayName} ${code} 自动监控准备中`}
+      className="grid min-w-0 content-start gap-4 overflow-hidden rounded-md border border-dashed border-cyan-500/40 bg-cyan-500/[0.025] p-4"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold">{displayName}</div>
+          <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+            <span className="font-mono font-medium text-foreground">{code}</span>
+            {marketLabel ? <span>{marketLabel}</span> : null}
+          </div>
+        </div>
+        <span className={cn("inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-1 text-[10px] font-medium", pending.tone)}>
+          {pending.working ? <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" /> : <AlertTriangle className="h-3 w-3" aria-hidden="true" />}
+          {pending.label}
+        </span>
+      </div>
+      {card?.decision_brief ? (
+        <div className="rounded-md border bg-background/80 p-3 text-xs">
+          <div className="flex flex-wrap items-center gap-2">
+            <strong>{card.decision_brief.headline}</strong>
+            <span className="rounded-full border px-2 py-0.5 text-[10px]">风险 {card.decision_brief.risk_level}</span>
+          </div>
+          <p className="mt-1 leading-5 text-muted-foreground">{card.decision_brief.summary}</p>
+          <p className="mt-1 leading-5"><strong>下一步：</strong>{card.decision_brief.next_confirmation}</p>
+        </div>
+      ) : null}
+      <div className="rounded-md border bg-background/70 p-3 text-xs leading-5 text-muted-foreground">
+        <p className="font-medium text-foreground">已纳入 AI 自主监控范围</p>
+        <p className="mt-1">{pending.detail}</p>
+        <p className="mt-2">监控计划通过证据与点位门禁后会自动替换此卡片；在此之前不会假装已经开始行情监控。</p>
+      </div>
+      <div className="grid gap-2" aria-label={`${displayName} 监控档案建立进度`}>
+        <div className="flex items-center justify-between gap-3 text-xs">
+          <span className="font-medium">{buildState?.stage_label || pending.label}</span>
+          <span className="font-mono tabular-nums text-muted-foreground">{progressPercent}%</span>
+        </div>
+        <div
+          role="progressbar"
+          aria-label="监控档案建立进度"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={progressPercent}
+          className="h-1.5 overflow-hidden rounded-full bg-muted"
+        >
+          <div
+            className={cn(
+              "h-full rounded-full transition-[width]",
+              buildState?.status === "failed" ? "bg-red-500" : buildState?.status === "blocked" ? "bg-amber-500" : "bg-cyan-500",
+            )}
+            style={{ width: `${progressPercent}%` }}
+          />
+        </div>
+        <div className="grid grid-cols-4 gap-1 text-center text-[10px] text-muted-foreground sm:grid-cols-9">
+          {buildSteps.map((step) => (
+            <span
+              key={step.label}
+              className={cn(
+                "rounded border px-1 py-1",
+                progressPercent >= step.threshold && "border-cyan-500/35 bg-cyan-500/[0.06] text-foreground",
+              )}
+            >
+              {step.label}
+            </span>
+          ))}
+        </div>
+        {buildState?.attempt ? (
+          <p className="text-[11px] text-muted-foreground">规划尝试 {buildState.attempt} 次 · 最近更新 {formatDate(buildState.updated_at)}</p>
+        ) : null}
+      </div>
+      {blockedReasons.length ? (
+        <p className="text-xs text-amber-800 dark:text-amber-200">受阻原因：{blockedReasons.join("；")}</p>
+      ) : null}
+      {card ? (
+        <div className="grid gap-2 rounded-md border bg-background/70 p-3 text-xs sm:grid-cols-3">
+          <span><strong>连续性：</strong>{continuityStatus}</span>
+          <span><strong>量能：</strong>{volumeStatus}</span>
+          <span><strong>候选：</strong>{levelEntries.length ? levelEntries.map((level) => String(level.score ?? "--")).join(" / ") : "尚无合格点位"}</span>
+        </div>
+      ) : null}
+      {selfRepair ? (
+        <div className={cn(
+          "rounded-md border px-3 py-2 text-xs",
+          selfRepair.circuit_open
+            ? "border-amber-500/40 bg-amber-500/5 text-amber-800 dark:text-amber-200"
+            : "border-slate-500/30 bg-slate-500/[0.04] text-muted-foreground",
+        )}>
+          {selfRepair.circuit_open ? (
+            <><strong>已停止自动重试：</strong>相同输入多次受阻或一次修复额度已耗尽；后续轮询不会继续调用模型。新报告、持仓或证据变化后才会重新尝试。</>
+          ) : (
+            <><strong>自动修复：</strong>先刷新行情并校验连续性与折算因子，再由多周期量价结构引擎重算候选；同一输入最多两次模型校验，超限后熔断停止消耗 Token。</>
+          )}
+        </div>
+      ) : null}
+      <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
+        <span>{run ? `${AUTOPILOT_TRIGGER_LABELS[run.trigger_type] || run.trigger_type} · ${formatDate(run.created_at)}` : "等待首次任务"}</span>
+        <span>只监控，不自动交易</span>
+      </div>
+      {run?.planner_job_id ? (
+        <button
+          type="button"
+          onClick={() => onShowUsage(run.planner_job_id || "")}
+          className="w-fit rounded-md border px-2.5 py-1.5 text-xs hover:bg-muted"
+        >
+          查看任务用量
+        </button>
+      ) : null}
+    </article>
+  );
+}
+
+function MonitorPriceVolumeSnapshotCard({
+  symbol,
+  liveSnapshot,
+  historicalSnapshot,
+  backfill,
+  enabled,
+  marketSupported,
+}: {
+  symbol: string;
+  liveSnapshot?: MonitorPriceVolumeSnapshot | null;
+  historicalSnapshot?: MonitorPriceVolumeSnapshot | null;
+  backfill?: NonNullable<MonitorProfile["last_quote"]>["price_volume_backfill"];
+  enabled: boolean;
+  marketSupported: boolean;
+}) {
+  if (!liveSnapshot && !historicalSnapshot && !enabled) return null;
+  if (!marketSupported && enabled) {
+    return (
+      <div
+        aria-label={`${symbol} 量价分析`}
+        data-price-volume-status="unsupported-market"
+        className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground"
+      >
+        该市场量价监测暂未支持。
+      </div>
+    );
+  }
+  const liveReady = liveSnapshot?.status === "ready";
+  const historicalReady = !liveReady && historicalSnapshot?.status === "ready";
+  const snapshot = liveReady
+    ? liveSnapshot
+    : historicalReady
+      ? historicalSnapshot
+      : liveSnapshot;
+  const backfillRunning = backfill?.status === "queued" || backfill?.status === "running";
+  if (!snapshot && backfillRunning) {
+    return (
+      <div
+        aria-label={`${symbol} 量价分析`}
+        data-price-volume-status="backfilling"
+        className="flex items-center gap-2 rounded-md border border-cyan-500/30 bg-cyan-500/5 px-3 py-2 text-xs text-cyan-700 dark:text-cyan-300"
+      >
+        <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+        正在补齐历史量价基线
+      </div>
+    );
+  }
   if (!snapshot) {
     return (
       <div
@@ -2349,17 +2897,26 @@ function MonitorPriceVolumeSnapshotCard({
     <div
       aria-label={`${symbol} 量价分析`}
       data-price-volume-status={snapshot.status}
+      data-analysis-scope={historicalReady ? "historical" : "live"}
       data-accelerated-decline={snapshot.accelerated_decline ? "true" : "false"}
       className="grid gap-2 rounded-md border bg-background/70 p-2.5"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-1.5 text-xs font-semibold">
           <Activity className="h-3.5 w-3.5 text-cyan-600 dark:text-cyan-400" aria-hidden="true" />
-          当前量价
+          {historicalReady ? "历史量价参考" : "当前实时量价"}
         </div>
-        <span className={cn("rounded border px-1.5 py-0.5 text-[10px] font-medium", regimeTone)}>
-          {regimeLabel}
-        </span>
+        {snapshot.interpretation ? (
+          <PriceVolumeMeaningTooltip label={regimeLabel} interpretation={snapshot.interpretation}>
+            <span className={cn("rounded border px-1.5 py-0.5 text-[10px] font-medium", regimeTone)}>
+              {regimeLabel}
+            </span>
+          </PriceVolumeMeaningTooltip>
+        ) : (
+          <span className={cn("rounded border px-1.5 py-0.5 text-[10px] font-medium", regimeTone)}>
+            {regimeLabel}
+          </span>
+        )}
       </div>
       {ready ? (
         <>
@@ -2386,7 +2943,17 @@ function MonitorPriceVolumeSnapshotCard({
           <div className="text-[10px] text-muted-foreground">
             最新 5 分钟 {formatSignedBps(snapshot.latest_return_bps)} bps · 收盘位于本根振幅 {closeLocation}
           </div>
+          {snapshot.volume_quality === "single_source" ? (
+            <div className="rounded border border-amber-500/30 bg-amber-500/5 px-2 py-1 text-[10px] text-amber-700 dark:text-amber-300">
+              单一来源量价参考 · 已按计划中的单源授权展示
+            </div>
+          ) : null}
         </>
+      ) : backfillRunning ? (
+        <div className="flex items-center gap-1.5 text-xs text-cyan-700 dark:text-cyan-300">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+          正在补齐历史量价基线
+        </div>
       ) : (
         <div className="text-xs leading-5 text-muted-foreground">
           <span className="font-medium text-foreground">
@@ -2396,6 +2963,12 @@ function MonitorPriceVolumeSnapshotCard({
           {reasonText ? ` · ${reasonText}` : ""}
         </div>
       )}
+      {historicalReady ? (
+        <div role="status" className="rounded border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-[11px] leading-5 text-amber-800 dark:text-amber-200">
+          历史量价参考 · 截至 {formatDate(snapshot.data_as_of)}。实时量价暂不可用
+          {liveSnapshot ? `：${priceVolumeReasonText(liveSnapshot.reason_codes || [])}` : ""}；该结论不参与实时触发。
+        </div>
+      ) : null}
       {snapshot.accelerated_decline ? (
         <div role="status" className="flex items-center gap-1.5 rounded border border-red-500/40 bg-red-500/10 px-2 py-1.5 text-xs font-semibold text-red-700 dark:text-red-300">
           <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
@@ -2483,18 +3056,18 @@ function MonitorPriceSnapshot({
   const sessionLowPosition = positionInPriceDomain(sessionLow, displayMinimum, displayMaximum);
   const sessionHighPosition = positionInPriceDomain(sessionHigh, displayMinimum, displayMaximum);
   const leftVsOpen = percentageFromOpen(targetWindow?.left.value ?? null, sessionOpen);
-  const rightVsOpen = percentageFromOpen(targetWindow?.right.value ?? null, sessionOpen);
+  const rightVsCurrent = targetDistancePercentage(targetWindow?.right.target ?? null, currentPrice);
   const currentMarkerAlignment = currentPosition <= 12
     ? "translate-x-0"
     : currentPosition >= 88 ? "-translate-x-full" : "-translate-x-1/2";
   const boostDirection = effectsActive ? targetWindow?.boostDirection || null : null;
   const crossedTargets = targetWindow?.crossedTargets || [];
   const lastCrossedTarget = crossedTargets[crossedTargets.length - 1] || null;
-  const boostMessage = boostDirection === "up"
-    ? `已突破 ${targetLabel(lastCrossedTarget)}；${targetWindow?.nextTarget ? `正在冲击 ${targetLabel(targetWindow.nextTarget)}` : "暂无更高目标，现价作为右侧边界"}`
-    : boostDirection === "down"
-      ? `已跌破 ${targetLabel(lastCrossedTarget)}；${targetWindow?.nextTarget ? `正在接近 ${targetLabel(targetWindow.nextTarget)}` : "暂无更低目标，现价作为左侧边界"}`
-      : null;
+  const focusTarget = lastCrossedTarget || targetWindow?.right.target || targetWindow?.left.target || null;
+  const focusTargetDistance = targetDistancePercentage(focusTarget, currentPrice);
+  const boostMessage = boostDirection && lastCrossedTarget
+    ? `${boostDirection === "up" ? "今日上行，已突破" : "今日下行，已跌破"} L${lastCrossedTarget.level}`
+    : null;
   return (
     <div
       aria-label={`${profile.symbol} 价格监控概览`}
@@ -2515,7 +3088,7 @@ function MonitorPriceSnapshot({
         />
       ) : null}
       <div className="relative z-[1] grid gap-3 p-3">
-        <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start">
+        <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(8.5rem,auto)_auto] sm:items-start">
           <div className="min-w-0">
             <div className="text-[11px] text-muted-foreground">最新监测价格</div>
             <div className="mt-0.5 font-mono text-xl font-semibold tracking-tight">
@@ -2531,21 +3104,44 @@ function MonitorPriceSnapshot({
                 : "尚未取得可用监测价格"}
             </div>
           </div>
-          <div className="flex min-w-0 items-start justify-self-end gap-2">
+          <div className="grid min-w-0 justify-items-start gap-1 sm:justify-items-end sm:text-right">
+            {focusTarget ? (
+              <>
+                <PointBasisTooltip
+                  label={targetLabel(focusTarget)}
+                  basis={rulePointBasisText(focusTarget.rule)}
+                >
+                  <span className="text-[10px] text-muted-foreground">{targetLabel(focusTarget)}</span>
+                </PointBasisTooltip>
+                <strong className="font-mono text-base font-semibold text-foreground">
+                  {formatMonitorPrice(focusTarget.value)}
+                </strong>
+                <span className={cn(
+                  "text-[10px] font-medium",
+                  focusTarget.direction === "down"
+                    ? "text-emerald-600 dark:text-emerald-400"
+                    : "text-red-600 dark:text-red-400",
+                )}>
+                  {formatTargetDistancePercentage(focusTargetDistance)}
+                </span>
+              </>
+            ) : null}
             {boostMessage ? (
               <div
                 role="status"
                 className={cn(
-                  "flex max-w-[13rem] items-start gap-1.5 rounded-md border px-2 py-1 text-[10px] font-medium leading-4 shadow-sm",
+                  "mt-1 inline-flex max-w-full items-center gap-1.5 whitespace-nowrap rounded-md border px-2 py-1 text-[10px] font-medium leading-4 shadow-sm",
                   boostDirection === "up"
                     ? "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-300"
                     : "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
                 )}
               >
-                <Zap className="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
-                <span>{boostDirection === "up" ? "今日突破 Boost" : "今日下行 Boost"} · {boostMessage}</span>
+                <Zap className="h-3 w-3 shrink-0" aria-hidden="true" />
+                <span>{boostMessage}</span>
               </div>
             ) : null}
+          </div>
+          <div className="justify-self-end">
             <MonitorCountdownRing
               profile={profile}
               version={version}
@@ -2559,8 +3155,11 @@ function MonitorPriceSnapshot({
 
         <MonitorPriceVolumeSnapshotCard
           symbol={profile.symbol}
-          snapshot={profile.last_quote?.price_volume}
+          liveSnapshot={profile.last_quote?.price_volume}
+          historicalSnapshot={profile.last_quote?.historical_price_volume}
+          backfill={profile.last_quote?.price_volume_backfill}
           enabled={Boolean(version?.plan.price_volume_policy?.enabled)}
+          marketSupported={["SH", "SZ", "BJ"].includes(profile.market.toUpperCase())}
         />
 
         {currentPrice != null && targetWindow ? (
@@ -2614,7 +3213,16 @@ function MonitorPriceSnapshot({
                   )}>{targetLabel(targetWindow.right.target)}</span>
                 </PointBasisTooltip>
                 <strong className="font-mono text-xs text-foreground">{formatMonitorPrice(targetWindow.right.value)}</strong>
-                <span className={cn("font-medium", openMoveClass(rightVsOpen))}>{formatOpenPercentage(rightVsOpen)}</span>
+                <span className={cn(
+                  "font-medium",
+                  targetWindow.right.target?.direction === "down"
+                    ? "text-emerald-600 dark:text-emerald-400"
+                    : "text-red-600 dark:text-red-400",
+                )}>
+                  {targetWindow.right.source === "current"
+                    ? "现价"
+                    : formatTargetDistancePercentage(rightVsCurrent)}
+                </span>
               </div>
             </div>
 
@@ -2765,12 +3373,38 @@ function MonitorPlanSummary({
   const enabledRules = version.plan.market_rules.filter((rule) => rule.enabled);
   const priceTargetCount = collectPriceTargets(version.plan).length;
   const intervals = Array.from(new Set(enabledRules.map((rule) => rule.parameters.interval))).sort();
+  const scenarios = version.plan.watch_scenarios || [];
+  const actionReadyCount = scenarios.filter((scenario) => scenario.automation_status === "action_ready").length;
+  const watchOnlyCount = scenarios.filter((scenario) => scenario.automation_status !== "action_ready").length;
+  const unsupportedConditionCount = scenarios.reduce(
+    (total, scenario) => total + (scenario.source_conditions || []).filter((condition) => condition.coverage_status !== "mapped").length,
+    0,
+  );
+  const autonomousReportApproval = version.plan.automation_policy?.activation_mode === "autonomous";
+  const reportApprovalText = autonomousReportApproval
+    ? version.status === "active"
+      ? "AI 已完成证据门禁判断并自动启用 shadow 监测；所有进退仍由人工决定。"
+      : "AI 已取得自主判断权限；计划只有通过数据门禁后才能自动换版。"
+    : "该计划仍须人工确认后启用。";
   const deliveryLabel = target
     ? `飞书${target.chat_type === "group" ? "群聊" : "私聊"}已绑定`
     : targetId ? "飞书目标待确认" : "飞书目标未绑定";
   return (
     <div className="grid gap-2 rounded-md border bg-muted/10 p-3 text-xs" aria-label={`监控计划 v${version.version} 摘要`}>
       {version.plan.data_mode === "single_source" ? <SingleSourceWarning /> : null}
+      {version.plan.source_horizon ? (
+        <div className="rounded border border-blue-500/20 bg-blue-500/5 px-2 py-2 text-[11px]">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <span className="font-medium">来源：{version.plan.source_horizon === "weekly" ? "正式周报" : version.plan.source_horizon === "structural" ? "正式结构报告" : "正式日报"}</span>
+            <span>{version.plan.analysis_ref?.title || version.plan.source_report_id}</span>
+            {version.plan.source_period?.label ? <span>{version.plan.source_period.label}</span> : null}
+            {version.plan.review_due_at ? <span>复核于 {formatDate(version.plan.review_due_at)}</span> : null}
+          </div>
+          <div className="mt-1 text-muted-foreground">
+            action_ready {actionReadyCount} · watch_only {watchOnlyCount} · 未自动映射条件 {unsupportedConditionCount}；{reportApprovalText}
+          </div>
+        </div>
+      ) : null}
       {priceTargetCount > 0 && priceTargetCount < 4 ? (
         <div className="rounded border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-[11px] text-amber-800 dark:text-amber-200">
           当前计划只有 {priceTargetCount} 个价格目标；在“计划与审核”中选择 AI 重新分析，可生成带语义的四级目标阶梯，旧计划会持续运行到你确认新版本。
@@ -2799,23 +3433,39 @@ function MonitorPlanSummary({
         </div>
       </div>
       {enabledRules.length ? (
-        <div className="grid gap-1 border-t pt-2 text-muted-foreground">
-          {enabledRules.slice(0, 4).map((rule) => {
+        <div
+          className="grid overflow-hidden rounded-md border text-muted-foreground sm:grid-cols-2"
+          data-monitor-rule-grid="compact"
+        >
+          {enabledRules.slice(0, 4).map((rule, index) => {
             const summary = ruleSummary(rule);
             return (
-              <div key={rule.client_rule_id} className="flex items-center justify-between gap-3">
+              <div
+                key={rule.client_rule_id}
+                className={cn(
+                  "grid min-w-0 gap-0.5 bg-background/30 px-2 py-1.5",
+                  index > 0 && "border-t",
+                  index === 1 && "sm:border-l sm:border-t-0",
+                  index === 2 && "sm:border-t",
+                  index === 3 && "sm:border-l sm:border-t",
+                )}
+              >
                 <PointBasisTooltip
                   label={summary}
                   basis={rule.kind.startsWith("price_") ? rulePointBasisText(rule) : null}
                   className="min-w-0 text-foreground"
                 >
-                  <span className="truncate" title={summary}>{summary}</span>
+                  <span className="leading-4" title={summary}>{summary}</span>
                 </PointBasisTooltip>
-                <span className="shrink-0 font-mono text-[11px]">连续 {rule.parameters.confirmation_count} 次</span>
+                <span className="font-mono text-[10px]">连续 {rule.parameters.confirmation_count} 次</span>
               </div>
             );
           })}
-          {enabledRules.length > 4 ? <div>另有 {enabledRules.length - 4} 条规则，请在“计划与审核”中展开。</div> : null}
+          {enabledRules.length > 4 ? (
+            <div className="border-t px-2 py-1.5 text-[10px] sm:col-span-2">
+              另有 {enabledRules.length - 4} 条规则，请在“计划与审核”中展开。
+            </div>
+          ) : null}
         </div>
       ) : null}
       <div className="flex flex-wrap items-center justify-between gap-1 border-t pt-2 text-[11px] text-muted-foreground">
@@ -2988,15 +3638,19 @@ function MonitorEventRow({
 export default function PortfolioMonitorPanel({
   holdings,
   selectedSymbols,
+  manualSymbols = selectedSymbols,
+  autonomousSymbols = selectedSymbols,
   selectionRevision = 0,
   selectionHydrationPending = false,
   onHydrateSelection,
 }: {
   holdings: PortfolioHolding[];
   selectedSymbols: Set<string>;
+  manualSymbols?: Set<string>;
+  autonomousSymbols?: Set<string>;
   selectionRevision?: number;
   selectionHydrationPending?: boolean;
-  onHydrateSelection?: (symbols: string[]) => void;
+  onHydrateSelection?: (selection: { manual: string[]; autonomous: string[] }) => void;
 }) {
   const [profiles, setProfiles] = useState<MonitorProfile[]>([]);
   const [events, setEvents] = useState<MonitorEvent[]>([]);
@@ -3006,7 +3660,9 @@ export default function PortfolioMonitorPanel({
   const [autopilotSelectionSyncState, setAutopilotSelectionSyncState] = useState<"idle" | "syncing" | "synced" | "error">("idle");
   const [autopilotSelectionSyncCycle, setAutopilotSelectionSyncCycle] = useState(0);
   const [autopilotRuns, setAutopilotRuns] = useState<MonitorAutopilotRun[]>([]);
+  const [monitoringTargetCards, setMonitoringTargetCards] = useState<MonitorTargetMonitoringCard[]>([]);
   const [showAllAutopilotRuns, setShowAllAutopilotRuns] = useState(false);
+  const [showAllEvents, setShowAllEvents] = useState(false);
   const [recommendations, setRecommendations] = useState<MonitorRecommendation[]>([]);
   const [reportCandidates, setReportCandidates] = useState<Record<string, MonitorReportCandidate[]>>({});
   const [selectedReportRefs, setSelectedReportRefs] = useState<Record<string, string>>({});
@@ -3048,6 +3704,9 @@ export default function PortfolioMonitorPanel({
       .sort((left, right) => Date.parse(right.first_seen_at) - Date.parse(left.first_seen_at))
       .slice(0, 100);
   }, [events, liveEvents]);
+  const renderedEvents = showAllEvents
+    ? displayEvents
+    : displayEvents.slice(0, RECENT_EVENT_PREVIEW_LIMIT);
   const effectiveMode = status?.effective_mode || status?.runtime.mode || "off";
   const runtimeLabel = effectiveMode === "deliver"
     ? (status?.runtime.running ? (status.runtime.leader ? "真实提醒" : "真实提醒 · 备用") : "真实提醒未运行")
@@ -3070,36 +3729,6 @@ export default function PortfolioMonitorPanel({
     && draftBaselineSignature
     && monitorPlanFormSignature(draftPlan, draftNumericPlan) !== draftBaselineSignature,
   );
-  const openProfiles = profiles.filter((profile) => profile.status !== "closed");
-  const closedProfileCount = profiles.length - openProfiles.length;
-  const visibleProfiles = showClosedProfiles ? profiles : openProfiles;
-  const selectedProfile = visibleProfiles.find((profile) => profile.profile_id === selectedProfileId)
-    || visibleProfiles[0]
-    || null;
-  const selectedProfileIndex = selectedProfile
-    ? visibleProfiles.findIndex((profile) => profile.profile_id === selectedProfile.profile_id)
-    : -1;
-  const visibleProfileIds = visibleProfiles.map((profile) => profile.profile_id).join("|");
-
-  useEffect(() => {
-    if (carouselPaused || !visibleProfileIds.includes("|")) return undefined;
-    const profileIds = visibleProfileIds.split("|").filter(Boolean);
-    const timer = window.setInterval(() => {
-      setSelectedProfileId((current) => {
-        const currentIndex = Math.max(0, profileIds.indexOf(current || ""));
-        return profileIds[(currentIndex + 1) % profileIds.length] || null;
-      });
-    }, 9_000);
-    return () => window.clearInterval(timer);
-  }, [carouselPaused, visibleProfileIds]);
-
-  const selectAdjacentProfile = (offset: number) => {
-    if (!visibleProfiles.length) return;
-    const currentIndex = selectedProfileIndex < 0 ? 0 : selectedProfileIndex;
-    const nextIndex = (currentIndex + offset + visibleProfiles.length) % visibleProfiles.length;
-    setSelectedProfileId(visibleProfiles[nextIndex]?.profile_id || null);
-  };
-
   const markSyncSuccess = useCallback(() => {
     const now = Date.now();
     if (syncFailureCountRef.current >= 2) setConnectionRecoveredAt(now);
@@ -3142,6 +3771,7 @@ export default function PortfolioMonitorPanel({
         statusResult,
         autopilotResult,
         runsResult,
+        targetCardsResult,
         recommendationsResult,
       ] = await Promise.all([
         api.listPortfolioMonitors(),
@@ -3150,6 +3780,7 @@ export default function PortfolioMonitorPanel({
         api.getPortfolioMonitoringStatus(),
         api.getPortfolioMonitoringAutopilot(),
         api.listPortfolioMonitoringAutopilotRuns(20),
+        api.listPortfolioMonitoringTargets(),
         api.listPortfolioMonitorRecommendations(20),
       ]);
       if (!isCurrentSync(generation)) return;
@@ -3161,10 +3792,10 @@ export default function PortfolioMonitorPanel({
         current && current.revision > autopilotResult.revision ? current : autopilotResult
       ));
       setAutopilotRuns(runsResult.runs);
+      setMonitoringTargetCards(targetCardsResult.targets);
       setRecommendations(recommendationsResult.recommendations);
       markSyncSuccess();
-      const activeTarget = targetsResult.targets.find((target) => target.status === "active");
-      setSelectedTarget((current) => current || activeTarget?.target_id || "");
+      setSelectedTarget((current) => current || autopilotResult.delivery_target_id || "");
     } catch (error) {
       if (!isCurrentSync(generation)) return;
       markSyncFailure();
@@ -3199,11 +3830,12 @@ export default function PortfolioMonitorPanel({
   const refreshLiveState = useCallback(async () => {
     const generation = beginSync();
     try {
-      const [profilesResult, statusResult, autopilotResult, runsResult, recommendationsResult] = await Promise.all([
+      const [profilesResult, statusResult, autopilotResult, runsResult, targetCardsResult, recommendationsResult] = await Promise.all([
         api.listPortfolioMonitors(),
         api.getPortfolioMonitoringStatus(),
         api.getPortfolioMonitoringAutopilot(),
         api.listPortfolioMonitoringAutopilotRuns(20),
+        api.listPortfolioMonitoringTargets(),
         api.listPortfolioMonitorRecommendations(20),
       ]);
       if (!isCurrentSync(generation)) return;
@@ -3213,6 +3845,7 @@ export default function PortfolioMonitorPanel({
         current && current.revision > autopilotResult.revision ? current : autopilotResult
       ));
       setAutopilotRuns(runsResult.runs);
+      setMonitoringTargetCards(targetCardsResult.targets);
       setRecommendations(recommendationsResult.recommendations);
       markSyncSuccess();
     } catch {
@@ -3286,11 +3919,18 @@ export default function PortfolioMonitorPanel({
     .map((holding) => holding.name || holding.symbol || holding.code)
     .join("、"), [holdings, selectedSymbols]);
 
-  const selectedMonitorSymbols = useMemo(
+  const selectedManualSymbols = useMemo(
     () => [...new Set(
-      Array.from(selectedSymbols, (symbol) => String(symbol).trim().toUpperCase()).filter(Boolean),
+      Array.from(manualSymbols, (symbol) => String(symbol).trim().toUpperCase()).filter(Boolean),
     )].sort(),
-    [selectedSymbols],
+    [manualSymbols],
+  );
+
+  const selectedAutonomousSymbols = useMemo(
+    () => [...new Set(
+      Array.from(autonomousSymbols, (symbol) => String(symbol).trim().toUpperCase()).filter(Boolean),
+    )].sort(),
+    [autonomousSymbols],
   );
 
   const configuredAutopilotSymbols = useMemo(
@@ -3303,12 +3943,12 @@ export default function PortfolioMonitorPanel({
   );
 
   const selectedAutopilotSymbols = useMemo(
-    () => selectedMonitorSymbols.filter(isAutopilotEligibleSymbol),
-    [selectedMonitorSymbols],
+    () => selectedAutonomousSymbols.filter(isAutopilotEligibleSymbol),
+    [selectedAutonomousSymbols],
   );
   const unsupportedAutopilotSymbols = useMemo(
-    () => selectedMonitorSymbols.filter((symbol) => !isAutopilotEligibleSymbol(symbol)),
-    [selectedMonitorSymbols],
+    () => selectedAutonomousSymbols.filter((symbol) => !isAutopilotEligibleSymbol(symbol)),
+    [selectedAutonomousSymbols],
   );
 
   const visibleAutopilotRuns = useMemo(() => {
@@ -3341,8 +3981,13 @@ export default function PortfolioMonitorPanel({
     }
     if (!autopilot || autopilotSelectionHydrationRequestedRef.current || !onHydrateSelection) return;
     autopilotSelectionHydrationRequestedRef.current = true;
-    onHydrateSelection(configuredAutopilotSymbols);
-  }, [autopilot, configuredAutopilotSymbols, onHydrateSelection, selectionHydrationPending]);
+    const autonomous = new Set(configuredAutopilotSymbols);
+    const manual = [...new Set(profiles
+      .filter((profile) => profile.status !== "closed")
+      .map((profile) => profile.symbol.trim().toUpperCase())
+      .filter((symbol) => symbol && !autonomous.has(symbol)))].sort();
+    onHydrateSelection({ manual, autonomous: configuredAutopilotSymbols });
+  }, [autopilot, configuredAutopilotSymbols, onHydrateSelection, profiles, selectionHydrationPending]);
 
   useEffect(() => {
     if (selectionHydrationPending) return;
@@ -3380,7 +4025,7 @@ export default function PortfolioMonitorPanel({
       selected_symbols: selectedAutopilotSymbols,
       change_source: "holding_selection",
       daily_close_enabled: autopilot.daily_close_enabled,
-      delivery_target_id: selectedTarget || autopilot.delivery_target_id || undefined,
+      delivery_target_id: selectedTarget || null,
       runtime_mode: autopilot.runtime_mode,
     }).then((next) => {
       if (!mountedRef.current) return;
@@ -3391,9 +4036,9 @@ export default function PortfolioMonitorPanel({
       failedAutopilotSelectionSyncRef.current = null;
       setAutopilotSelectionSyncState("synced");
       if (!selectedAutopilotSymbols.length) {
-        toast.success(selectedMonitorSymbols.length
+        toast.success(selectedAutonomousSymbols.length
           ? "所选标的暂不支持自主监控，自主监控已自动关闭。"
-          : "持仓矩阵已清空监控选择，自主监控已自动关闭。");
+          : "持仓矩阵已清空 AI 自主等级，自主监控已自动关闭。");
       }
     }).catch((error) => {
       if (!mountedRef.current) return;
@@ -3415,21 +4060,21 @@ export default function PortfolioMonitorPanel({
     configuredAutopilotFingerprint,
     selectedAutopilotFingerprint,
     selectedAutopilotSymbols,
-    selectedMonitorSymbols,
+    selectedAutonomousSymbols,
     selectedTarget,
     selectionHydrationPending,
     selectionRevision,
   ]);
 
   useEffect(() => {
-    if (!selectedMonitorSymbols.length) {
+    if (!selectedManualSymbols.length) {
       setReportCandidates({});
       setSelectedReportRefs({});
       return;
     }
     let cancelled = false;
     void Promise.all(
-      selectedMonitorSymbols.map(async (symbol) => {
+      selectedManualSymbols.map(async (symbol) => {
         const result = await api.listPortfolioMonitorReportCandidates(symbol);
         return [symbol, result.candidates] as const;
       }),
@@ -3439,7 +4084,7 @@ export default function PortfolioMonitorPanel({
       setReportCandidates(nextCandidates);
       setSelectedReportRefs((current) => {
         const next: Record<string, string> = {};
-        for (const symbol of selectedMonitorSymbols) {
+        for (const symbol of selectedManualSymbols) {
           const candidates = nextCandidates[symbol] || [];
           const retained = candidates.find((candidate) => candidate.report_ref === current[symbol]);
           const preferred = retained
@@ -3453,7 +4098,7 @@ export default function PortfolioMonitorPanel({
       if (!cancelled) setReportCandidates({});
     });
     return () => { cancelled = true; };
-  }, [selectedMonitorSymbols]);
+  }, [selectedManualSymbols]);
 
   const holdingNameByIdentifier = useMemo(() => {
     const names = new Map<string, string>();
@@ -3472,6 +4117,84 @@ export default function PortfolioMonitorPanel({
     () => new Map(targets.map((target) => [target.target_id, target])),
     [targets],
   );
+
+  const openProfiles = useMemo(
+    () => profiles.filter((profile) => profile.status !== "closed"),
+    [profiles],
+  );
+  const closedProfileCount = profiles.length - openProfiles.length;
+  const visibleProfiles = showClosedProfiles ? profiles : openProfiles;
+  const visibleCarouselTargets = useMemo<MonitorCarouselTarget[]>(() => {
+    const knownProfileSymbols = new Set(
+      openProfiles.map((profile) => profile.symbol.trim().toUpperCase()),
+    );
+    const targetCardBySymbol = new Map(
+      monitoringTargetCards.map((card) => [card.symbol.trim().toUpperCase(), card]),
+    );
+    const latestRunBySymbol = new Map<string, MonitorAutopilotRun>();
+    for (const run of autopilotRuns) {
+      const symbol = run.symbol.trim().toUpperCase();
+      if (symbol && !latestRunBySymbol.has(symbol)) latestRunBySymbol.set(symbol, run);
+    }
+    const targetCardSymbols = monitoringTargetCards
+      .filter((card) => card.selected)
+      .map((card) => card.symbol.trim().toUpperCase());
+    const pendingSymbols = autopilot?.enabled
+      ? [...new Set([...configuredAutopilotSymbols, ...targetCardSymbols])]
+        .filter((symbol) => !knownProfileSymbols.has(symbol))
+      : [];
+    return [
+      ...visibleProfiles.map((profile) => ({
+        key: profile.profile_id,
+        kind: "profile" as const,
+        symbol: profile.symbol.trim().toUpperCase(),
+        profile,
+        card: targetCardBySymbol.get(profile.symbol.trim().toUpperCase()) || null,
+      })),
+      ...pendingSymbols.map((symbol) => ({
+        key: `autopilot:${symbol}`,
+        kind: "pending_autopilot" as const,
+        symbol,
+        run: latestRunBySymbol.get(symbol) || null,
+        card: targetCardBySymbol.get(symbol) || null,
+      })),
+    ];
+  }, [autopilot?.enabled, autopilotRuns, configuredAutopilotSymbols, monitoringTargetCards, openProfiles, visibleProfiles]);
+  const selectedCarouselTarget = visibleCarouselTargets.find(
+    (target) => target.key === selectedProfileId,
+  ) || visibleCarouselTargets[0] || null;
+  const selectedProfile = selectedCarouselTarget?.kind === "profile"
+    ? selectedCarouselTarget.profile
+    : null;
+  const selectedTargetCard = selectedCarouselTarget?.card || null;
+  const selectedPendingTarget = selectedCarouselTarget?.kind === "pending_autopilot"
+    ? selectedCarouselTarget
+    : null;
+  const selectedProfileIndex = selectedCarouselTarget
+    ? visibleCarouselTargets.findIndex((target) => target.key === selectedCarouselTarget.key)
+    : -1;
+  const visibleProfileIds = visibleCarouselTargets.map((target) => target.key).join("|");
+
+  useEffect(() => {
+    if (carouselPaused || !visibleProfileIds.includes("|")) return undefined;
+    const profileIds = visibleProfileIds.split("|").filter(Boolean);
+    const timer = window.setInterval(() => {
+      setSelectedProfileId((current) => {
+        const currentIndex = Math.max(0, profileIds.indexOf(current || ""));
+        return profileIds[(currentIndex + 1) % profileIds.length] || null;
+      });
+    }, 9_000);
+    return () => window.clearInterval(timer);
+  }, [carouselPaused, visibleProfileIds]);
+
+  const selectAdjacentProfile = (offset: number) => {
+    if (!visibleCarouselTargets.length) return;
+    const currentIndex = selectedProfileIndex < 0 ? 0 : selectedProfileIndex;
+    const nextIndex = (
+      currentIndex + offset + visibleCarouselTargets.length
+    ) % visibleCarouselTargets.length;
+    setSelectedProfileId(visibleCarouselTargets[nextIndex]?.key || null);
+  };
 
   const showPlan = (detail: MonitorProfile, preferredVersion?: number | null) => {
     const version = selectPlanVersion(detail, preferredVersion);
@@ -3582,7 +4305,7 @@ export default function PortfolioMonitorPanel({
   const toggleAutopilot = async () => {
     const nextEnabled = !autopilotOperational;
     if (nextEnabled && !selectedAutopilotSymbols.length) {
-      toast.error("请先在持仓矩阵勾选至少一个 A 股或场内 ETF 标的。");
+      toast.error("请先在持仓矩阵把至少一个 A 股或场内 ETF 切换为紫色 AI 自主等级。");
       return;
     }
     if (!nextEnabled && !window.confirm("关闭自主监控后，现有计划仍会保留，但 Agent 不再自动研究或换版。确定关闭吗？")) {
@@ -3598,7 +4321,7 @@ export default function PortfolioMonitorPanel({
         selected_symbols: selectedAutopilotSymbols,
         change_source: "user_toggle",
         daily_close_enabled: true,
-        delivery_target_id: selectedTarget || undefined,
+        delivery_target_id: selectedTarget || null,
         runtime_mode: "shadow",
       });
       setAutopilot(next);
@@ -3631,6 +4354,135 @@ export default function PortfolioMonitorPanel({
       )));
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "记录反馈失败");
+    }
+  };
+
+  const configureDecisionRiskPreference = async (card: MonitorTargetMonitoringCard) => {
+    const existing = card.risk_preference;
+    const holding = holdings.find((item) => String(item.symbol || item.code || "").toUpperCase().startsWith(card.symbol.split(".")[0]));
+    const riskText = window.prompt("单标的最大风险金额（元，必填；不会自动下单）", existing?.max_risk_amount != null ? String(existing.max_risk_amount) : "");
+    if (riskText == null) return false;
+    const maxRiskAmount = Number(riskText);
+    if (!Number.isFinite(maxRiskAmount) || maxRiskAmount <= 0) {
+      toast.error("请输入大于 0 的最大风险金额。");
+      return false;
+    }
+    const addText = window.prompt("单次最大加仓金额（元，可留空）", existing?.max_add_amount != null ? String(existing.max_add_amount) : "");
+    if (addText == null) return false;
+    const positionText = window.prompt("单标的最大总仓位金额（元，可留空）", existing?.max_position_amount != null ? String(existing.max_position_amount) : "");
+    if (positionText == null) return false;
+    const sellableText = window.prompt("当前可卖数量（股，可留空；卖出草稿必填）", existing?.sellable_quantity != null ? String(existing.sellable_quantity) : String(holding?.quantity ?? ""));
+    if (sellableText == null) return false;
+    const reduceText = window.prompt("结构失效时计划减仓比例（例如 0.3 表示30%，可留空）", existing?.default_reduce_fraction != null ? String(existing.default_reduce_fraction) : "");
+    if (reduceText == null) return false;
+    const holdingPeriodText = window.prompt("持有周期（short_term / swing / long_term）", existing?.holding_period || "");
+    if (holdingPeriodText == null) return false;
+    const holdingPeriod = holdingPeriodText.trim();
+    if (!["short_term", "swing", "long_term"].includes(holdingPeriod)) {
+      toast.error("持有周期必须是 short_term、swing 或 long_term。");
+      return false;
+    }
+    const minimumRewardRiskText = window.prompt("最低收益风险比（例如 2）", existing?.minimum_reward_risk != null ? String(existing.minimum_reward_risk) : "");
+    if (minimumRewardRiskText == null) return false;
+    const confirmationText = window.prompt("确认周期，用逗号分隔（例如 5m,1d）", (existing?.confirmation_intervals || []).join(","));
+    if (confirmationText == null) return false;
+    const optionalNumber = (value: string) => value.trim() ? Number(value) : null;
+    const maxAddAmount = optionalNumber(addText);
+    const maxPositionAmount = optionalNumber(positionText);
+    const sellableQuantity = optionalNumber(sellableText);
+    const defaultReduceFraction = optionalNumber(reduceText);
+    const minimumRewardRisk = optionalNumber(minimumRewardRiskText);
+    const confirmationIntervals = confirmationText.split(",").map((value) => value.trim()).filter(Boolean);
+    if ([maxAddAmount, maxPositionAmount, sellableQuantity, defaultReduceFraction, minimumRewardRisk].some((value) => value != null && !Number.isFinite(value))) {
+      toast.error("风险设置包含无效数字。");
+      return false;
+    }
+    if (minimumRewardRisk == null || confirmationIntervals.length === 0) {
+      toast.error("请明确最低收益风险比和至少一个确认周期。");
+      return false;
+    }
+    if (!confirmationIntervals.every((value): value is "5m" | "30m" | "1d" => ["5m", "30m", "1d"].includes(value))) {
+      toast.error("确认周期只支持 5m、30m 和 1d。");
+      return false;
+    }
+    await api.setPortfolioMonitoringRiskPreference(card.symbol, {
+      holding_period: holdingPeriod as "short_term" | "swing" | "long_term",
+      max_risk_amount: maxRiskAmount,
+      max_add_amount: maxAddAmount,
+      max_position_amount: maxPositionAmount,
+      minimum_reward_risk: minimumRewardRisk,
+      confirmation_intervals: confirmationIntervals,
+      draft_valid_minutes: existing?.draft_valid_minutes || 30,
+      condition_order_permission: "local_draft",
+      sellable_quantity: sellableQuantity,
+      intraday_added_quantity: existing?.intraday_added_quantity ?? 0,
+      default_reduce_fraction: defaultReduceFraction,
+    });
+    toast.success("风险设置已保存；旧草稿已自动标记失效。");
+    return true;
+  };
+
+  const chooseMonitoringDecision = async (
+    card: MonitorTargetMonitoringCard,
+    choice: MonitorDecisionChoice,
+  ) => {
+    setBusy(`decision:${card.decision_id}`);
+    try {
+      const idempotencyKey = typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `${card.decision_id}-${choice.choice_id}-${Date.now()}`;
+      await api.choosePortfolioMonitoringDecision(card.decision_id, choice.choice_id, {
+        decision_id: card.decision_id,
+        choice_id: choice.choice_id,
+        decision_revision: card.decision_revision,
+        evidence_fingerprint: card.evidence_fingerprint,
+        idempotency_key: idempotencyKey,
+      });
+      if (choice.choice_id === "adjust_risk_preferences") {
+        const configured = await configureDecisionRiskPreference(card);
+        if (!configured) return;
+        await load();
+        return;
+      }
+      if (choice.eligible_draft_type) {
+        const draft = await api.createPortfolioMonitoringConditionDraft(card.decision_id, {
+          choice_id: choice.choice_id,
+          decision_revision: card.decision_revision,
+          evidence_fingerprint: card.evidence_fingerprint,
+        });
+        toast.success(
+          draft.status === "draft"
+            ? "本地条件单草稿已生成；真实订单提交仍被禁止。"
+            : "已保存方向预案，但风险设置或约束不足，未生成数量。",
+        );
+      } else {
+        toast.success("选择已记录；相同证据不会反复要求确认。");
+      }
+      await load();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "记录决策失败");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const validateConditionDraft = async (draftId: string) => {
+    try {
+      await api.validatePortfolioMonitoringConditionDraft(draftId);
+      toast.success("草稿已通过当前证据和约束校验；仍不会提交真实订单。");
+      await load();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "草稿校验失败");
+    }
+  };
+
+  const cancelConditionDraft = async (draftId: string) => {
+    try {
+      await api.cancelPortfolioMonitoringConditionDraft(draftId);
+      toast.success("本地草稿已撤销，历史记录仍保留。");
+      await load();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "撤销草稿失败");
     }
   };
 
@@ -3708,18 +4560,14 @@ export default function PortfolioMonitorPanel({
   };
 
   const createDrafts = async () => {
-    if (!selectedSymbols.size) return;
-    if (!selectedTarget) {
-      toast.error("请先绑定飞书提醒目标。 ");
-      return;
-    }
+    if (!selectedManualSymbols.length) return;
     setBusy("create");
     try {
       let job = await api.createPortfolioMonitorPlannerJob({
-        symbols: selectedMonitorSymbols,
+        symbols: selectedManualSymbols,
         report_refs: selectedReportRefs,
         research_policy: "if_needed",
-        delivery_target_id: selectedTarget,
+        delivery_target_id: selectedTarget || undefined,
         force_fresh: true,
       });
       setPlannerJob(job);
@@ -3964,7 +4812,10 @@ export default function PortfolioMonitorPanel({
             onRequestedJobHandled={clearUsageJobRequest}
           />
           <MonitorSoundControls />
-          <span className="text-xs text-muted-foreground">已选 {selectedSymbols.size} 只{selectedNames ? `：${selectedNames}` : ""}</span>
+          <span className="text-xs text-muted-foreground">
+            已设 {selectedSymbols.size} 只 · 普通 {selectedManualSymbols.length} · AI 自主 {selectedAutonomousSymbols.length}
+            {selectedNames ? `：${selectedNames}` : ""}
+          </span>
           <button
             type="button"
             disabled={busy === "runtime-control" || monitorDisconnected}
@@ -3984,7 +4835,7 @@ export default function PortfolioMonitorPanel({
           </button>
           <button
             type="button"
-            disabled={!selectedSymbols.size || busy === "create"}
+            disabled={!selectedManualSymbols.length || busy === "create"}
             onClick={() => void createDrafts()}
             className="inline-flex items-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
           >
@@ -4056,10 +4907,10 @@ export default function PortfolioMonitorPanel({
                   </span>
                 </div>
                 <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
-                  自主监控直接跟随持仓矩阵的监控勾选。开启后，Agent 只会读取这些标的的新报告，必要时补充只读研究；通过数据门禁的点位自动进入 shadow 监控。
+                  自主监控只跟随持仓矩阵中紫色的「AI 自主」等级。开启后，Agent 会自动判断周报条件和版本差异；通过闭合日线、量能、来源及有效期门禁后自动换版并进入 shadow 监控。
                 </p>
                 <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
-                  与下方共用同一套报告、计划和监控运行版：自主监控负责自动研究与换版，下方只保留报告来源选择和手动覆盖入口。
+                  与下方共用同一套报告、计划和监控运行版：这里只扩大提醒判断权，不接入交易；买入、减仓和退出仍全部由你决定。
                 </p>
               </div>
               <button
@@ -4083,9 +4934,9 @@ export default function PortfolioMonitorPanel({
             <div className="grid gap-3 rounded-md border bg-background/70 p-3" aria-label="自主监控标的范围">
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
-                  <div className="text-xs font-medium">跟随持仓矩阵的监控选择</div>
+                  <div className="text-xs font-medium">跟随持仓矩阵的 AI 自主等级</div>
                   <p className="mt-1 text-[11px] text-muted-foreground">
-                    当前矩阵已选 {selectedMonitorSymbols.length} / 共 {holdings.length} 只；自主监控已纳入 {selectedAutopilotSymbols.length} 只
+                    当前已设普通监控 {selectedManualSymbols.length} 只、AI 自主 {selectedAutonomousSymbols.length} 只 / 共 {holdings.length} 只；自主服务可纳入 {selectedAutopilotSymbols.length} 只
                     {selectedAutopilotNames ? `：${selectedAutopilotNames}` : "。请先在持仓矩阵勾选需要监控的标的。"}
                   </p>
                 </div>
@@ -4117,7 +4968,7 @@ export default function PortfolioMonitorPanel({
                 </div>
               </div>
               <p className="text-[11px] leading-5 text-muted-foreground">
-                在本页下方「持仓矩阵」第一列，点击股票名前的雷达图标选择单只标的；点击表头的雷达图标可全选或取消全选。
+                在本页下方「持仓矩阵」第一列连续点击同一个雷达：灰色未监控 → 蓝色普通监控 → 紫色 AI 自主。停止操作 5 秒后才应用最终等级。
               </p>
               {autopilotSelectionSyncState === "error" ? (
                 <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-red-500/30 bg-red-500/5 px-2.5 py-2 text-[11px] text-red-700 dark:text-red-300" role="alert">
@@ -4256,18 +5107,16 @@ export default function PortfolioMonitorPanel({
             </div>
           </div>
 
-          {selectedMonitorSymbols.length ? (
+          {selectedManualSymbols.length ? (
             <div className="grid gap-3 rounded-md border border-cyan-500/30 bg-cyan-500/[0.03] p-3">
               <div>
-                <div className="text-sm font-semibold">报告来源与手动覆盖</div>
+                <div className="text-sm font-semibold">普通监控设置</div>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  {autopilotOperational
-                    ? "这不是第二套监控。自主监控会自动读取同一批报告，并在硬门禁通过后自动更新运行计划；这里用于指定报告或手动生成覆盖草案。手动草案不会被原地修改，但后续自主换版可能将其标记为已取代；如需锁定手工方案，请先关闭自主监控。"
-                    : "自主监控关闭时，这里是报告驱动监控的手动入口。每只标的会冻结所选报告和行情快照；没有有效报告、报告过期或证据冲突时会异步深研，草案经人工确认后才会替换运行版。"}
+                  蓝色普通监控标的在这里选择报告并生成草案；人工确认启用后持续监控，AI 不会自动改写其运行版。
                 </p>
               </div>
               <div className="grid gap-2 lg:grid-cols-2">
-                {selectedMonitorSymbols.map((symbol) => {
+                {selectedManualSymbols.map((symbol) => {
                   const candidates = reportCandidates[symbol] || [];
                   return (
                     <label key={symbol} className="grid gap-1 text-xs text-muted-foreground">
@@ -4378,15 +5227,22 @@ export default function PortfolioMonitorPanel({
 
           <div className="grid gap-3 rounded-md border p-3">
             <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
-              <label className="grid gap-1 text-xs text-muted-foreground">
-                飞书提醒目标
-                <select value={selectedTarget} onChange={(event) => setSelectedTarget(event.target.value)} className="rounded-md border bg-background px-3 py-2 text-sm text-foreground">
-                  <option value="">尚未绑定</option>
+              <div className="grid gap-1 text-xs text-muted-foreground">
+                <label htmlFor="portfolio-monitor-feishu-target">飞书提醒目标</label>
+                <select
+                  id="portfolio-monitor-feishu-target"
+                  aria-describedby="portfolio-monitor-feishu-target-help"
+                  value={selectedTarget}
+                  onChange={(event) => setSelectedTarget(event.target.value)}
+                  className="rounded-md border bg-background px-3 py-2 text-sm text-foreground"
+                >
+                  <option value="">跟随全局设置</option>
                   {targets.filter((target) => target.status === "active").map((target) => (
                     <option key={target.target_id} value={target.target_id}>{target.chat_type === "group" ? "群聊" : "私聊"} · {target.chat_id}</option>
                   ))}
                 </select>
-              </label>
+                <span id="portfolio-monitor-feishu-target-help" className="text-[11px] text-muted-foreground">选择“跟随全局设置”时，发送时使用设置页的默认目标；已有监控的独立目标不会被覆盖。</span>
+              </div>
               <button
                 type="button"
                 disabled={busy === "create-binding"}
@@ -4450,7 +5306,7 @@ export default function PortfolioMonitorPanel({
               <div className="flex items-center gap-2">
                 <h3 className="text-sm font-semibold">监控标的</h3>
                 <span className="rounded-full border bg-muted/30 px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
-                  {visibleProfiles.length}
+                  {visibleCarouselTargets.length}
                 </span>
               </div>
               <div className="flex items-center gap-1.5">
@@ -4464,7 +5320,7 @@ export default function PortfolioMonitorPanel({
                     {showClosedProfiles ? "隐藏已关闭" : `查看已关闭 ${closedProfileCount}`}
                   </button>
                 ) : null}
-                {visibleProfiles.length > 1 ? (
+                {visibleCarouselTargets.length > 1 ? (
                   <>
                     <button
                       type="button"
@@ -4475,7 +5331,7 @@ export default function PortfolioMonitorPanel({
                       <ChevronLeft className="h-3.5 w-3.5" />
                     </button>
                     <span className="min-w-10 text-center font-mono text-[10px] tabular-nums text-muted-foreground">
-                      {selectedProfileIndex + 1} / {visibleProfiles.length}
+                      {selectedProfileIndex + 1} / {visibleCarouselTargets.length}
                     </span>
                     <button
                       type="button"
@@ -4498,7 +5354,7 @@ export default function PortfolioMonitorPanel({
                 </button>
               </div>
             </div>
-            {visibleProfiles.length && selectedProfile ? (
+            {visibleCarouselTargets.length && selectedCarouselTarget ? (
               <div
                 className="grid w-full min-w-0 max-w-full gap-2 lg:h-[56rem] lg:grid-cols-2"
                 onMouseEnter={() => setCarouselPaused(true)}
@@ -4517,7 +5373,21 @@ export default function PortfolioMonitorPanel({
                     <span className="sr-only">状态与下次检查</span>
                   </div>
                   <div className="flex gap-2 overflow-x-auto p-2 lg:grid lg:content-start lg:overflow-x-hidden lg:overflow-y-auto">
-                    {visibleProfiles.map((profile) => {
+                    {visibleCarouselTargets.map((target) => {
+                      if (target.kind === "pending_autopilot") {
+                        return (
+                          <MonitorPendingCarouselRow
+                            key={target.key}
+                            symbol={target.symbol}
+                            displayName={monitorSymbolName(target.symbol, holdingNameByIdentifier)}
+                            selected={target.key === selectedCarouselTarget.key}
+                            run={target.run}
+                            card={target.card}
+                            onSelect={() => setSelectedProfileId(target.key)}
+                          />
+                        );
+                      }
+                      const { profile } = target;
                       const normalizedSymbol = profile.symbol.trim().toUpperCase();
                       const [code, symbolMarket] = normalizedSymbol.split(".");
                       const marketLabel = symbolMarket || profile.market || "";
@@ -4539,7 +5409,7 @@ export default function PortfolioMonitorPanel({
                           displayName={monitorProfileDisplayName(profile, holdingNameByIdentifier)}
                           code={code}
                           marketLabel={marketLabel}
-                          selected={profile.profile_id === selectedProfile.profile_id}
+                          selected={target.key === selectedCarouselTarget.key}
                           lampState={lampState}
                           nowMs={heartbeatNow}
                           countdownActive={countdownActive}
@@ -4549,7 +5419,7 @@ export default function PortfolioMonitorPanel({
                     })}
                   </div>
                 </div>
-                {(() => {
+                {selectedProfile ? (() => {
                   const profile = selectedProfile;
                   const normalizedSymbol = profile.symbol.trim().toUpperCase();
                   const [code, symbolMarket] = normalizedSymbol.split(".");
@@ -4599,6 +5469,15 @@ export default function PortfolioMonitorPanel({
                           <span className="sr-only">{profileStatusLabel}</span>
                         </div>
                       </div>
+                      {selectedTargetCard?.decision_brief ? (
+                        <MonitorDecisionCard
+                          card={selectedTargetCard}
+                          busy={busy}
+                          onChoice={(choice) => void chooseMonitoringDecision(selectedTargetCard, choice)}
+                          onValidateDraft={(draftId) => void validateConditionDraft(draftId)}
+                          onCancelDraft={(draftId) => void cancelConditionDraft(draftId)}
+                        />
+                      ) : null}
                       <div className="sr-only">
                         <MonitorHeartbeat
                           profile={profile}
@@ -4680,7 +5559,18 @@ export default function PortfolioMonitorPanel({
                       </div>
                     </article>
                   );
-                })()}
+                })() : selectedPendingTarget ? (
+                  <MonitorPendingTargetCard
+                    symbol={selectedPendingTarget.symbol}
+                    displayName={monitorSymbolName(
+                      selectedPendingTarget.symbol,
+                      holdingNameByIdentifier,
+                    )}
+                    run={selectedPendingTarget.run}
+                    card={selectedPendingTarget.card}
+                    onShowUsage={setUsageJobId}
+                  />
+                ) : null}
               </div>
             ) : (
               <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
@@ -4692,12 +5582,26 @@ export default function PortfolioMonitorPanel({
           </div>
 
           <div className="grid gap-2">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <h3 className="text-sm font-semibold">最近事件</h3>
-              <span className="inline-flex items-center gap-1 text-xs text-muted-foreground"><Clock3 className="h-3.5 w-3.5" />已记录 {Math.max(status?.events || 0, displayEvents.length)} 条</span>
+              <div className="flex flex-wrap items-center justify-end gap-2 text-xs">
+                <span className="inline-flex items-center gap-1 text-muted-foreground"><Clock3 className="h-3.5 w-3.5" />已记录 {Math.max(status?.events || 0, displayEvents.length)} 条</span>
+                {displayEvents.length > RECENT_EVENT_PREVIEW_LIMIT ? (
+                  <button
+                    type="button"
+                    aria-expanded={showAllEvents}
+                    onClick={() => setShowAllEvents((current) => !current)}
+                    className="rounded border px-2 py-1 font-medium text-foreground hover:bg-muted"
+                  >
+                    {showAllEvents
+                      ? `收起，仅看最新 ${RECENT_EVENT_PREVIEW_LIMIT} 条`
+                      : `展开全部 ${displayEvents.length} 条`}
+                  </button>
+                ) : null}
+              </div>
             </div>
-            <div className="overflow-hidden rounded-md border">
-              {displayEvents.length ? displayEvents.map((event) => (
+            <div className="overflow-hidden rounded-md border" aria-label="最近事件列表">
+              {renderedEvents.length ? renderedEvents.map((event) => (
                 <MonitorEventRow
                   key={event.event_id}
                   event={event}

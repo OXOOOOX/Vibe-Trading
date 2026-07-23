@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from backtest.loaders.eastmoney_client import get_json, resolve_secid
@@ -43,6 +44,13 @@ _BUCKETS = ("main", "small", "medium", "large", "super_large")
 _MAX_DAYS = 250
 _MAX_ROWS_PER_SYMBOL = 250
 _VALID_PERIODS = ("min", "daily")
+_BUCKET_SEMANTICS = {
+    "main": "provider-defined aggregate of large and super-large order-size buckets",
+    "small": "net flow attributed to provider-defined small-order executions",
+    "medium": "net flow attributed to provider-defined medium-order executions",
+    "large": "net flow attributed to provider-defined large-order executions",
+    "super_large": "net flow attributed to provider-defined super-large-order executions",
+}
 
 
 def _error(message: str) -> str:
@@ -216,12 +224,32 @@ class FundFlowTool(BaseTool):
             symbol: _fetch_symbol_flow(symbol, period=period, days=days)
             for symbol in (c.strip() for c in codes)
         }
+        subject_symbol = str(kwargs.get("_subject_symbol") or "").strip().upper() or None
+        relationship = str(kwargs.get("_relationship") or "").strip() or None
+        for symbol, result in results.items():
+            result["data_symbol"] = symbol
+            result["subject_symbol"] = subject_symbol or symbol
+            result["relationship"] = relationship if subject_symbol and symbol != subject_symbol else "subject"
         envelope = {
             "ok": True,
+            "schema_version": 2,
             "market": "stock",
             "source": "eastmoney",
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
             "period": period,
+            "metric_family": "secondary_market_order_size_net_flow",
+            "unit": "CNY",
             "buckets": list(_BUCKETS),
+            "bucket_semantics": _BUCKET_SEMANTICS,
+            "entity_identification": False,
+            "actor_inference": "unsupported",
+            "not_equivalent_to": [
+                "ETF subscriptions or redemptions",
+                "ETF fund-unit/share change",
+                "fund-company-confirmed net flow",
+            ],
+            "subject_symbol": subject_symbol,
+            "relationship": relationship,
             "data": results,
         }
         return json.dumps(envelope, ensure_ascii=False)

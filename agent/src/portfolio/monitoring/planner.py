@@ -15,6 +15,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from src.market_cache import get_market_refresh_service
+from src.portfolio.analysis_methods import (
+    ACTION_READY_MIN_BARS,
+    METHOD_REGISTRY_VERSION,
+    WATCH_ONLY_MIN_BARS,
+    build_market_analysis_snapshot,
+    method_release_status,
+)
 from src.portfolio.state import normalize_symbol
 
 from .models import DEFAULT_PRICE_VOLUME_POLICY, validate_plan
@@ -54,7 +61,7 @@ def _calculation_basis(
 class MonitoringPlanner:
     """Build a reviewable plan without inventing unavailable evidence."""
 
-    model_id = "evidence-policy-v3"
+    model_id = METHOD_REGISTRY_VERSION
 
     def __init__(self, market_service: Any | None = None) -> None:
         self.market_service = market_service or get_market_refresh_service()
@@ -134,6 +141,672 @@ class MonitoringPlanner:
         return quote
 
     def build(
+        self,
+        holding: dict[str, Any],
+        *,
+        allow_single_source: bool = False,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any], list[str]]:
+        """Build a continuity-safe structural plan from deterministic levels."""
+
+        symbol = normalize_symbol(str(holding.get("symbol") or holding.get("code") or "")).upper()
+        quote = self._actionable_quote(symbol, allow_single_source=allow_single_source)
+        blocked: list[str] = []
+        accepted_statuses = {"verified", "single_source"} if allow_single_source else {"verified"}
+        if not quote:
+            blocked.append("verified_quote_missing")
+        elif quote.get("status") not in accepted_statuses:
+            blocked.append(f"quote_not_actionable:{quote.get('status') or 'unknown'}")
+        elif quote.get("adjustment") != "raw":
+            blocked.append("raw_price_basis_unavailable")
+        elif not quote.get("sources"):
+            blocked.append("quote_provenance_missing")
+        try:
+            last_price = float((quote or {}).get("last_price"))
+            if last_price <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            last_price = 0.0
+            blocked.append("verified_price_missing")
+
+        daily = self.market_service.store.query_bars(
+            symbol=symbol,
+            interval="1D",
+            adjustment="raw",
+            view="consensus",
+            limit=320,
+        )
+        verified_daily = [
+            row
+            for row in daily
+            if row.get("status") in accepted_statuses and row.get("close") is not None
+        ]
+        intraday = self.market_service.store.query_bars(
+            symbol=symbol,
+            interval="5m",
+            adjustment="raw",
+            view="consensus",
+            limit=2500,
+        )
+        verified_intraday = [
+            row
+            for row in intraday
+            if row.get("status") in accepted_statuses
+            and row.get("close") is not None
+            and str(row.get("volume_status") or row.get("status") or "") in accepted_statuses
+        ]
+        if hasattr(self.market_service, "derive_adjustment_factor_candidates"):
+            self.market_service.derive_adjustment_factor_candidates(
+                symbol,
+                raw_bars=verified_daily,
+            )
+        factor_rows = (
+            self.market_service.store.list_adjustment_factors(symbol)
+            if hasattr(self.market_service.store, "list_adjustment_factors")
+            else []
+        )
+        instrument_type = (
+            "etf"
+            if symbol[:2] in {"15", "16", "50", "51", "52", "56", "58"}
+            else "company_equity"
+        )
+        snapshot = build_market_analysis_snapshot(
+            verified_daily,
+            symbol=symbol,
+            instrument_type=instrument_type,
+            adjustment="raw",
+            factor_rows=factor_rows,
+            intraday_bars=verified_intraday,
+        )
+        continuity = dict(snapshot.get("continuity") or {})
+        data_mode = "single_source" if (quote or {}).get("status") == "single_source" else "verified"
+        volume_status = str((quote or {}).get("volume_status") or "unavailable")
+        if volume_status == "unavailable" and verified_daily:
+            volume_status = str(verified_daily[-1].get("volume_status") or "unavailable")
+        evidence = {
+            "symbol": symbol,
+            "holding": {
+                "name": holding.get("name"),
+                "quantity": holding.get("quantity"),
+                "cost_price": holding.get("cost_price"),
+                "updated_at": holding.get("updated_at"),
+            },
+            "quote": quote,
+            "daily_bar_count": len(verified_daily),
+            "usable_daily_bar_count": int(snapshot.get("bar_count") or 0),
+            "daily_tail_hash": _hash(verified_daily[-60:]),
+            "intraday_tail_hash": _hash(
+                [
+                    (
+                        row.get("bar_time"),
+                        row.get("open"),
+                        row.get("high"),
+                        row.get("low"),
+                        row.get("close"),
+                        row.get("volume"),
+                        row.get("amount"),
+                        row.get("volume_status"),
+                    )
+                    for row in verified_intraday[-120:]
+                ]
+            ),
+            "volume_signature": _hash(
+                [
+                    (
+                        row.get("bar_time"),
+                        row.get("volume_status"),
+                        row.get("volume_source_count"),
+                        row.get("volume_sources"),
+                    )
+                    for row in verified_daily[-20:]
+                ]
+            ),
+            "adjustment_factor_revision": _hash(factor_rows),
+            "method_registry_version": METHOD_REGISTRY_VERSION,
+            "level_snapshot_id": snapshot.get("level_snapshot_id"),
+            "level_snapshot": snapshot,
+            "continuity": continuity,
+            "data_as_of": (quote or {}).get("bar_time"),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "planner_mode": "multi_method_level_evidence",
+            "threshold_method": "multi_method_level_evidence",
+            "selection_mode": "deterministic_fallback",
+            "data_mode": data_mode,
+            "volume_gate": {
+                "status": "ready" if volume_status in accepted_statuses else "pending_evidence",
+                "source_status": volume_status,
+                "blocks_price_observation": False,
+                "blocks_confirmation": volume_status not in accepted_statuses,
+            },
+        }
+        release_gate = method_release_status(METHOD_REGISTRY_VERSION)
+        evidence["method_release_gate"] = release_gate
+        if not release_gate.get("eligible_for_automatic_release"):
+            blocked.append("no_qualified_level")
+        if data_mode == "single_source":
+            evidence["single_source_consent"] = {
+                "granted": bool(allow_single_source),
+                "granted_at": datetime.now(timezone.utc).isoformat(),
+            }
+        if int(snapshot.get("bar_count") or 0) < WATCH_ONLY_MIN_BARS:
+            blocked.extend(str(item) for item in snapshot.get("data_gap_codes") or [])
+            if "insufficient_post_event_history" not in blocked:
+                blocked.append("insufficient_post_event_history")
+        if blocked:
+            return None, evidence, list(dict.fromkeys(blocked))
+
+        primary = dict(snapshot.get("primary_levels") or {})
+        ladder = dict(snapshot.get("level_ladder") or {})
+
+        def preferred_level(side: str, roles: set[str]) -> dict[str, Any] | None:
+            values = [
+                item
+                for item in list(ladder.get(side) or [])
+                if isinstance(item, dict) and str(item.get("role") or "") in roles
+            ]
+            if not values:
+                values = [
+                    item
+                    for item in list(snapshot.get("level_candidates") or [])
+                    if isinstance(item, dict)
+                    and item.get("level_type") == side
+                    and str(item.get("role") or "") in roles
+                ]
+            if not values:
+                return None
+            values.sort(
+                key=lambda item: (
+                    item.get("automation_status") == "action_ready",
+                    float(item.get("rank_score") or 0.0),
+                ),
+                reverse=True,
+            )
+            return dict(values[0])
+
+        support = preferred_level("support", {"S1"}) or preferred_level(
+            "support", {"S2"}
+        ) or primary.get("support")
+        resistance = preferred_level("resistance", {"R1"}) or preferred_level(
+            "resistance", {"R2"}
+        ) or primary.get("resistance")
+        if not isinstance(support, dict) or not isinstance(resistance, dict):
+            return None, evidence, ["no_qualified_level"]
+
+        def calculation_basis(candidate: dict[str, Any], value: float, label: str) -> dict[str, Any]:
+            references = []
+            for item in list((candidate.get("calculation_basis") or {}).get("references") or [])[:8]:
+                references.append(
+                    {
+                        "label": str(item.get("kind") or "结构证据")[:80],
+                        "value": float(item.get("value")),
+                        "date": str(item.get("date") or "")[:40],
+                    }
+                )
+            return _calculation_basis(
+                method="multi_method_level_evidence",
+                method_label=label,
+                formula="多周期边界 + 已确认摆动点 + ATR聚类 + 触达反应与量能证据评分",
+                summary=(
+                    f"区间 {candidate['lower']}–{candidate['upper']}，评分 {candidate['score']}，"
+                    f"置信度 {candidate['confidence']}，方法 {', '.join(candidate.get('method_ids') or [])}。"
+                ),
+                recommended_value=value,
+                references=references,
+            )
+
+        support_invalidation = float((support.get("invalidation") or {}).get("value"))
+        resistance_invalidation = float((resistance.get("invalidation") or {}).get("value"))
+        rules: list[dict[str, Any]] = []
+        scenarios: list[dict[str, Any]] = []
+
+        def append_scenario(
+            *,
+            client_rule_id: str,
+            kind: str,
+            severity: str,
+            intent: str,
+            level: int,
+            candidate: dict[str, Any],
+            label: str,
+            rationale: str,
+            confirmation_count: int,
+            action: str,
+            entry_conditions: list[dict[str, Any]],
+            confirmation_conditions: list[dict[str, Any]],
+            threshold: float | None = None,
+            zone: tuple[float, float] | None = None,
+            automation_status: str | None = None,
+        ) -> None:
+            if zone is not None:
+                lower, upper = zone
+                parameters = {
+                    "lower": _rounded(lower),
+                    "upper": _rounded(upper),
+                    "interval": "5m",
+                    "adjustment": "raw",
+                    "confirmation_count": confirmation_count,
+                    "cooldown_minutes": 120,
+                    "clear_hysteresis_bps": 30,
+                }
+                trigger = {
+                    "kind": kind,
+                    "lower": _rounded(lower),
+                    "upper": _rounded(upper),
+                    "interval": "5m",
+                    "confirmation_count": confirmation_count,
+                }
+                original_level = {
+                    "kind": "zone",
+                    "lower": _rounded(lower),
+                    "upper": _rounded(upper),
+                    "unit": "CNY",
+                    "adjustment": "raw",
+                    "source_text": label,
+                }
+                recommended_value = (lower + upper) / 2
+            else:
+                assert threshold is not None
+                parameters = {
+                    "threshold": _rounded(threshold),
+                    "interval": "5m",
+                    "adjustment": "raw",
+                    "confirmation_count": confirmation_count,
+                    "cooldown_minutes": 120,
+                    "clear_hysteresis_bps": 30,
+                }
+                trigger = {
+                    "kind": kind,
+                    "threshold": _rounded(threshold),
+                    "interval": "5m",
+                    "confirmation_count": confirmation_count,
+                }
+                original_level = {
+                    "kind": "price",
+                    "value": _rounded(threshold),
+                    "unit": "CNY",
+                    "adjustment": "raw",
+                    "source_text": label,
+                }
+                recommended_value = threshold
+            basis = calculation_basis(candidate, recommended_value, label)
+            rules.append(
+                {
+                    "client_rule_id": client_rule_id,
+                    "kind": kind,
+                    "severity": severity,
+                    "enabled": True,
+                    "target_intent": intent,
+                    "target_level": level,
+                    "alert_cue": "none",
+                    "parameters": parameters,
+                    "valid_until": rule_valid_until,
+                    "rationale": rationale,
+                    "calculation_basis": basis,
+                }
+            )
+            source_conditions = []
+            for condition in [*entry_conditions, *confirmation_conditions]:
+                source_conditions.append(
+                    {
+                        "condition_id": condition["source_condition_id"],
+                        "source_text": str(condition.pop("source_text")),
+                        "role": "required",
+                        "coverage_status": "mapped",
+                        "reason": "",
+                        "evidence_refs": [str(candidate.get("candidate_id") or client_rule_id)],
+                    }
+                )
+            scenario_status = automation_status or str(
+                candidate.get("automation_status") or "watch_only"
+            )
+            scenarios.append(
+                {
+                    "scenario_id": client_rule_id,
+                    "client_rule_id": client_rule_id,
+                    "label": label,
+                    "intent": intent,
+                    "evidence_refs": [str(candidate.get("candidate_id") or client_rule_id)],
+                    "original_level": original_level,
+                    "trigger": trigger,
+                    "approach_policy": {
+                        "distance_bps": 100,
+                        "source": "atr20_default",
+                        "check_interval": "1m",
+                    },
+                    "volume_confirmation": {
+                        "metric": "same_bucket_5m_volume_ratio",
+                        "comparator": "gte",
+                        "threshold": 1.2,
+                        "min_samples": 10,
+                        "mode": "classify_only",
+                        "unit": "ratio",
+                    },
+                    "resolution_policy": {
+                        "rejection_hysteresis_bps": 30,
+                        "max_observation_bars": 12 if any(
+                            str(item.get("interval")) == "1d"
+                            for item in confirmation_conditions
+                        ) else 6,
+                        "close_action": "unresolved",
+                    },
+                    "rationale": rationale,
+                    "source_conditions": source_conditions,
+                    "entry_conditions": {"operator": "all", "conditions": entry_conditions},
+                    "confirmation_conditions": {
+                        "operator": "all",
+                        "conditions": confirmation_conditions,
+                    },
+                    "invalidation_conditions": {"operator": "all", "conditions": []},
+                    "sequence_policy": {
+                        "enabled": bool(confirmation_conditions),
+                        "max_wait_bars": 12 if any(
+                            str(item.get("interval")) == "1d"
+                            for item in confirmation_conditions
+                        ) else 6,
+                        "reset_on_invalidation": True,
+                    },
+                    "action_template": {
+                        "action": action,
+                        "sizing": {
+                            "kind": "default_policy",
+                            "source": "requires_user_risk_preferences",
+                        },
+                        "confidence_floor": "high" if scenario_status == "action_ready" else "low",
+                    },
+                    "automation_status": scenario_status,
+                }
+            )
+
+        def condition(
+            condition_id: str,
+            source_text: str,
+            kind: str,
+            operator: str,
+            *,
+            interval: str,
+            **values: Any,
+        ) -> dict[str, Any]:
+            return {
+                "condition_id": condition_id,
+                "source_condition_id": f"source-{condition_id}",
+                "source_text": source_text,
+                "kind": kind,
+                "operator": operator,
+                "interval": interval,
+                "consecutive": int(values.pop("consecutive", 1)),
+                "lookback_bars": int(values.pop("lookback_bars", 1)),
+                "freshness_seconds": int(
+                    values.pop("freshness_seconds", 172800 if interval == "1d" else 900)
+                ),
+                **values,
+            }
+
+        now = datetime.now(timezone.utc)
+        rule_valid_until = (now + timedelta(days=45)).isoformat()
+        hard_valid_until = (now + timedelta(days=90)).isoformat()
+        support_is_actionable_s1 = bool(
+            support.get("role") == "S1" and support.get("automation_status") == "action_ready"
+        )
+        append_scenario(
+            client_rule_id="support-zone-test",
+            kind="price_zone_enter",
+            zone=(float(support["lower"]), float(support["upper"])),
+            severity="info",
+            intent="add_position",
+            level=1,
+            candidate=support,
+            label=f"{support.get('role') or 'T0'} 支撑测试",
+            rationale="进入支撑区只表示开始测试；收复上沿并通过完成K线和量能确认后，才允许生成加仓草稿。",
+            confirmation_count=1,
+            action="add" if support_is_actionable_s1 else "observe",
+            automation_status="action_ready" if support_is_actionable_s1 else "watch_only",
+            entry_conditions=[
+                condition(
+                    "support-zone-entry",
+                    "已完成5分钟K线进入支撑区",
+                    "price_zone",
+                    "between",
+                    interval="5m",
+                    lower=_rounded(float(support["lower"])),
+                    upper=_rounded(float(support["upper"])),
+                )
+            ],
+            confirmation_conditions=[
+                condition(
+                    "support-reclaim",
+                    "进入支撑区后重新收于区间上沿之上",
+                    "price_reclaim",
+                    "gte",
+                    interval="5m",
+                    value=_rounded(float(support["upper"])),
+                    direction="above",
+                    lookback_bars=6,
+                ),
+                condition(
+                    "support-volume",
+                    "同时间桶成交量或成交额比不低于1.2",
+                    "volume_ratio",
+                    "gte",
+                    interval="5m",
+                    value=1.2,
+                    metric="confirmation_ratio",
+                ),
+            ],
+        )
+        append_scenario(
+            client_rule_id="resistance-breakout-confirmation",
+            kind="price_cross_above",
+            threshold=float(resistance["upper"]),
+            severity="warning",
+            intent="breakout",
+            level=2,
+            candidate=resistance,
+            label=f"{resistance.get('role') or 'R1'} 趋势突破确认",
+            rationale="阻力上沿越过只是早期事实；连续两根已完成5分钟K线站上并通过量能门禁后，才确认有效突破并重算点位。",
+            confirmation_count=2,
+            action="observe",
+            entry_conditions=[
+                condition(
+                    "breakout-entry",
+                    "5分钟价格越过阻力区上沿",
+                    "price_compare",
+                    "gte",
+                    interval="5m",
+                    value=_rounded(float(resistance["upper"])),
+                )
+            ],
+            confirmation_conditions=[
+                condition(
+                    "breakout-closes",
+                    "连续两根已完成5分钟K线收于阻力区上沿之上",
+                    "price_compare",
+                    "gte",
+                    interval="5m",
+                    value=_rounded(float(resistance["upper"])),
+                    consecutive=2,
+                    lookback_bars=2,
+                ),
+                condition(
+                    "breakout-volume",
+                    "同时间桶成交量或成交额比不低于1.2",
+                    "volume_ratio",
+                    "gte",
+                    interval="5m",
+                    value=1.2,
+                    metric="confirmation_ratio",
+                ),
+            ],
+        )
+        append_scenario(
+            client_rule_id="support-invalidation",
+            kind="price_cross_below",
+            threshold=support_invalidation,
+            severity="critical",
+            intent="stop_loss",
+            level=2,
+            candidate=support,
+            label=f"{support.get('role') or 'S1'} 结构风险防线",
+            rationale="分钟级跌破只进入待确认并暂停新增买入；只有日线收盘跌破且量能门禁通过，才确认结构失效并允许生成减仓草稿。",
+            confirmation_count=1,
+            action="reduce",
+            entry_conditions=[
+                condition(
+                    "risk-early-break",
+                    "已完成5分钟K线跌破结构风险防线",
+                    "price_compare",
+                    "lte",
+                    interval="5m",
+                    value=_rounded(support_invalidation),
+                )
+            ],
+            confirmation_conditions=[
+                condition(
+                    "risk-daily-close",
+                    "日线收盘确认跌破结构风险防线",
+                    "price_compare",
+                    "lte",
+                    interval="1d",
+                    value=_rounded(support_invalidation),
+                ),
+                condition(
+                    "risk-daily-volume",
+                    "日线成交量相对前20日不低于1.2倍",
+                    "rolling_volume_ratio",
+                    "gte",
+                    interval="1d",
+                    value=1.2,
+                    metric="volume",
+                    lookback_bars=20,
+                ),
+            ],
+        )
+        resistance_is_actionable_r1 = bool(
+            resistance.get("role") == "R1"
+            and resistance.get("automation_status") == "action_ready"
+        )
+        append_scenario(
+            client_rule_id="resistance-zone-test",
+            kind="price_zone_enter",
+            zone=(float(resistance["lower"]), float(resistance["upper"])),
+            severity="info",
+            intent="take_profit",
+            level=1,
+            candidate=resistance,
+            label=f"{resistance.get('role') or 'R1'} 阻力测试",
+            rationale="进入阻力区不是机械止盈；已完成K线转弱且量能确认后，才允许生成减仓草稿。",
+            confirmation_count=1,
+            action="reduce" if resistance_is_actionable_r1 else "observe",
+            automation_status="action_ready" if resistance_is_actionable_r1 else "watch_only",
+            entry_conditions=[
+                condition(
+                    "resistance-zone-entry",
+                    "已完成5分钟K线进入阻力区",
+                    "price_zone",
+                    "between",
+                    interval="5m",
+                    lower=_rounded(float(resistance["lower"])),
+                    upper=_rounded(float(resistance["upper"])),
+                )
+            ],
+            confirmation_conditions=[
+                condition(
+                    "resistance-bearish",
+                    "阻力测试后出现已完成5分钟阴线",
+                    "bar_direction",
+                    "equals",
+                    interval="5m",
+                    direction="bearish",
+                ),
+                condition(
+                    "resistance-volume",
+                    "同时间桶成交量或成交额比不低于1.2",
+                    "volume_ratio",
+                    "gte",
+                    interval="5m",
+                    value=1.2,
+                    metric="confirmation_ratio",
+                ),
+            ],
+        )
+        evidence["rule_automation_status"] = {
+            "resistance-breakout-confirmation": resistance.get("automation_status", "watch_only"),
+            "resistance-zone-test": "action_ready" if resistance_is_actionable_r1 else "watch_only",
+            "support-zone-test": "action_ready" if support_is_actionable_s1 else "watch_only",
+            "support-invalidation": support.get("automation_status", "watch_only"),
+        }
+        evidence["target_ladder"] = {
+            side: [
+                {
+                    "candidate_id": item.get("candidate_id"),
+                    "role": item.get("role"),
+                    "zone": [item.get("lower"), item.get("upper")],
+                    "invalidation": (item.get("invalidation") or {}).get("value"),
+                    "score": item.get("score"),
+                    "confidence": item.get("confidence"),
+                    "automation_status": item.get("automation_status"),
+                    "method_families": item.get("method_families") or [],
+                    "noise_gate": item.get("noise_gate") or {},
+                }
+                for item in list(ladder.get(side) or [])[:3]
+            ]
+            for side in ("support", "resistance")
+        }
+        price_volume_policy = {
+            **DEFAULT_PRICE_VOLUME_POLICY,
+            "baseline_sessions": 20,
+            "min_samples": 10,
+            "expansion_ratio": 1.2,
+        }
+        plan = {
+            "schema_version": 5,
+            "symbol": symbol,
+            "data_mode": data_mode,
+            "summary": "多层结构点位按观察、确认和失效原始周期分离；系统可生成非交易型建议，但不执行交易。",
+            "quote_tier": "normal",
+            "near_trigger_tier": "active",
+            "near_trigger_distance_bps": 100,
+            "price_volume_policy": price_volume_policy,
+            "analysis_ref": {
+                "snapshot_id": str(snapshot.get("level_snapshot_id") or _hash(snapshot))[:80],
+                "report_ref": f"market-analysis://{symbol}/{snapshot.get('level_snapshot_id')}",
+                "report_type": "monitor_research",
+                "title": f"{symbol} 多方法结构监控快照",
+                "revision": 1,
+                "body_sha256": _hash(snapshot),
+                "quality_status": "ready",
+                "generated_at": now.isoformat(),
+                "data_as_of": now.isoformat(),
+            },
+            "watch_scenarios": scenarios,
+            "market_rules": rules,
+            "news_topics": [],
+            "fundamental_monitor": {
+                "enabled": False,
+                "capability_status": "unavailable_until_document_evidence_is_calibrated",
+            },
+            "hard_valid_until": hard_valid_until,
+            "evidence_notes": [
+                "所有价格均由确定性结构引擎计算，AI不能新增价格。",
+                "进入区间属于观察事件；突破、跌破和反弹须通过已完成K线与量能门禁。",
+                "成交量冲突只暂停确认，不关闭价格观察档案。",
+            ],
+            "automation_policy": {
+                "activation_mode": "autonomous",
+                "activated_by": "autopilot",
+                "evidence_fingerprint": _hash(
+                    {
+                        "level_snapshot_id": snapshot.get("level_snapshot_id"),
+                        "daily_tail_hash": evidence.get("daily_tail_hash"),
+                        "intraday_tail_hash": evidence.get("intraday_tail_hash"),
+                        "volume_signature": evidence.get("volume_signature"),
+                    }
+                ),
+                "trade_execution": "forbidden",
+                "trigger_type": "multi_method_level_monitor",
+            },
+        }
+        return validate_plan(plan, expected_symbol=symbol), evidence, []
+
+    def _build_legacy(
         self,
         holding: dict[str, Any],
         *,

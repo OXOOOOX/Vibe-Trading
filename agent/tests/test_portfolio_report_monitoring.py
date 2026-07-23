@@ -17,7 +17,10 @@ from src.portfolio.monitoring.models import PlanValidationError, validate_plan
 from src.portfolio.monitoring.planner import MonitoringPlanner
 from src.portfolio.monitoring.price_volume import PriceVolumeAnalyzer
 from src.portfolio.monitoring.report_catalog import MonitorReportCatalog
-from src.portfolio.monitoring.report_planner import ReportDrivenMonitoringPlanner
+from src.portfolio.monitoring.report_planner import (
+    DeterministicMarketRepairError,
+    ReportDrivenMonitoringPlanner,
+)
 from src.portfolio.monitoring.service import MonitoringService
 from src.portfolio.monitoring.store import MonitoringStore
 from src.portfolio.daily.store import DailyRunStore
@@ -433,6 +436,164 @@ def test_report_catalog_prefers_completed_penetrative_deep_report_evidence(tmp_p
     assert candidate["metadata"]["generation_reason"] == "原报告过期"
 
 
+def test_report_catalog_uses_unified_current_family_and_loads_etf_structural_bundle(
+    tmp_path,
+) -> None:
+    store = MonitoringStore(tmp_path / "unified-catalog.sqlite3")
+    body = "# 科创芯片ETF结构性研究\n\n" + "证据。" * 300
+    bundle_path = tmp_path / "monitoring_bundle.json"
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "horizon": "structural",
+                "monitoring_status": "available",
+                "review_due_at": "2099-07-21T09:00:00+08:00",
+                "source_valid_until": "2099-07-21T09:00:00+08:00",
+                "valid_until": "2099-07-21T09:00:00+08:00",
+                "candidates": [{"scenario_id": "support"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    record = SimpleNamespace(
+        report_id="deep_etf_1",
+        symbol="588870.SH",
+        security_name="科创芯片ETF",
+        status="completed",
+        profile="etf_deep_research",
+        quality_status="passed_with_gaps",
+        revision=3,
+        updated_at="2026-07-20T02:00:00+00:00",
+        created_at="2026-07-20T01:00:00+00:00",
+        data_as_of="2026-07-18T07:00:00+00:00",
+        report_date="2026-07-20",
+        generation_source="manual",
+        generation_reason="",
+    )
+
+    class DeepReports:
+        def list(self, *, limit: int):
+            return [record]
+
+        def read_markdown(self, report_id: str):
+            return body
+
+        def artifact_path(self, report_id: str, artifact_id: str):
+            assert (report_id, artifact_id) == ("deep_etf_1", "monitoring_bundle")
+            return bundle_path
+
+    class ReportLibrary:
+        def subject(self, symbol: str, **kwargs):
+            assert symbol == "588870.SH"
+            assert kwargs == {"include_timeline": False, "history_mode": "current_families"}
+            return {
+                "current": {
+                    "structural": {
+                        "latest": {"report_id": "catalog-structural-1"},
+                        "latest_complete": {"report_id": "catalog-structural-1"},
+                    }
+                }
+            }
+
+        def get_report(self, report_id: str):
+            assert report_id == "catalog-structural-1"
+            return {
+                "report_id": report_id,
+                "family_id": "family-588870-structural",
+                "symbol": "588870.SH",
+                "source_type": "deep_report",
+                "source_id": "deep_etf_1",
+                "report_kind": "deep_research",
+                "report_quality_status": "passed_with_gaps",
+                "coverage_status": "partial",
+                "report_period": {"label": "结构性"},
+                "viewpoints": [{"horizon": "structural"}],
+                "relations": [],
+            }
+
+    catalog = MonitorReportCatalog(
+        store=store,
+        session_store=SessionStore(tmp_path / "empty-sessions"),
+        daily_store=DailyRunStore(tmp_path / "empty-daily"),
+        deep_report_service=DeepReports(),
+        report_library_service=ReportLibrary(),
+        now_provider=lambda: datetime(2026, 7, 20, 3, tzinfo=timezone.utc),
+    )
+
+    candidates = catalog.list_candidates("588870.SH")
+    assert len(candidates) == 1
+    assert candidates[0]["report_type"] == "etf_deep_research"
+    assert candidates[0]["catalog_report_id"] == "catalog-structural-1"
+    assert candidates[0]["catalog_family_id"] == "family-588870-structural"
+    assert candidates[0]["monitoring_bundle"]["horizon"] == "structural"
+    assert candidates[0]["research_reasons"] == []
+
+
+def test_structural_bundle_adapter_preserves_manual_confirmation_and_lineage() -> None:
+    planner = ReportDrivenMonitoringPlanner(
+        market_planner=MonitoringPlanner(MarketService()),
+        client=FakeClient([]),
+    )
+    report_snapshot = {
+        "snapshot_id": "snapshot-structural",
+        "report_ref": "deep-report:deep_etf_1",
+        "report_type": "etf_deep_research",
+        "title": "科创芯片ETF结构性研究",
+        "revision": 3,
+        "body_sha256": "a" * 64,
+        "quality_status": "ready",
+        "generated_at": "2026-07-20T02:00:00+00:00",
+        "data_as_of": "2026-07-18T07:00:00+00:00",
+        "metadata": {"report_period": {"label": "结构性"}},
+        "monitoring_bundle": {
+            "report_id": "catalog-structural-1",
+            "symbol": "588870.SH",
+            "horizon": "structural",
+            "monitoring_status": "available",
+            "activation_policy": "manual_confirmation_required",
+            "trade_execution": "forbidden",
+            "review_due_at": "2099-07-21T09:00:00+08:00",
+            "valid_until": "2099-07-21T09:00:00+08:00",
+            "candidates": [
+                {
+                    "scenario_id": "structural-stop",
+                    "label": "结构失效位",
+                    "intent": "structural_invalidation",
+                    "level": {"kind": "point", "price": 1.7},
+                    "source_text": "有效跌破 1.700 后结构失效",
+                    "machine_expressible": True,
+                    "actionability": "action_ready",
+                    "volume_conditions": ["放量跌破提高置信度"],
+                    "lineage": {
+                        "status": "complete",
+                        "claim_ids": ["claim-structural-stop"],
+                        "fact_ids": ["fact-close"],
+                        "evidence_ids": ["evidence-bars"],
+                    },
+                }
+            ],
+        },
+    }
+
+    plan, manifest, research = planner.build_from_structural_monitoring_bundle(
+        holding={"symbol": "588870.SH"},
+        report_snapshot=report_snapshot,
+    )
+
+    assert research is None
+    assert plan["source_horizon"] == "structural"
+    assert plan["source_report_id"] == "catalog-structural-1"
+    assert plan["market_rules"][0]["enabled"] is True
+    assert plan["watch_scenarios"][0]["evidence_refs"] == [
+        "claim-structural-stop",
+        "fact-close",
+        "evidence-bars",
+    ]
+    assert manifest["requires_manual_activation"] is True
+    assert manifest["trade_execution"] == "forbidden"
+
+
 def test_autonomous_monitoring_queues_deep_report_only_with_explicit_gate_and_gap(
     tmp_path, monkeypatch,
 ) -> None:
@@ -490,6 +651,78 @@ def test_monitor_auto_deep_report_defaults_to_disabled(monkeypatch) -> None:
     monkeypatch.delenv("VIBE_TRADING_MONITOR_AUTO_DEEP_REPORT_ENABLED", raising=False)
 
     assert MonitoringService._auto_deep_report_enabled() is False
+
+
+def test_structural_report_refresh_is_bounded_to_one_monitor_generated_revision(
+    tmp_path, monkeypatch,
+) -> None:
+    store = MonitoringStore(tmp_path / "structural-refresh.sqlite3")
+    executor = ThreadPoolExecutor(max_workers=1)
+    submitted: list[dict] = []
+    service = MonitoringService(
+        store=store,
+        planner_executor=executor,
+        auto_deep_report_submitter=lambda payload: submitted.append(payload) or {
+            "status": "queued",
+            "job_id": "dispatch-refresh-1",
+            "session_id": "session-refresh-1",
+        },
+    )
+    selected = {
+        "report_ref": "deep-report:report-source-1",
+        "report_type": "etf_deep_research",
+        "source_id": "report-source-1",
+        "monitoring_bundle_sha256": "b" * 64,
+        "metadata": {
+            "report_id": "report-source-1",
+            "generation_source": "manual",
+        },
+    }
+    kwargs = {
+        "autonomous": True,
+        "job_id": "planner-refresh-1",
+        "symbol": "513120.SH",
+        "holding": {"name": "HK创新药"},
+        "selected": selected,
+        "research_date": "2026-07-20",
+        "trigger_type": "report_ready",
+        "bundle_status": "not_recommended",
+    }
+    try:
+        monkeypatch.setenv("VIBE_TRADING_DEEP_REPORT_ENABLED", "1")
+        monkeypatch.setenv("VIBE_TRADING_MONITOR_AUTO_DEEP_REPORT_ENABLED", "1")
+        result = service._maybe_queue_structural_report_refresh(**kwargs)
+        assert result["status"] == "queued"
+        assert submitted == [{
+            "job_id": "planner-refresh-1",
+            "symbol": "513120.SH",
+            "security_name": "HK创新药",
+            "research_reasons": [
+                "structural_monitoring_not_recommended",
+                "no_qualified_structural_monitoring_points",
+            ],
+            "research_date": "2026-07-20",
+            "trigger_type": "report_ready",
+            "structural_refresh": True,
+            "parent_report_id": "report-source-1",
+            "source_bundle_sha256": "b" * 64,
+        }]
+
+        already_refreshed = copy.deepcopy(selected)
+        already_refreshed["metadata"]["generation_source"] = (
+            "portfolio_monitor_structural_refresh"
+        )
+        skipped = service._maybe_queue_structural_report_refresh(
+            **{**kwargs, "selected": already_refreshed},
+        )
+        assert skipped == {
+            "status": "refresh_already_attempted",
+            "parent_report_id": "report-source-1",
+            "deduplicated": True,
+        }
+        assert len(submitted) == 1
+    finally:
+        executor.shutdown(wait=True)
 
 
 def test_planner_job_cancel_recovery_and_symbol_retry_are_durable(tmp_path) -> None:
@@ -713,6 +946,494 @@ class StaticCatalog:
 
     def freeze(self, candidate: dict):
         return self.store.save_report_snapshot(candidate)
+
+
+def test_autonomous_no_point_structural_report_uses_no_model_market_repair(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("VIBE_TRADING_PORTFOLIO_STATE_PATH", str(tmp_path / "portfolio.json"))
+    monkeypatch.setenv("VIBE_TRADING_DEEP_REPORT_ENABLED", "1")
+    monkeypatch.setenv("VIBE_TRADING_MONITOR_AUTO_DEEP_REPORT_ENABLED", "1")
+    update_holdings(
+        holdings=[{
+            "name": "HK创新药",
+            "code": "513120",
+            "symbol": "513120.SH",
+            "quantity": 1000,
+            "cost_price": 1.18,
+        }]
+    )
+    store = MonitoringStore(tmp_path / "structural-no-points.sqlite3")
+    store.set_autopilot_config({
+        "enabled": True,
+        "runtime_mode": "shadow",
+        "selected_symbols": ["513120.SH"],
+    })
+    candidate = {
+        "report_ref": "deep-report:report-no-points-1",
+        "report_type": "etf_deep_research",
+        "symbol": "513120.SH",
+        "title": "513120 structural research",
+        "source_id": "report-no-points-1",
+        "source_message_id": None,
+        "artifact_id": "markdown",
+        "revision": 1,
+        "body": "# Structural report\n\nNo qualified monitoring points.",
+        "body_sha256": "c" * 64,
+        "quality_status": "ready",
+        "generated_at": "2026-07-20T01:00:00+00:00",
+        "data_as_of": "2026-07-18T07:00:00+00:00",
+        "metadata": {
+            "report_id": "report-no-points-1",
+            "generation_source": "manual",
+        },
+        "monitoring_bundle_sha256": "d" * 64,
+        "monitoring_bundle": {
+            "report_id": "report-no-points-1",
+            "symbol": "513120.SH",
+            "horizon": "structural",
+            "monitoring_status": "not_recommended",
+            "activation_policy": "manual_confirmation_required",
+            "trade_execution": "forbidden",
+            "review_due_at": "2099-07-21T09:00:00+08:00",
+            "valid_until": "2099-07-21T09:00:00+08:00",
+            "candidates": [],
+        },
+    }
+    submitted: list[dict] = []
+    market_service = MarketService()
+    client = FakeClient([])
+    report_planner = ReportDrivenMonitoringPlanner(
+        market_planner=MonitoringPlanner(market_service),
+        client=client,
+    )
+    executor = ThreadPoolExecutor(max_workers=1)
+    service = MonitoringService(
+        store=store,
+        planner=report_planner.market_planner,
+        report_catalog=StaticCatalog(store, candidate),
+        report_planner=report_planner,
+        planner_executor=executor,
+        auto_deep_report_submitter=lambda payload: submitted.append(payload) or {},
+    )
+    try:
+        trigger, _created = store.enqueue_autopilot_trigger(
+            symbol="513120.SH",
+            trigger_type="report_ready",
+            dedupe_key="structural-refresh-lifecycle",
+        )
+        job = service.create_planner_job(
+            ["513120.SH"],
+            activation_mode="autonomous",
+            trigger_type="report_ready",
+            autopilot_trigger_id=trigger["trigger_id"],
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            job = store.get_planner_job(job["job_id"])
+            assert job is not None
+            if job["status"] in {"ready", "blocked", "failed", "cancelled"}:
+                break
+            time.sleep(0.02)
+        assert job["status"] == "ready", json.dumps(job, ensure_ascii=False, default=str)
+        item = job["items"][0]
+        assert item["status"] == "ready"
+        assert item["profile_id"]
+        assert item["progress"]["stage"] == "ready"
+        assert item["progress"]["activated"] is True
+        assert item["progress"]["trade_execution"] == "forbidden"
+        assert submitted == []
+        assert client.calls == 0
+        profile = store.get_profile(item["profile_id"])
+        assert profile is not None
+        assert profile["status"] == "active"
+        active_plan = next(
+            plan for plan in profile["plans"]
+            if plan["version"] == profile["active_plan_version"]
+        )
+        assert active_plan["model_id"] == "market-analysis-methods/1.2"
+        assert active_plan["evidence_manifest"]["planner_mode"] == (
+            "deterministic_multi_method_market_repair"
+        )
+        assert active_plan["evidence_manifest"]["model_calls"] == 0
+        assert len(active_plan["plan"]["market_rules"]) == 4
+        scenarios = active_plan["plan"]["watch_scenarios"]
+        assert all(
+            any(
+                condition.get("kind") in {"volume_ratio", "rolling_volume_ratio"}
+                and condition.get("value") == 1.2
+                for condition in scenario["confirmation_conditions"]["conditions"]
+            )
+            for scenario in scenarios
+        )
+        run = next(
+            row
+            for row in service.list_autopilot_runs(limit=10)
+            if row["trigger_id"] == trigger["trigger_id"]
+        )
+        assert run["status"] == "completed"
+        assert run["build_state"]["status"] == "active"
+        assert run["build_state"]["stage"] == "ready"
+        assert run["build_state"]["progress_percent"] == 100
+        assert run["build_state"]["self_repair"] == {
+            "policy": "bounded",
+            "infrastructure_retry_limit": 1,
+            "infrastructure_retries_used": 0,
+            "agent_iteration_limit": 2,
+            "agent_token_budget": 12000,
+            "strategy": "continuity_then_multi_method",
+            "full_report_retry_enabled": False,
+            "circuit_open": False,
+            "token_spend_allowed": False,
+        }
+    finally:
+        executor.shutdown(wait=True)
+
+
+def test_no_model_market_repair_blocks_with_stable_reason_when_history_is_short() -> None:
+    class ShortHistoryMarketStore(MarketStore):
+        def query_bars(self, *, interval: str, **kwargs):
+            rows = super().query_bars(interval=interval, **kwargs)
+            return rows[:10] if interval == "1D" else rows
+
+    market_service = MarketService()
+    market_service.store = ShortHistoryMarketStore()
+    client = FakeClient([])
+    planner = ReportDrivenMonitoringPlanner(
+        market_planner=MonitoringPlanner(market_service),
+        client=client,
+    )
+    snapshot = {
+        "snapshot_id": "snapshot-short-history",
+        "report_ref": "deep-report:report-short-history",
+        "report_type": "etf_deep_research",
+        "title": "short history structural research",
+        "source_id": "report-short-history",
+        "revision": 1,
+        "body_sha256": "e" * 64,
+        "quality_status": "ready",
+        "generated_at": "2026-07-20T01:00:00+00:00",
+        "data_as_of": "2026-07-18T07:00:00+00:00",
+        "monitoring_bundle": {
+            "report_id": "report-short-history",
+            "symbol": "513120.SH",
+            "horizon": "structural",
+            "monitoring_status": "data_insufficient",
+            "candidates": [],
+        },
+    }
+
+    with pytest.raises(DeterministicMarketRepairError) as caught:
+        planner.build_from_verified_market_repair(
+            holding={"name": "HK创新药", "symbol": "513120.SH"},
+            report_snapshot=snapshot,
+            autonomous=True,
+        )
+
+    assert "deterministic_market_repair_insufficient_daily_history" in caught.value.reasons
+    assert client.calls == 0
+
+
+def test_runtime_observation_events_do_not_rebuild_the_monitor_profile(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("VIBE_TRADING_PORTFOLIO_STATE_PATH", str(tmp_path / "portfolio.json"))
+    update_holdings(
+        holdings=[{
+            "name": "格力电器",
+            "code": "000651",
+            "symbol": "000651.SZ",
+            "quantity": 100,
+            "cost_price": 37.05,
+        }]
+    )
+    store = MonitoringStore(tmp_path / "observation-only-events.sqlite3")
+    store.set_autopilot_config({
+        "enabled": True,
+        "runtime_mode": "shadow",
+        "selected_symbols": ["000651.SZ"],
+        "trigger_types": ["approaching", "invalidated"],
+    })
+    executor = ThreadPoolExecutor(max_workers=1)
+    service = MonitoringService(store=store, planner_executor=executor)
+    ticks: list[bool] = []
+    service.autopilot_tick = lambda **_kwargs: ticks.append(True) or {}
+    try:
+        assert service.enqueue_autopilot_event(
+            trigger_type="approaching",
+            symbol="000651.SZ",
+            fingerprint="episode-approaching",
+            payload={"event_id": "event-approaching", "phase": "approaching"},
+        ) is None
+        assert service.enqueue_autopilot_event(
+            trigger_type="invalidated",
+            symbol="000651.SZ",
+            fingerprint="episode-invalidated",
+            payload={"event_id": "event-invalidated", "phase": "rejected"},
+        ) is None
+        assert store.list_autopilot_triggers(limit=10) == []
+        assert ticks == []
+    finally:
+        executor.shutdown(wait=True)
+
+
+def test_autopilot_failure_circuit_opens_for_unchanged_input_and_resets_for_new_report(
+    tmp_path,
+) -> None:
+    store = MonitoringStore(tmp_path / "autopilot-failure-circuit.sqlite3")
+    store.set_autopilot_config({
+        "enabled": True,
+        "runtime_mode": "shadow",
+        "selected_symbols": ["000651.SZ"],
+    })
+    executor = ThreadPoolExecutor(max_workers=1)
+    service = MonitoringService(store=store, planner_executor=executor)
+    try:
+        common_payload = {
+            "report_hash": "same-report-hash",
+            "report_ref": "deep-report:report-same",
+            "holding_hash": "same-holding-hash",
+        }
+        stable_progress = {
+            "daily_tail_hash": "tail-a",
+            "volume_signature": "volume-a",
+            "adjustment_factor_revision": "factor-a",
+            "method_registry_version": "1.1.0",
+            "level_snapshot_id": "snapshot-a",
+            "continuity": {"status": "blocked", "event_count": 1},
+            "volume_gate": {"status": "ready"},
+        }
+        for index, trigger_type in enumerate(("holdings_changed", "report_ready"), start=1):
+            trigger, _created = store.enqueue_autopilot_trigger(
+                symbol="000651.SZ",
+                trigger_type=trigger_type,
+                dedupe_key=f"failure-{index}",
+                payload=common_payload,
+            )
+            job = store.create_planner_job(
+                symbols=["000651.SZ"],
+                report_refs={"000651.SZ": common_payload["report_ref"]},
+                research_policy="if_needed",
+                delivery_target_id=None,
+                force_fresh=True,
+                activation_mode="autonomous",
+                trigger_type=trigger_type,
+                autopilot_trigger_id=trigger["trigger_id"],
+            )
+            store.update_planner_item(
+                job["job_id"],
+                "000651.SZ",
+                status="failed",
+                report_ref=common_payload["report_ref"],
+                blocked_reasons=["structural_report_refresh_queue_failed"],
+                progress=stable_progress,
+                error="database is locked",
+            )
+            store.update_planner_job_status(job["job_id"], "failed")
+            store.update_autopilot_trigger(
+                trigger["trigger_id"],
+                status="failed",
+                planner_job_id=job["job_id"],
+                error="planner_job_failed",
+            )
+
+        circuit = service._autopilot_circuit_state(
+            "000651.SZ",
+            {"payload": common_payload},
+            {"progress": stable_progress},
+        )
+        assert circuit["open"] is True
+        assert circuit["failure_count"] == 2
+        assert circuit["threshold"] == 2
+
+        changed_input = service._autopilot_circuit_state(
+            "000651.SZ",
+            {"payload": {**common_payload, "report_hash": "new-report-hash"}},
+            {"progress": stable_progress},
+        )
+        assert changed_input["open"] is False
+        assert changed_input["failure_count"] == 0
+
+        changed_market = service._autopilot_circuit_state(
+            "000651.SZ",
+            {"payload": common_payload},
+            {"progress": {**stable_progress, "daily_tail_hash": "tail-b"}},
+        )
+        assert changed_market["open"] is False
+        assert changed_market["failure_count"] == 0
+    finally:
+        executor.shutdown(wait=True)
+
+
+def test_reconcile_marks_legacy_no_action_without_profile_as_blocked(tmp_path) -> None:
+    store = MonitoringStore(tmp_path / "legacy-no-action.sqlite3")
+    store.set_autopilot_config({
+        "enabled": True,
+        "runtime_mode": "shadow",
+        "selected_symbols": ["513120.SH"],
+    })
+    executor = ThreadPoolExecutor(max_workers=1)
+    service = MonitoringService(store=store, planner_executor=executor)
+    try:
+        trigger, _created = store.enqueue_autopilot_trigger(
+            symbol="513120.SH",
+            trigger_type="report_ready",
+            dedupe_key="legacy-no-action",
+        )
+        job = store.create_planner_job(
+            symbols=["513120.SH"],
+            report_refs={"513120.SH": "deep-report:report-legacy"},
+            research_policy="if_needed",
+            delivery_target_id=None,
+            force_fresh=True,
+            activation_mode="autonomous",
+            trigger_type="report_ready",
+            autopilot_trigger_id=trigger["trigger_id"],
+        )
+        store.update_planner_item(
+            job["job_id"],
+            "513120.SH",
+            status="ready",
+            report_ref="deep-report:report-legacy",
+            progress={
+                "stage": "no_action",
+                "outcome": "report_has_no_qualified_monitoring_points",
+                "structural_report_refresh": {
+                    "status": "refresh_already_attempted",
+                    "refresh_outcome": "completed",
+                    "report_quality_status": "failed_validation",
+                },
+            },
+        )
+        store.update_planner_job_status(job["job_id"], "ready")
+        store.update_autopilot_trigger(
+            trigger["trigger_id"],
+            status="completed",
+            planner_job_id=job["job_id"],
+        )
+
+        assert service._reconcile_structural_report_refreshes() == 1
+        repaired = store.get_planner_job(job["job_id"])
+        assert repaired is not None
+        assert repaired["status"] == "blocked"
+        assert repaired["items"][0]["status"] == "blocked"
+        assert repaired["items"][0]["blocked_reasons"] == [
+            "structural_report_refresh_failed_validation"
+        ]
+        run = next(
+            item
+            for item in service.list_autopilot_runs(limit=10)
+            if item["trigger_id"] == trigger["trigger_id"]
+        )
+        assert run["status"] == "blocked"
+        assert run["build_state"]["status"] == "blocked"
+        assert run["build_state"]["stage_label"] == "研究结果未通过门禁"
+    finally:
+        executor.shutdown(wait=True)
+
+
+def test_completed_structural_refresh_requeues_planning_with_new_report(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("VIBE_TRADING_PORTFOLIO_STATE_PATH", str(tmp_path / "portfolio.json"))
+    monkeypatch.setenv("VIBE_TRADING_DEEP_REPORT_ENABLED", "1")
+    monkeypatch.setenv("VIBE_TRADING_MONITOR_AUTO_DEEP_REPORT_ENABLED", "1")
+    update_holdings(holdings=[{
+        "name": "Gree Electric",
+        "code": "000651",
+        "symbol": "000651.SZ",
+        "quantity": 100,
+        "cost_price": 39.0,
+    }])
+    store = MonitoringStore(tmp_path / "structural-refresh-replan.sqlite3")
+    store.set_autopilot_config({
+        "enabled": True,
+        "runtime_mode": "shadow",
+        "selected_symbols": ["000651.SZ"],
+    })
+    candidate = {
+        "report_ref": "deep-report:report-parent",
+        "report_type": "equity_deep_research",
+        "symbol": "000651.SZ",
+        "source_id": "report-parent",
+        "metadata": {"report_id": "report-parent", "generation_source": "manual"},
+        "monitoring_bundle_sha256": "a" * 64,
+        "monitoring_bundle": {
+            "monitoring_status": "not_recommended",
+            "candidates": [],
+        },
+    }
+    executor = ThreadPoolExecutor(max_workers=1)
+    service = MonitoringService(
+        store=store,
+        report_catalog=StaticCatalog(store, candidate),
+        planner_executor=executor,
+        auto_deep_report_submitter=lambda _payload: {
+            "status": "refresh_already_attempted",
+            "refresh_outcome": "completed",
+            "report_id": "report-refreshed",
+            "report_quality_status": "passed_with_gaps",
+            "deduplicated": True,
+        },
+    )
+    monkeypatch.setattr(service, "_autopilot_authorized", lambda _symbol: True)
+    monkeypatch.setattr(service, "_holding", lambda _symbol: {
+        "name": "Gree Electric",
+        "code": "000651",
+        "symbol": "000651.SZ",
+        "quantity": 100,
+        "cost_price": 39.0,
+    })
+    submitted_jobs: list[str] = []
+    monkeypatch.setattr(service, "_submit_planner_job", submitted_jobs.append)
+    try:
+        trigger, _created = store.enqueue_autopilot_trigger(
+            symbol="000651.SZ",
+            trigger_type="report_ready",
+            dedupe_key="completed-refresh-replan",
+        )
+        job = store.create_planner_job(
+            symbols=["000651.SZ"],
+            report_refs={"000651.SZ": candidate["report_ref"]},
+            research_policy="if_needed",
+            delivery_target_id=None,
+            force_fresh=True,
+            activation_mode="autonomous",
+            trigger_type="report_ready",
+            autopilot_trigger_id=trigger["trigger_id"],
+        )
+        progress = {
+            "stage": "structural_report_refresh_requested",
+            "structural_parent_report_id": "report-parent",
+            "structural_report_type": "equity_deep_research",
+            "structural_generation_source": "manual",
+            "structural_source_bundle_sha256": "a" * 64,
+            "structural_bundle_status": "not_recommended",
+        }
+        store.update_planner_item(
+            job["job_id"],
+            "000651.SZ",
+            status="researching",
+            report_ref=candidate["report_ref"],
+            progress=progress,
+        )
+        store.update_planner_job_status(job["job_id"], "researching")
+        store.update_autopilot_trigger(
+            trigger["trigger_id"],
+            status="running",
+            planner_job_id=job["job_id"],
+        )
+        assert service._reconcile_structural_report_refreshes() == 1
+        resumed = store.get_planner_job(job["job_id"])
+        assert resumed is not None
+        assert resumed["status"] == "researching"
+        assert resumed["items"][0]["status"] == "queued"
+        assert resumed["items"][0]["report_ref"] == "deep-report:report-refreshed"
+        assert resumed["items"][0]["attempt"] == 2
+        assert resumed["items"][0]["completed_at"] is None
+        assert submitted_jobs == [job["job_id"]]
+    finally:
+        executor.shutdown(wait=True)
 
 
 def test_async_planner_job_creates_pending_review_without_auto_activation(tmp_path, monkeypatch) -> None:

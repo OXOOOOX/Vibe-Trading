@@ -96,7 +96,7 @@ class RecommendationResolver:
         sizing_kind = str(sizing.get("kind") or "default_policy")
         sizing_value = _number(sizing.get("value"))
         source = str(sizing.get("source") or "system_default")
-        default_used = sizing_kind == "default_policy"
+        default_used = False
         requested_units: float | None = None
         requested_amount: float | None = None
         notes: list[str] = []
@@ -121,16 +121,14 @@ class RecommendationResolver:
             requested_amount = sizing_value
             requested_units = requested_amount / price
         else:
-            source = "system_default"
-            if action == "exit":
-                requested_units = quantity
-            elif action == "reduce":
-                requested_units = quantity * 0.25
-            elif action == "add":
-                requested_amount = (current_value or 0.0) * 0.10
-                requested_units = requested_amount / price
-            requested_amount = requested_units * price if requested_units is not None else None
-            notes.append("system default sizing applied")
+            # Directional evidence is not a personal risk budget.  Keep the
+            # recommendation useful, but never imply that 10%/25%/100% is a
+            # calculated size when the user has not configured risk limits.
+            source = "requires_user_risk_preferences"
+            requested_units = None
+            requested_amount = None
+            recommendation_status = "needs_risk_preferences"
+            notes.append("risk preferences are required before quantity calculation")
 
         constrained_units = requested_units
         if constrained_units is not None and action in {"reduce", "exit"}:
