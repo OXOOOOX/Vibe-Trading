@@ -1,0 +1,20 @@
+{
+  "symbol": "588870.SH",
+  "unchanged": {
+    "changed_snapshot_types": [],
+    "trigger_flags": [],
+    "expected_mode": "reuse"
+  },
+  "market_delta": {
+    "changed_snapshot_types": ["market"],
+    "trigger_flags": ["volume_breakout"],
+    "expected_mode": "partial_refresh",
+    "expected_modules": ["flow_liquidity", "price_volume", "scenarios_watchlist"]
+  },
+  "structural_change": {
+    "changed_snapshot_types": ["universe"],
+    "trigger_flags": ["constituent_rebalance"],
+    "expected_mode": "section_revision",
+    "expected_sections": ["aggregate_fundamentals", "exposure_structure", "holding_penetration"]
+  }
+}

@@ -21,6 +21,8 @@ _REPORT_PAYLOAD = {
             "orgSName": "Broker A",
             "researcher": "Analyst One",
             "publishDate": "2024-04-30 08:00:00",
+            "infoCode": "AP202404301234567890",
+            "encodeUrl": "report+/=token",
             "emRatingName": "Buy",
             "predictThisYearEps": "12.34",
             "predictNextYearEps": "15.00",
@@ -78,6 +80,8 @@ def test_success_envelope_merges_reports_and_consensus():
         "analyst": "Analyst One",
         "publish_date": "2024-04-30",
         "rating": "Buy",
+        "info_code": "AP202404301234567890",
+        "url": "https://data.eastmoney.com/report/zw_stock.jshtml?encodeUrl=report%2B%2F%3Dtoken",
         "eps_forecast": {"this_year": 12.34, "next_year": 15.0},
         "pe_forecast": {"this_year": 20.1, "next_year": 16.5},
     }

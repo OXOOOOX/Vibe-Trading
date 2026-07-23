@@ -6,9 +6,9 @@ interface DeepReportMenuItemProps {
 }
 
 const CAPABILITIES = [
-  "穿透三张财务报表，并标出财务质量与需核查事项",
-  "用确定性计算反推市值隐含预期，验证长期经营情景",
-  "保存 Evidence → Fact → Claim 证据链并输出可复用 PDF",
+  "上市公司：穿透三张财务报表、财务质量与市值隐含预期",
+  "ETF：分析指数规则、暴露结构、流动性、量价与关键持仓",
+  "保存 Evidence → Fact → Claim 证据链并输出 Markdown、PDF 与结构监控 JSON",
 ] as const;
 
 export function DeepReportMenuItem({ onSelect }: DeepReportMenuItemProps) {
@@ -23,7 +23,7 @@ export function DeepReportMenuItem({ onSelect }: DeepReportMenuItemProps) {
         className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none"
       >
         <BookOpen className="h-4 w-4" />
-        单股穿透式深度研究
+        股票 / ETF 穿透式深度研究
       </button>
 
       <div
@@ -42,13 +42,13 @@ export function DeepReportMenuItem({ onSelect }: DeepReportMenuItemProps) {
           <div>
             <div className="text-sm font-semibold">什么是穿透式深度研究？</div>
             <div className="mt-0.5 text-[11px] font-medium text-cyan-700 dark:text-cyan-300">
-              上市公司单股 · 固定结构 · 可校验报告
+              上市公司或 ETF · 分类型结构 · 可校验报告
             </div>
           </div>
         </div>
 
         <p className="mt-3 text-xs leading-5 text-muted-foreground">
-          它会把财务事实、确定性计算和产业叙事分层处理；证据不足的模块会明确降级，不用模型补数字。
+          系统先识别资产类型，再使用对应的公司或 ETF 研究门控；证据不足的模块会明确降级，不用模型补数字。
         </p>
 
         <ul className="mt-3 space-y-2">

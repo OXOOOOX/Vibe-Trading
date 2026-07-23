@@ -25,6 +25,7 @@ import json
 import logging
 from datetime import date, timedelta
 from typing import Any
+from urllib.parse import urlencode
 
 from backtest.loaders._http import (
     DEFAULT_USER_AGENT,
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 # Eastmoney research-report list endpoint. qType=0 selects individual-stock
 # reports; the response carries a ``data`` array of one row per report.
 _REPORT_LIST_URL = "https://reportapi.eastmoney.com/report/list"
+_REPORT_DETAIL_URL = "https://data.eastmoney.com/report/zw_stock.jshtml"
 
 # THS consensus-forecast endpoint. Returns per-forward-year mean analyst EPS.
 _THS_CONSENSUS_URL = "https://basic.10jqka.com.cn/api/stock/profit_forecast/"
@@ -210,8 +212,8 @@ def _normalize_report(row: Any) -> dict | None:
         row: One element of the reportapi ``data`` array.
 
     Returns:
-        ``{title, brokerage, analyst, publish_date, rating, eps_forecast,
-        pe_forecast}`` or ``None``.
+        ``{title, brokerage, analyst, publish_date, rating, info_code, url,
+        eps_forecast, pe_forecast}`` or ``None``.
     """
     if not isinstance(row, dict):
         return None
@@ -225,6 +227,8 @@ def _normalize_report(row: Any) -> dict | None:
         "analyst": _clean_text(row.get("researcher")),
         "publish_date": publish_date,
         "rating": _clean_text(row.get("emRatingName")) or _clean_text(row.get("sRatingName")),
+        "info_code": _clean_text(row.get("infoCode")),
+        "url": _report_detail_url(row),
         "eps_forecast": {
             "this_year": _to_number(row.get("predictThisYearEps")),
             "next_year": _to_number(row.get("predictNextYearEps")),
@@ -234,6 +238,15 @@ def _normalize_report(row: Any) -> dict | None:
             "next_year": _to_number(row.get("predictNextYearPe")),
         },
     }
+
+
+def _report_detail_url(row: dict[str, Any]) -> str | None:
+    """Build the public Eastmoney detail URL carried by a report-list row."""
+
+    encoded = _clean_text(row.get("encodeUrl"))
+    if not encoded:
+        return None
+    return f"{_REPORT_DETAIL_URL}?{urlencode({'encodeUrl': encoded})}"
 
 
 def _fetch_consensus_eps(code: str) -> tuple[list[dict], bool]:

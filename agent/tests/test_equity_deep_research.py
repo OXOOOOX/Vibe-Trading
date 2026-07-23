@@ -3,14 +3,27 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from src.reports.contracts import ModuleResult
+from src.reports.claim_support import build_claim_support_audit
+from src.codex_cli.runner import CodexResearchRunner
 from src.reports.financial_analysis import normalize_financial_snapshot
-from src.reports.service import DeepReportService, report_pdf_filename
+from src.reports.reader_terms import reader_machine_terms, semantics_reader_label
+from src.reports.service import (
+    DeepReportService,
+    _etf_penetration_markdown,
+    _etf_penetration_view,
+    _reader_fact_value,
+    _readerize_report_text,
+    _reader_reference_identity,
+    _reference_plan,
+    report_pdf_filename,
+)
 from src.session.events import EventBus
 from src.session.service import (
     SessionService,
@@ -219,7 +232,11 @@ def _attach_test_ledger(
             "content_hash": evidence_id,
             "summary": "test evidence",
             "status": "recorded_from_opened_source",
-            "metadata": {},
+            "metadata": {
+                "source_strength": "A",
+                "source_class": "official",
+                "independence_group": "test-official-source",
+            },
         }
         for evidence_id in ("ev_industry", "ev_stage", "ev_risk")
     ]
@@ -229,7 +246,7 @@ def _attach_test_ledger(
             "symbol": symbol,
             "metric": fact_id.removeprefix("fact_"),
             "value": "1",
-            "unit": "test",
+            "unit": "CNY" if fact_id == "fact_watch" else "test",
             "period": "2025",
             "formula": None,
             "input_fact_ids": [],
@@ -274,6 +291,201 @@ def _submit_valid_workspace(service: DeepReportService, report_id: str) -> None:
         service.submit_section(report_id, section_id=section_id, body_markdown=body)
 
 
+def test_reference_plan_deduplicates_documents_and_resolves_internal_codes() -> None:
+    evidence = {
+        "ev_a": {
+            "evidence_id": "ev_a",
+            "source": "示例机构",
+            "source_locator": "https://example.test/source",
+            "metadata": {"document_ref": "doc_same", "title": "同一资料"},
+        },
+        "ev_b": {
+            "evidence_id": "ev_b",
+            "source": "示例机构",
+            "source_locator": "https://example.test/source",
+            "metadata": {"document_ref": "doc_same", "title": "同一资料"},
+        },
+    }
+    facts = {
+        "fact_a": {"fact_id": "fact_a", "evidence_ids": ["ev_a"]},
+        "fact_b": {"fact_id": "fact_b", "evidence_ids": ["ev_b"]},
+    }
+    plan = _reference_plan(
+        "A [Fact:fact_a]，B [Fact:fact_b]；历史 [Report:report_aaaaaaaaaaaaaaaa]。",
+        facts,
+        evidence,
+        lambda _report_id: {
+            "title": "系统内历史报告",
+            "internal_index_code": "VT-EQ-000001SZ-20260718-R02-ABCDEF",
+            "public_url": "/report-library/references/VT-EQ-000001SZ-20260718-R02-ABCDEF",
+            "revision": 2,
+        },
+    )
+
+    assert len(plan["citations"]) == 2
+    assert plan["fact_citation_map"]["fact_a"] == [1]
+    assert plan["fact_citation_map"]["fact_b"] == [1]
+    assert plan["citations"][0]["public_url"] == "https://example.test/source"
+    internal = plan["citations"][1]
+    assert internal["source_kind"] == "internal_report"
+    assert internal["internal_index_code"] == "VT-EQ-000001SZ-20260718-R02-ABCDEF"
+    assert internal["public_url"].startswith("/report-library/references/")
+
+
+def test_claim_support_audit_distinguishes_authority_triangulation_and_conflict() -> None:
+    evidence = [
+        {"evidence_id": "official", "source": "交易所", "status": "verified", "metadata": {
+            "source_class": "exchange", "independence_group": "exchange",
+        }},
+        {"evidence_id": "secondary_a", "source": "机构A", "status": "verified", "metadata": {
+            "source_strength": "C", "independence_group": "publisher-a",
+        }},
+        {"evidence_id": "secondary_b", "source": "机构B", "status": "verified", "metadata": {
+            "source_strength": "C", "independence_group": "publisher-b",
+        }},
+        {"evidence_id": "conflict", "source": "冲突资料", "status": "conflicted", "metadata": {
+            "independence_group": "publisher-c",
+        }},
+    ]
+    claims = [
+        {"claim_id": "claim_official", "claim_type": "fact", "evidence_ids": ["official"]},
+        {"claim_id": "claim_two", "claim_type": "inference", "evidence_ids": ["secondary_a", "secondary_b"]},
+        {"claim_id": "claim_conflict", "claim_type": "fact", "evidence_ids": ["conflict"]},
+        {"claim_id": "claim_gap", "claim_type": "data_gap", "evidence_ids": []},
+    ]
+
+    audit = build_claim_support_audit(claims, evidence)
+    statuses = {item["claim_id"]: item["support_status"] for item in audit["claims"]}
+    assert statuses == {
+        "claim_official": "verified",
+        "claim_two": "triangulated",
+        "claim_conflict": "conflicted",
+        "claim_gap": "insufficient",
+    }
+    assert audit["support_audit_version"] == 2
+    assert audit["audited_at"]
+    assert all("support_reason" in item for item in audit["claims"])
+
+
+def test_legacy_recursive_module_state_is_flattened_read_only() -> None:
+    module = ModuleResult(
+        status="warning",
+        details={
+            "deterministic_analysis": {
+                "status": "passed",
+                "details": {
+                    "selection_id": "p4aselection_legacy",
+                    "selected_count": 5,
+                    "selected_weight_coverage": 0.62,
+                    "selected": [{"symbol": "688256.SH", "weight": 0.12}],
+                },
+            }
+        },
+    )
+
+    assert "deterministic_analysis" not in module.details
+    assert module.selection_id == "p4aselection_legacy"
+    assert module.selected_count == 5
+    assert module.selected_weight_coverage == 0.62
+    assert module.selected_components == [{"symbol": "688256.SH", "weight": 0.12}]
+
+
+def test_reader_section_rejects_unregistered_machine_terms(tmp_path: Path) -> None:
+    service = DeepReportService(tmp_path / "reports")
+    record = service.begin(
+        session_id="s1", attempt_id="a1", request_content="研究000001.SZ"
+    )
+
+    with pytest.raises(ValueError, match="unregistered_reader_term:inventory"):
+        service.submit_section(
+            record.report_id,
+            section_id="executive_summary",
+            body_markdown="The inventory trend remains uncertain.",
+        )
+
+
+def test_etf_semantics_use_chinese_reader_labels_and_machine_tokens_are_blocked() -> None:
+    assert semantics_reader_label("contractual_annual_rate") == "基金合同约定的年费率"
+    assert semantics_reader_label("unknown_internal_semantics") == "其他已登记口径"
+    assert reader_machine_terms("口径：fund_share_nav_from_pcf") == [
+        "fund_share_nav_from_pcf"
+    ]
+
+
+def test_legacy_etf_flat_modules_restore_reader_penetration_table() -> None:
+    holding = ModuleResult(
+        status="passed",
+        availability="complete",
+        validation="passed",
+        module_id="holding_penetration",
+        selection_id="selection-1",
+        selected_count=2,
+        selected_weight_coverage=0.18,
+        explanation_coverage=0.18,
+        selected_components=[
+            {"symbol": "688001.SH", "name": "甲公司", "weight": 0.10},
+            {"symbol": "688002.SH", "name": "乙公司", "weight": 0.08},
+        ],
+        details={
+            "fact_ids": {
+                "component_weights": {
+                    "688001.SH": "fact-weight-1",
+                    "688002.SH": "fact-weight-2",
+                }
+            }
+        },
+    )
+    research = ModuleResult(
+        status="warning",
+        availability="partial",
+        validation="warning",
+        module_id="component_research",
+        selection_id="selection-1",
+        resolution_id="resolution-1",
+        selected_count=2,
+        research_coverage=0.55,
+        fully_supported_coverage=0.0,
+        partial_reusable_count=1,
+        missing_count=1,
+        selected_components=[
+            {
+                "component_symbol": "688001.SH",
+                "component_name": "甲公司",
+                "selected_weight": 0.10,
+                "digest_status": "partial_reusable",
+            },
+            {
+                "component_symbol": "688002.SH",
+                "component_name": "乙公司",
+                "selected_weight": 0.08,
+                "digest_status": "missing",
+            },
+        ],
+    )
+    context = {
+        "facts": [
+            {
+                "fact_id": "fact-observed",
+                "metric": "etf_observed_weight_coverage",
+                "value": "0.95",
+            }
+        ]
+    }
+
+    markdown = _etf_penetration_markdown(
+        _etf_penetration_view(
+            context,
+            {"holding_penetration": holding, "component_research": research},
+        )
+    )
+
+    assert "当前尚未形成可验证的成分选择快照" not in markdown
+    assert "甲公司（688001.SH）" in markdown
+    assert "乙公司（688002.SH）" in markdown
+    assert "部分研究可复用" in markdown
+    assert "尚无可复用研究" in markdown
+
+
 def test_report_workspace_rejects_owned_headings_and_unreplayable_numbers(tmp_path: Path) -> None:
     service = DeepReportService(tmp_path / "reports")
     record = service.begin(session_id="s1", attempt_id="a1", request_content="研究000001.SZ")
@@ -309,6 +521,85 @@ def test_report_workspace_rejects_owned_headings_and_unreplayable_numbers(tmp_pa
     )
     assert section.status == "passed"
     assert section.fact_ids == [revenue["fact_id"]]
+
+
+def test_extended_research_requires_receipts_before_a_gap_section_can_be_submitted(
+    tmp_path: Path,
+) -> None:
+    service = DeepReportService(tmp_path / "reports")
+    record = service.begin(
+        session_id="s1",
+        attempt_id="a1",
+        request_content="研究000001.SZ",
+    )
+    service.initialize_enrichment_plan(record.report_id, {
+        "schema_version": 1,
+        "plan_id": "enrichment_test",
+        "status": "planned",
+        "tasks": [{
+            "task_id": "business_position",
+            "domain": "industry_tam_competition",
+            "section_ids": ["business_position"],
+            "intent": "取得产业位置证据",
+            "minimum_attempts": 3,
+            "minimum_independent_sources": 2,
+            "required_fact_metrics": [],
+            "required_metric_periods": 0,
+            "target_years": [],
+            "attempts": [],
+        }],
+    })
+
+    with pytest.raises(ValueError, match="enrichment_task_not_exhausted:business_position"):
+        service.submit_section(
+            record.report_id,
+            section_id="business_position",
+            body_markdown="没有取得可核验的独立行业来源。[data_gap]",
+        )
+
+    for index in range(3):
+        receipt = service.record_research_attempt(
+            record.report_id,
+            task_id="business_position",
+            outcome="no_results",
+            query=f"industry query {index}",
+            detail="No readable authoritative result",
+        )
+
+    assert receipt["task"]["status"] == "exhausted"
+    assert receipt["task"]["reason_code"] == "public_source_not_found"
+    section = service.submit_section(
+        record.report_id,
+        section_id="business_position",
+        body_markdown="规定范围内没有找到可核验的独立行业来源。[data_gap]",
+    )
+    assert section.status == "passed"
+
+
+def test_extended_research_rejects_unregistered_evidence_receipts(tmp_path: Path) -> None:
+    service = DeepReportService(tmp_path / "reports")
+    record = service.begin(session_id="s1", attempt_id="a1", request_content="研究000001.SZ")
+    service.initialize_enrichment_plan(record.report_id, {
+        "schema_version": 1,
+        "plan_id": "enrichment_test",
+        "tasks": [{
+            "task_id": "consensus",
+            "minimum_attempts": 1,
+            "minimum_independent_sources": 1,
+            "required_fact_metrics": ["consensus_eps"],
+            "required_metric_periods": 3,
+            "target_years": [],
+            "attempts": [],
+        }],
+    })
+
+    with pytest.raises(ValueError, match="unknown enrichment Fact IDs"):
+        service.record_research_attempt(
+            record.report_id,
+            task_id="consensus",
+            outcome="evidence_accepted",
+            fact_ids=["fact_invented"],
+        )
 
 
 def test_final_numeric_audit_binds_exact_published_markdown(tmp_path: Path) -> None:
@@ -366,6 +657,24 @@ def test_pdf_derivative_uses_clean_title_and_omits_duplicate_compiler_h1(tmp_pat
     assert pdf_path.read_bytes() == b"%PDF-1.4\nrefreshed\n"
 
 
+def test_compiler_removes_redundant_model_authored_section_heading(tmp_path: Path) -> None:
+    service = DeepReportService(tmp_path / "reports")
+    record = service.begin(session_id="s1", attempt_id="a1", request_content="研究000001.SZ")
+    _attach_test_ledger(service, record.report_id)
+    _submit_valid_workspace(service, record.report_id)
+    service.submit_section(
+        record.report_id,
+        section_id="executive_summary",
+        body_markdown="### 核心结论\n\n本节只陈述已核验的研究边界。",
+    )
+
+    published = service.publish_workspace(record.report_id)
+    markdown = service.read_markdown(published.report_id)
+
+    assert markdown.count("## 核心结论") == 1
+    assert "### 核心结论" not in markdown
+
+
 def test_hard_module_failure_generates_actionable_diagnostic(tmp_path: Path) -> None:
     service = DeepReportService(tmp_path / "reports")
     record = service.begin(session_id="s1", attempt_id="a1", request_content="研究000001.SZ")
@@ -411,9 +720,18 @@ def test_hard_module_failure_generates_actionable_diagnostic(tmp_path: Path) -> 
     assert "用新数据更新" in diagnostic
 
 
-def test_revision_workspace_reuses_hashes_and_full_refresh_stales_everything(tmp_path: Path) -> None:
+def test_revision_workspace_reuses_hashes_and_full_refresh_stales_everything(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VIBE_TRADING_RESEARCH_KNOWLEDGE_ENABLED", "0")
     service = DeepReportService(tmp_path / "reports")
     first = service.begin(session_id="s1", attempt_id="a1", request_content="研究000001.SZ")
+    first.research_coverage = {
+        "coverage_snapshot_id": "coverage_parent",
+        "material_conflicts": [],
+    }
+    service._write_manifest(first)
     _attach_test_ledger(service, first.report_id)
     _submit_valid_workspace(service, first.report_id)
     first = service.publish_workspace(first.report_id)
@@ -428,6 +746,17 @@ def test_revision_workspace_reuses_hashes_and_full_refresh_stales_everything(tmp
         revision_sections=["counter_thesis"],
     )
     targeted_workspace = service.inspect_workspace(targeted.report_id)["sections"]
+    assert targeted.research_coverage == first.research_coverage
+    assert targeted.history_delta == {
+        "base_report_id": first.report_id,
+        "added": [],
+        "updated": [],
+        "confirmed": [],
+        "superseded": [],
+        "contradicted": [],
+        "stale": [],
+        "still_unverified": [],
+    }
     assert targeted_workspace["counter_thesis"]["status"] == "stale"
     for section_id, section in targeted_workspace.items():
         if section_id == "counter_thesis":
@@ -452,6 +781,8 @@ def test_revision_workspace_reuses_hashes_and_full_refresh_stales_everything(tmp
         revision_mode="full_refresh",
     )
     refreshed_workspace = service.inspect_workspace(refreshed.report_id)
+    assert refreshed.research_coverage == {}
+    assert refreshed.history_delta == {}
     assert refreshed_workspace["analysis_available"] is False
     assert all(
         "body_markdown" not in section
@@ -492,6 +823,70 @@ def test_automatic_repair_is_allowed_only_once(tmp_path: Path) -> None:
     assert service.should_auto_repair(record.report_id, evaluation) is True
     service.mark_repairing(record.report_id)
     assert service.should_auto_repair(record.report_id, evaluation) is False
+
+
+def test_claim_support_failure_is_preflighted_and_mapped_to_repair_section(
+    tmp_path: Path,
+) -> None:
+    service = DeepReportService(tmp_path / "reports")
+    record = service.begin(session_id="s1", attempt_id="a1", request_content="研究000001.SZ")
+    _attach_test_ledger(service, record.report_id)
+    service.attach_external_evidence(record.report_id, {
+        "facts": [{
+            "fact_id": "fact_weak_single",
+            "symbol": "000001.SZ",
+            "metric": "weak_context",
+            "value": "1",
+            "unit": "test",
+            "period": "2025",
+            "formula": None,
+            "input_fact_ids": [],
+            "evidence_ids": ["ev_weak_single"],
+            "calculation_version": "test-v1",
+            "validation_status": "pass",
+            "statement_type": None,
+            "metadata": {},
+        }],
+        "evidence": [{
+            "evidence_id": "ev_weak_single",
+            "symbol": "000001.SZ",
+            "domain": "industry",
+            "source": "single web provider",
+            "source_locator": "https://example.test/weak",
+            "retrieved_at": "2025-04-01T00:00:00+00:00",
+            "published_at": "2025-04-01",
+            "content_hash": "weak-single",
+            "summary": "single-source context",
+            "status": "recorded_from_opened_source",
+            "metadata": {
+                "source_strength": "C",
+                "source_class": "web",
+                "independence_group": "single-provider",
+            },
+        }],
+    })
+    _submit_valid_workspace(service, record.report_id)
+    service.submit_section(
+        record.report_id,
+        section_id="terminal_narrative",
+        body_markdown=(
+            "单一网页信息表明长期经营阶段已经改变。"
+            "[Evidence:ev_weak_single] [inference]"
+        ),
+    )
+
+    evaluation = service.evaluate_workspace(record.report_id)
+
+    support_issue = next(
+        issue
+        for issue in evaluation["validation"]["issues"]
+        if issue.startswith("claim_support_gate:")
+    )
+    assert service.should_auto_repair(record.report_id, evaluation) is True
+    context = service.repair_context(record.report_id, [support_issue])
+    assert context["section_ids"] == ["terminal_narrative"]
+    assert context["claim_repairs"][0]["support_reason"] == "single_non_authoritative_source"
+    assert "不得把同一问题句原样带入" in context["prompt_block"]
 
 
 def test_repair_revision_reuses_passed_sections_and_stales_only_failures(tmp_path: Path) -> None:
@@ -547,6 +942,87 @@ def test_missing_financial_section_is_repairable_when_deterministic_gate_passed(
     ) is True
 
 
+def test_readerize_deduplicates_spaced_footnotes_for_shared_source() -> None:
+    content = (
+        "覆盖率为 0% [Fact:fact_coverage] "
+        "[Fact:fact_supported_coverage]，因此保持观察。"
+    )
+    references = {
+        "fact_citation_map": {
+            "fact_coverage": [2],
+            "fact_supported_coverage": [2],
+        },
+        "evidence_citation_map": {},
+        "internal_report_links": {},
+    }
+
+    rendered = _readerize_report_text(content, references, {})
+
+    assert rendered == "覆盖率为 0% [^2]，因此保持观察。"
+    assert "[^2] [^2]" not in rendered
+
+
+def test_readerize_formats_bare_ratio_facts_as_reader_percentages() -> None:
+    content = (
+        "已知覆盖率为100.00% [Fact:fact_be7b2e423b529fb0fbefb459]；"
+        "研究覆盖率为0.6019415095727207，完全支持覆盖率为0。"
+        "[Fact:fact_coverage] [Fact:fact_supported]\n"
+        "产品资料以服务端编译资料为准；当前工作区没有带 Fact 的具体条款。"
+    )
+    references = {
+        "fact_citation_map": {
+            "fact_be7b2e423b529fb0fbefb459": [1],
+            "fact_coverage": [2],
+            "fact_supported": [2],
+        },
+        "evidence_citation_map": {},
+        "internal_report_links": {},
+    }
+    facts = {
+        "fact_be7b2e423b529fb0fbefb459": {
+            "fact_id": "fact_be7b2e423b529fb0fbefb459",
+            "value": "0.99999",
+            "unit": "ratio",
+        },
+        "fact_coverage": {
+            "fact_id": "fact_coverage", "value": "0.6019415095727207", "unit": "ratio",
+        },
+        "fact_supported": {
+            "fact_id": "fact_supported", "value": "0.0", "unit": "ratio",
+        },
+    }
+
+    rendered = _readerize_report_text(content, references, facts)
+
+    assert "研究覆盖率为60.19%" in rendered
+    assert "完全支持覆盖率为0.00%" in rendered
+    assert "[数据:" not in rendered
+    assert "已知覆盖率为100.00% [^1]" in rendered
+    assert "产品资料以已核验资料为准" in rendered
+    assert "当前资料没有具备可追溯来源的具体条款" in rendered
+    assert "0.6019415095727207" not in rendered
+    assert "。[^2]\n" in rendered
+
+
+def test_reader_fact_value_formats_thousand_cny_units() -> None:
+    assert _reader_fact_value({
+        "metric": "operating_cashflow",
+        "value": "5131729",
+        "unit": "CNY_thousand",
+    }) == "51.32亿元"
+
+
+def test_reference_provider_identifiers_are_reader_friendly() -> None:
+    assert _reader_reference_identity({
+        "publisher": "csi_official_close_weight",
+        "title": "csi_official_close_weight",
+    }) == ("中证指数有限公司", "指数成分权重文件")
+    assert _reader_reference_identity({
+        "publisher": "mootdx、tencent",
+        "title": "mootdx、tencent",
+    }) == ("mootdx、腾讯行情", "行情数据交叉核验")
+
+
 def test_deep_report_service_persists_validated_artifacts_and_revision(tmp_path: Path) -> None:
     service = DeepReportService(tmp_path / "reports")
     first = service.begin(
@@ -570,15 +1046,36 @@ def test_deep_report_service_persists_validated_artifacts_and_revision(tmp_path:
     assert "阅读提示" in compiled
     assert "研究已完成；部分判断因公开证据不足而保留" in compiled
     assert "数据依据" in compiled
-    assert "资料来源" in compiled
-    assert "〔数据1〕" in compiled
-    assert "〔来源1〕" in compiled
+    assert "参考资料" in compiled
+    assert "2025年04月01日" in compiled
+    assert "[^1]" in compiled
+    assert "〔数据1〕" not in compiled
+    assert "〔来源1〕" not in compiled
+    references = json.loads(
+        (tmp_path / "reports" / first.report_id / "references.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert references["schema_version"] == 2
+    assert references["content_sha256"]
+    assert references["citations"]
     assert "编译器校验摘要" not in compiled
     assert "equity_deep_research" not in compiled
     assert "passed_with_gaps" not in compiled
     assert "[Fact:" not in compiled
     assert "[Evidence:" not in compiled
     assert "fact_revenue" not in compiled
+    monitoring_bundle = json.loads(
+        (tmp_path / "reports" / first.report_id / "monitoring_bundle.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert monitoring_bundle["report_id"] == first.report_id
+    assert monitoring_bundle["instrument_type"] == "company_equity"
+    assert monitoring_bundle["horizon"] == "structural"
+    assert monitoring_bundle["candidates"] == []
+    assert monitoring_bundle["activation_policy"] == "manual_confirmation_required"
+    assert monitoring_bundle["trade_execution"] == "forbidden"
     assert (tmp_path / "reports" / first.report_id / "claims.jsonl").exists()
 
     revision = service.begin(
@@ -591,6 +1088,63 @@ def test_deep_report_service_persists_validated_artifacts_and_revision(tmp_path:
     assert revision.generation_reason == "原报告过期"
     assert (tmp_path / "reports" / revision.report_id / "analysis" / "facts.jsonl").exists()
     assert revision.symbol == "000001.SZ"
+
+
+def test_structural_monitoring_candidate_is_compiled_with_stable_lineage(tmp_path: Path) -> None:
+    service = DeepReportService(tmp_path / "reports")
+    record = service.begin(session_id="s-monitor", attempt_id="a-monitor", request_content="研究000001.SZ")
+    _attach_test_ledger(service, record.report_id)
+    _submit_valid_workspace(service, record.report_id)
+    accepted = service.submit_monitoring_bundle(
+        record.report_id,
+        monitoring_bundle={
+            "structural_context": {
+                "trend_stage": "震荡",
+                "trend_direction": "横盘",
+                "trend_strength": "中",
+                "thesis_state": "intact",
+                "thesis_invalidation_conditions": ["跟踪指标失效"],
+                "review_triggers": ["重新核验产业证据"],
+            },
+            "candidates": [{
+                "semantic_key": "watch-fact",
+                "label": "重新研究触发点",
+                "intent": "research_review",
+                "level": {"kind": "point", "price": 1},
+                "price_trigger_conditions": ["原始价格触及 1 元后人工复核"],
+                "confirmation_conditions": ["研究证据同步变化"],
+                "volume_conditions": [],
+                "invalidation_conditions": ["新证据否定原条件"],
+                "observation_window": "90 个自然日",
+                "recommended_action": "人工复核并重新研究",
+                "source_text": "跟踪指标 [Fact:fact_watch]。",
+                "section_id": "conclusion_watchlist",
+                "fact_ids": ["fact_watch"],
+                "evidence_ids": ["ev_stage"],
+                "machine_expressible": True,
+            }],
+        },
+    )
+    assert accepted["candidate_count"] == 1
+
+    published = service.publish_workspace(record.report_id)
+    bundle = json.loads(service.artifact_path(
+        published.report_id, "monitoring_bundle"
+    ).read_text(encoding="utf-8"))
+    assert bundle["monitoring_status"] == "available"
+    assert bundle["report_quality_status"] == published.quality_status
+    assert bundle["integrity"]["report_sha256"] == json.loads(
+        (tmp_path / "reports" / published.report_id / "references.json").read_text(
+            encoding="utf-8"
+        )
+    )["content_sha256"]
+    candidate = bundle["candidates"][0]
+    assert candidate["scenario_id"].startswith("struct_")
+    assert candidate["actionability"] == "action_ready"
+    assert candidate["lineage"]["fact_ids"] == ["fact_watch"]
+    assert candidate["lineage"]["evidence_ids"] == ["ev_stage"]
+    assert candidate["lineage"]["claim_ids"]
+    assert candidate["lineage"]["reference_numbers"]
 
 
 def test_deep_report_validation_fails_closed_without_sections_or_facts(tmp_path: Path) -> None:
@@ -695,6 +1249,40 @@ def test_session_deep_report_mode_wraps_prompt_and_attaches_report_metadata(
     assert refreshed.parent_report_id == report.report_id
     assert refreshed.revision == 2
     assert refreshed.revision_mode == "full_refresh"
+
+
+def test_session_forces_etf_profile_for_market_qualified_etf_symbol(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("VIBE_TRADING_DEEP_REPORT_ENABLED", "1")
+
+    class FakeSessionService(SessionService):
+        async def _run_with_agent(self, attempt, **kwargs):
+            assert "[ETF_DEEP_RESEARCH_PROFILE]" in attempt.prompt
+            return {
+                "status": "success",
+                "content": "研究已结束。",
+                "run_dir": None,
+                "react_trace": [],
+            }
+
+    service = FakeSessionService(
+        store=SessionStore(tmp_path / "sessions"),
+        event_bus=EventBus(),
+        runs_dir=tmp_path / "runs",
+    )
+    session = service.create_session("etf-deep")
+    result = asyncio.run(service.execute_message(
+        session.session_id,
+        "研究对象已确认：科创板新能源ETF（588870.SH）",
+        message_metadata={
+            "response_mode": "deep_report",
+            "report_profile": "equity_deep_research",
+        },
+    ))
+    attempt = service.store.get_attempt(session.session_id, result["attempt_id"])
+    assert attempt is not None
+    assert attempt.metadata["report_profile"] == "etf_deep_research"
 
 
 def test_followup_uses_linked_structured_context_without_creating_revision(tmp_path: Path) -> None:
@@ -1299,3 +1887,72 @@ def test_terminal_scenario_results_extend_fact_ledger_without_weighting(tmp_path
     ledger = (tmp_path / "reports" / record.report_id / "analysis" / "facts.jsonl").read_text(encoding="utf-8")
     assert "terminal_scenario_earnings" in ledger
     assert result["probability_weighted_result"] is None
+
+
+@pytest.mark.skipif(
+    os.getenv("VIBE_TRADING_RUN_REAL_CODEX_SMOKE") != "1",
+    reason="requires an authenticated isolated Vibe-Trading Codex CLI profile",
+)
+def test_real_codex_cli_stock_workspace_compile_and_pdf_smoke(tmp_path: Path) -> None:
+    service = DeepReportService(tmp_path / "reports")
+    record = service.begin(
+        session_id="real_codex_smoke_session",
+        attempt_id="real_codex_smoke_attempt",
+        request_content="Minimal Codex CLI stock research smoke test for 000001.SZ",
+    )
+    _attach_test_ledger(service, record.report_id)
+    events: list[tuple[str, dict]] = []
+
+    class SmokeUsageRecorder:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def record_llm(self, usage, **kwargs) -> None:
+            self.calls.append({"usage": usage, **kwargs})
+
+    usage = SmokeUsageRecorder()
+    section_bodies = {
+        "executive_summary": "Core operating fact [Fact:fact_revenue].",
+        "business_position": "Industry evidence [Evidence:ev_industry].",
+        "financial_quality": "Cash conversion evidence [Fact:fact_cfo].",
+        "accounting_review": "Accounting signal for follow-up only [Fact:fact_alert].",
+        "implied_expectations": "[data_gap] Evidence is insufficient; no target price is provided.",
+        "terminal_narrative": "The stage assessment is an inference [inference] [Evidence:ev_stage].",
+        "counter_thesis": "Counter-thesis evidence [Evidence:ev_risk].",
+        "conclusion_watchlist": "Watch-list fact [Fact:fact_watch].",
+    }
+    prompt = (
+        "This is an authorized deterministic smoke test. First inspect the report workspace. "
+        "Then submit all eight required sections using report_workspace submit_section. "
+        "Use these exact section bodies and do not add headings or numbers:\n"
+        + json.dumps(section_bodies, ensure_ascii=False)
+    )
+    runner = CodexResearchRunner(
+        session_id=record.session_id,
+        attempt_id=record.attempt_id,
+        report_id=record.report_id,
+        report_profile=record.profile,
+        revision_mode=record.revision_mode,
+        prompt=prompt,
+        history=[],
+        reports_dir=service.base_dir,
+        allowed_tools=["report_workspace"],
+        financial_rigor_commands=set(),
+        event_callback=lambda kind, data: events.append((kind, data)),
+        usage_recorder=usage,  # type: ignore[arg-type]
+        semaphore=asyncio.Semaphore(1),
+    )
+
+    result = asyncio.run(runner.run())
+
+    assert result["status"] == "success", result
+    assert usage.calls
+    published = service.publish_workspace(record.report_id)
+    assert published.status == "completed"
+    assert service.read_markdown(record.report_id)
+    pdf_path, _ = service.ensure_pdf(
+        record.report_id,
+        lambda _title, _content: b"%PDF-1.4\n% Codex smoke\n",
+    )
+    assert pdf_path.read_bytes().startswith(b"%PDF-1.4")
+    assert any(kind == "tool.end" for kind, _ in events)

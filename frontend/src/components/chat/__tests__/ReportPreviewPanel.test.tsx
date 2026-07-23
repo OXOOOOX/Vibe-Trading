@@ -138,4 +138,46 @@ describe("ReportPreviewPanel", () => {
     expect(await screen.findByText("版本差异", { selector: "span" })).toBeInTheDocument();
     expect(screen.getByTestId("preview-markdown")).toHaveTextContent("版本差异");
   });
+
+  it("shows sources, research delta, and structured history without loading old Markdown", async () => {
+    vi.spyOn(api, "getDeepReport").mockResolvedValue({
+      report_id: "report-3", session_id: "session-1", attempt_id: "attempt-3",
+      profile: "equity_deep_research", symbol: "603738.SH", security_name: "泰晶科技",
+      report_date: "2026-07-18", data_as_of: "2026-07-18",
+      quality_status: "passed_with_gaps", status: "completed", analysis_modules: {},
+      artifacts: [{ artifact_id: "markdown", artifact_type: "text/markdown", filename: "report.md", path: "hidden", available: true }],
+      validation_issues: [], created_at: "2026-07-18T00:00:00+08:00",
+      updated_at: "2026-07-18T01:00:00+08:00", revision: 3,
+      content: "# 当前报告\n正文", delivery_kind: "report",
+      research_coverage: {
+        domains: [{
+          domain: "financial_statements", required: true,
+          preferred_source_classes: ["regulatory_filing"], minimum_independent_sources: 1,
+          freshness_policy: "version_or_ttl", status: "covered", unresolved_questions: [],
+        }],
+      },
+      history_delta: {
+        base_report_id: "report-2", added: [{ metric: "revenue", value: "10", unit: "亿元" }],
+        updated: [], confirmed: [], contradicted: [], stale: [],
+      },
+    });
+    vi.spyOn(api, "searchResearchKnowledge").mockResolvedValue({
+      facts: [{ metric: "revenue", value: "10", unit: "亿元", period: "2025", freshness_status: "valid" }],
+      evidence: [{ publisher: "上交所", source_class: "regulatory_filing", domain: "announcement", canonical_url: "https://example.test/filing" }],
+      prior_claims: [], chunks: [],
+    });
+    vi.spyOn(api, "getResearchSymbolHistory").mockResolvedValue({
+      symbol: "603738.SH",
+      reports: [{ report_id: "report-2", revision: 2, fact_count: 12, coverage_snapshot_id: "coverage-2" }],
+    });
+
+    render(<ReportPreviewPanel target={{ reportId: "report-3" }} onClose={vi.fn()} />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByText("本次使用的信息"));
+    expect(await screen.findByTestId("preview-markdown")).toHaveTextContent("上交所");
+    await user.click(screen.getByText("与上次相比"));
+    expect(await screen.findByTestId("preview-markdown")).toHaveTextContent("revenue");
+    await user.click(screen.getByText("历史研究"));
+    expect(await screen.findByTestId("preview-markdown")).toHaveTextContent("report-2");
+  });
 });

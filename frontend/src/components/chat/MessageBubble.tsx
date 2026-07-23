@@ -10,6 +10,12 @@ import { AgentAvatar } from "./AgentAvatar";
 import { RunCompleteCard } from "./RunCompleteCard";
 import { ApiError, api } from "@/lib/api";
 import { toast } from "sonner";
+import {
+  deepReportModuleLabel,
+  deepReportTitle,
+  deepReportTypeLabel,
+  etfReadinessMessage,
+} from "@/lib/deepReportPresentation";
 
 const remarkPlugins = [remarkGfm];
 const rehypePlugins = [rehypeHighlight];
@@ -24,7 +30,7 @@ const DEEP_REPORT_SECTIONS = [
   ["conclusion_watchlist", "结论与跟踪框架"],
 ] as const;
 
-export type DeepReportAction = "continue" | "refresh" | "revise" | "repair" | "archive";
+export type DeepReportAction = "continue" | "refresh" | "enrich" | "revise" | "repair" | "archive";
 
 export interface DeepReportTaskStarted {
   action: DeepReportAction;
@@ -213,27 +219,11 @@ function DeepReportPdfButton({ reportId }: { reportId: string }) {
     <a
       href={api.deepReportArtifactUrl(reportId, "pdf")}
       className="p-1.5 rounded-md bg-muted/80 hover:bg-muted text-muted-foreground hover:text-foreground"
-      title="下载已校验的穿透式深度研究 PDF"
+      title="下载已校验的深度研究 PDF"
     >
       <FileDown className="h-3.5 w-3.5" />
     </a>
   );
-}
-
-const DEEP_REPORT_MODULE_LABELS: Record<string, string> = {
-  executive_summary: "核心结论",
-  business_position: "公司业务与产业位置",
-  financial_quality: "三张报表与财务质量",
-  accounting_review: "会计异常核查",
-  implied_expectations: "市值隐含预期",
-  terminal_narrative: "长期经营情景",
-  terminal_scenarios: "长期经营情景",
-  counter_thesis: "反方、风险与催化剂",
-  conclusion_watchlist: "结论与跟踪框架",
-};
-
-function deepReportModuleLabel(moduleId: string): string {
-  return DEEP_REPORT_MODULE_LABELS[moduleId] || moduleId;
 }
 
 function deepReportReaderGaps(moduleIds?: string[], includeInherited = false): string[] {
@@ -294,12 +284,14 @@ function DeepReportActionHint({
 function DeepReportActionBar({
   reportId,
   canArchive,
+  canEnrich,
   canRepair,
   busy = false,
   onTaskStarted,
 }: {
   reportId: string;
   canArchive: boolean;
+  canEnrich: boolean;
   canRepair: boolean;
   busy?: boolean;
   onTaskStarted?: (task: DeepReportTaskStarted) => void;
@@ -317,6 +309,15 @@ function DeepReportActionBar({
         result = await api.followUpDeepReport(reportId, "继续研究这份报告，并优先回答尚未解决的证据缺口。");
       } else if (action === "refresh") {
         result = await api.refreshDeepReport(reportId, "使用最新可验证数据重新研究，并生成新的不可变 revision。");
+      } else if (action === "enrich") {
+        const consented = window.confirm(
+          "系统将针对缺少往年数据、可比期间和关键来源的模块继续读取财报、公告和网页正文，并创建新的报告版本。\n\n这通常耗时更长，也可能消耗较多 Token。扩展搜集后仍无法核实的数据会继续保留为空，不会编造。\n\n是否同意并开始补齐？",
+        );
+        if (!consented) return;
+        result = await api.enrichDeepReport(
+          reportId,
+          "用户已明确同意扩展资料搜集，并知悉这会增加研究耗时和 Token 消耗；请优先补齐当前报告中缺少的往年数据、可比期间和关键来源，再形成正式报告。",
+        );
       } else if (action === "archive") {
         const archived = await api.archiveDeepReport(reportId);
         toast.success(`已保存到 Obsidian：${archived.path}`);
@@ -381,6 +382,22 @@ function DeepReportActionBar({
             className="rounded border border-amber-500/40 bg-amber-500/5 px-2.5 py-1.5 font-medium text-amber-700 hover:bg-amber-500/10 disabled:opacity-50 dark:text-amber-300"
           >
             {pending === "repair" ? "修复中…" : "修复报告"}
+          </button>
+        </DeepReportActionHint>
+      ) : null}
+      {canEnrich ? (
+        <DeepReportActionHint
+          id={`${hintPrefix}-enrich`}
+          text="经你确认后，系统会扩大资料搜集范围，优先补齐往年数据、可比期间和关键来源，再生成新版本；耗时和 Token 消耗通常更高。"
+        >
+          <button
+            type="button"
+            disabled={actionDisabled}
+            aria-describedby={`${hintPrefix}-enrich`}
+            onClick={() => void runAction("enrich")}
+            className="rounded border border-amber-500/40 bg-amber-500/5 px-2.5 py-1.5 font-medium text-amber-700 hover:bg-amber-500/10 disabled:opacity-50 dark:text-amber-300"
+          >
+            {pending === "enrich" ? "补齐中…" : "补齐资料并重新生成"}
           </button>
         </DeepReportActionHint>
       ) : null}
@@ -576,9 +593,21 @@ export const MessageBubble = memo(function MessageBubble({
     const canDownloadDeepReportPdf = Boolean(
       msg.reportId && msg.reportPdfAvailable === true && !failedDeepReport,
     );
+    const reportType = deepReportTypeLabel(
+      msg.reportProfile,
+      msg.reportQualityStatus,
+      msg.reportEtfReadiness,
+    );
+    const reportTitle = deepReportTitle(
+      msg.reportSecurityName,
+      msg.reportSymbol,
+      msg.reportProfile,
+      msg.reportQualityStatus,
+      msg.reportEtfReadiness,
+    );
     const explicitReportFilename = extractMarkdownReportFilename(msg.content);
     const reportPreviewFilename = explicitReportFilename
-      || (msg.reportSecurityName ? `${msg.reportSecurityName}穿透式深度研究.md` : "穿透式深度研究.md");
+      || `${reportTitle}.md`;
     const reportPreviewArtifact = failedDeepReport ? "diagnostic" : "markdown";
     const canPreviewReport = Boolean(
       onPreviewReport
@@ -603,7 +632,7 @@ export const MessageBubble = memo(function MessageBubble({
           {msg.reportId && (
             <div className="mb-3 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
               <span className="rounded border border-primary/30 bg-primary/5 px-2 py-0.5 font-medium text-primary">
-                穿透式深度研究
+                {reportType}
               </span>
               {msg.reportGenerationSource === "portfolio_monitor_autopilot" ? (
                 <span className="rounded border border-violet-500/30 bg-violet-500/5 px-2 py-0.5 font-medium text-violet-700 dark:text-violet-300">
@@ -623,11 +652,32 @@ export const MessageBubble = memo(function MessageBubble({
               ) : null}
             </div>
           )}
+          {msg.reportId && msg.reportHistoryDelta?.base_report_id && (
+            <div className="mb-3 rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+              <span className="font-medium text-foreground">与上次研究相比：</span>
+              新增 {msg.reportHistoryDelta.added?.length || 0} 项 ·
+              更新 {msg.reportHistoryDelta.updated?.length || 0} 项 ·
+              待复核 {(msg.reportHistoryDelta.stale?.length || 0) + (msg.reportHistoryDelta.contradicted?.length || 0)} 项
+              {msg.reportResearchCoverage ? (
+                <span className="ml-2">
+                  （确认复用 {msg.reportResearchCoverage.reused_fact_count || 0} 项，重新核验 {msg.reportResearchCoverage.refreshed_fact_count || 0} 项）
+                </span>
+              ) : null}
+            </div>
+          )}
           {msg.reportId && failedDeepReport && (
             <div role="alert" className="mb-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
               {fullRefreshRequired
                 ? "本次缺少可核验的价格、市值、股票身份或财务数据。单独修改章节无法解决，请点击“用新数据更新”。"
                 : "关键内容没有通过发布前校验。本次只保留诊断结果，不应视为正式投资研究。"}
+            </div>
+          )}
+          {msg.reportId && msg.reportEtfReadiness && msg.reportEtfReadiness.status !== "penetration_ready" && !failedDeepReport && (
+            <div className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-amber-700 dark:text-amber-300">
+              {etfReadinessMessage(msg.reportEtfReadiness)}
+              {typeof msg.reportEtfReadiness.metrics?.component_research_coverage === "number"
+                ? `；当前成分研究覆盖 ${(msg.reportEtfReadiness.metrics.component_research_coverage * 100).toFixed(1)}%。`
+                : ""}
             </div>
           )}
           {msg.reportId && reportGapLabels.length > 0 && (
@@ -640,6 +690,9 @@ export const MessageBubble = memo(function MessageBubble({
                   </span>
                 ))}
               </div>
+              <p className="mt-2 border-t pt-2 leading-relaxed">
+                如果这些缺口影响你的分析目标，可以在下方选择“补齐资料并重新生成”。系统会先征求同意，并提示额外耗时与 Token 消耗。
+              </p>
             </div>
           )}
           <div className="prose prose-sm dark:prose-invert max-w-none leading-relaxed prose-table:border prose-table:border-border/50 prose-th:bg-muted/30 prose-th:px-3 prose-th:py-1.5 prose-td:px-3 prose-td:py-1.5 prose-th:text-left prose-th:text-xs prose-th:font-medium prose-td:text-xs prose-hr:hidden">
@@ -652,9 +705,7 @@ export const MessageBubble = memo(function MessageBubble({
                 runId: msg.runId,
                   reportId: msg.reportId,
                   artifactId: msg.reportId ? reportPreviewArtifact : undefined,
-                  title: msg.reportSecurityName
-                  ? `${msg.reportSecurityName}穿透式深度研究`
-                  : reportPreviewFilename.replace(/\.md$/i, ""),
+                  title: msg.reportId ? reportTitle : reportPreviewFilename.replace(/\.md$/i, ""),
               })}
               aria-label={`在右侧预览报告 ${reportPreviewFilename}`}
               className="mt-3 flex w-full items-center gap-3 rounded-xl border border-cyan-500/25 bg-cyan-500/5 px-3 py-2.5 text-left transition-colors hover:border-cyan-500/45 hover:bg-cyan-500/10"
@@ -700,6 +751,7 @@ export const MessageBubble = memo(function MessageBubble({
             <DeepReportActionBar
               reportId={msg.reportId}
               canArchive={!failedDeepReport && msg.reportMarkdownAvailable !== false}
+              canEnrich={reportGapLabels.length > 0}
               canRepair={failedDeepReport && !fullRefreshRequired}
               busy={deepReportBusy}
               onTaskStarted={onDeepReportTaskStarted}
