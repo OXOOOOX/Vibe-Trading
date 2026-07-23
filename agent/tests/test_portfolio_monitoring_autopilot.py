@@ -301,6 +301,57 @@ def test_daily_turnover_uses_amount_and_waits_for_consecutive_closes():
     assert pending["evidence_pending"] is True
 
 
+def test_closed_daily_volume_ratio_uses_previous_five_sessions_across_weekend():
+    plan = _v5_plan()
+    scenario = plan["watch_scenarios"][0]
+    scenario["source_conditions"] = [{
+        "condition_id": "source-daily-volume",
+        "source_text": "当日成交量至少为此前五日均量的 1.5 倍",
+        "role": "required",
+        "coverage_status": "mapped",
+        "reason": "deterministic closed daily volume",
+        "evidence_refs": ["weekly-report"],
+    }]
+    scenario["entry_conditions"] = {"operator": "all", "conditions": []}
+    scenario["confirmation_conditions"] = {
+        "operator": "all",
+        "conditions": [
+            _condition(
+                "daily-volume-ratio",
+                "source-daily-volume",
+                "rolling_volume_ratio",
+                "gte",
+                interval="1d",
+                lookback_bars=5,
+                freshness_seconds=345600,
+                value=1.5,
+                metric="volume",
+                unit="ratio",
+            )
+        ],
+    }
+    plan = validate_plan(plan)
+    daily = []
+    for index, day in enumerate((10, 13, 14, 15, 16, 17)):
+        daily.append({
+            **_bar("15:00", opened=1.15, close=1.16),
+            "bar_time": f"2026-07-{day:02d}T15:00:00+08:00",
+            "session_date": f"2026-07-{day:02d}",
+            "volume": 160_000 if index == 5 else 100_000,
+        })
+    assessment = CompoundConditionEvaluator().evaluate(
+        plan=plan,
+        symbol=plan["symbol"],
+        market_store=_Bars({"1m": [], "5m": [], "1D": daily}),
+        now_utc=datetime(2026, 7, 20, 2, 0, tzinfo=timezone.utc),
+    )["report-weak-rebound"]
+    assert assessment["confirmation_met"] is True
+    fact = assessment["facts"]["confirmation"][0]
+    assert fact["value"] == pytest.approx(1.6)
+    assert fact["baseline_volume"] == pytest.approx(100_000)
+    assert fact["session_date"] == "2026-07-17"
+
+
 def test_v5_downward_compound_confirmation_carries_cue_contract_only_when_confirmed(
     tmp_path: Path,
 ):
@@ -395,6 +446,57 @@ def test_v5_downward_compound_confirmation_carries_cue_contract_only_when_confir
     assert unresolved["facts"]["alert_cue"] == "none"
 
 
+def test_watch_only_compound_scenario_never_emits_confirmed_signal(tmp_path: Path):
+    store = MonitoringStore(tmp_path / "watch-only.sqlite3")
+    store.set_autopilot_config(
+        {"enabled": True, "selected_symbols": ["159999.SZ"]}
+    )
+    plan = validate_plan(_v5_plan(scenario_overrides={"automation_status": "watch_only"}))
+    profile_id, version = store.save_draft(
+        symbol=plan["symbol"],
+        market="SZ",
+        instrument_type="etf",
+        plan=plan,
+        evidence_manifest={"data_as_of": NOW.isoformat()},
+        input_snapshot_hash="holding-hash",
+        delivery_target_id=None,
+        model_id="test-watch-only",
+        created_by="autopilot",
+    )
+    store.activate_autonomous(
+        profile_id,
+        version,
+        trigger_type="report_ready",
+        evidence_fingerprint="evidence-watch-only",
+    )
+    compound = {
+        "automation_status": "watch_only",
+        "entry_met": True,
+        "confirmation_met": True,
+        "invalidated": False,
+        "evidence_pending": False,
+    }
+
+    def observe(minute: int):
+        return store.evaluate_quote(
+            profile_id,
+            {
+                "last_price": 1.18,
+                "interval": "5m",
+                "bar_time": f"2026-07-16T02:{minute:02d}:00+00:00",
+                "session_date": "2026-07-16",
+                "status": "verified",
+                "sources": ["source-a", "source-b"],
+                "compound_assessments": {"report-weak-rebound": compound},
+            },
+            delivery_mode="shadow",
+        )
+
+    assert [event["kind"] for event in observe(0)] == ["watch_episode_approaching"]
+    assert observe(5) == []
+    assert all(event["outcome"] != "confirmed" for event in store.list_events(limit=20))
+
+
 def test_recommendation_quantity_is_bounded_and_never_executes(monkeypatch):
     monkeypatch.setattr(
         "src.portfolio.monitoring.recommendations.load_state",
@@ -443,6 +545,36 @@ def test_recommendation_quantity_is_bounded_and_never_executes(monkeypatch):
     )
     assert add["constrained_quantity"] == 1000
     assert add["estimated_amount"] == 10_000
+
+
+def test_recommendation_never_invents_default_position_size(monkeypatch):
+    monkeypatch.setattr(
+        "src.portfolio.monitoring.recommendations.load_state",
+        lambda: PortfolioState(
+            holdings=[{"symbol": "159999.SZ", "quantity": 3000, "last_price": 10}],
+            cash=15_000,
+        ),
+    )
+    scenario = validate_plan(_v5_plan())["watch_scenarios"][0]
+    scenario["action_template"] = {
+        "action": "reduce",
+        "sizing": {"kind": "default_policy", "source": "requires_user_risk_preferences"},
+        "confidence_floor": "high",
+    }
+
+    recommendation = RecommendationResolver().resolve(
+        symbol="159999.SZ",
+        scenario=scenario,
+        current_price=10,
+        now_utc=NOW,
+        compound={"evidence_pending": False},
+    )
+
+    assert recommendation["status"] == "needs_risk_preferences"
+    assert recommendation["requested_quantity"] is None
+    assert recommendation["constrained_quantity"] is None
+    assert recommendation["system_default_used"] is False
+    assert recommendation["trade_execution"] == "forbidden"
 
 
 def test_autonomous_activation_needs_no_delivery_target_and_trigger_dedupes(tmp_path: Path):
@@ -619,7 +751,7 @@ def test_v8_config_migration_adds_an_empty_fail_closed_selection(tmp_path: Path)
     with store.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "9"
+        ).fetchone()[0] == "10"
 
 
 def test_deselect_cancels_jobs_closes_only_autopilot_and_reselects(
@@ -1003,3 +1135,116 @@ def test_autopilot_run_exposes_planner_gate_details(tmp_path: Path):
     assert run["blocked_reasons"] == ["planner_validation_failed"]
     assert run["validation_errors"] == [error]
     assert run["detail_error"] == error
+
+
+def test_monitoring_target_cards_merge_scope_and_blocked_builds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    holdings = PortfolioState(holdings=[
+        {"symbol": "000651.SZ", "name": "格力电器", "quantity": 100},
+        {"symbol": "159516.SZ", "name": "半导体设备ETF", "quantity": 1000},
+    ])
+    monkeypatch.setattr("src.portfolio.monitoring.service.load_state", lambda: holdings)
+    store = MonitoringStore(tmp_path / "monitoring.sqlite3")
+    store.set_autopilot_config({
+        "enabled": True,
+        "selected_symbols": ["000651.SZ", "159516.SZ"],
+    })
+    trigger, _ = store.enqueue_autopilot_trigger(
+        symbol="159516.SZ",
+        trigger_type="holdings_changed",
+        dedupe_key="etf-discontinuity",
+    )
+    job = store.create_planner_job(
+        symbols=["159516.SZ"],
+        report_refs={},
+        research_policy="if_needed",
+        delivery_target_id=None,
+        force_fresh=True,
+        activation_mode="autonomous",
+        trigger_type="holdings_changed",
+        autopilot_trigger_id=trigger["trigger_id"],
+    )
+    blockers = [
+        "price_series_discontinuity_unverified",
+        "adjustment_factor_unverified",
+        "insufficient_post_event_history",
+    ]
+    store.update_planner_item(
+        job["job_id"],
+        "159516.SZ",
+        status="blocked",
+        blocked_reasons=blockers,
+        progress={
+            "stage": "blocked",
+            "continuity": {
+                "status": "blocked",
+                "post_event_bar_count": 9,
+                "blocked_reasons": blockers,
+            },
+            "volume_gate": {"status": "ready"},
+        },
+    )
+    store.update_autopilot_trigger(
+        trigger["trigger_id"],
+        status="blocked",
+        planner_job_id=job["job_id"],
+    )
+
+    legacy_payload = _v5_plan(symbol="159516.SZ")
+    legacy_payload["market_rules"][0]["calculation_basis"] = {
+        "method": "symmetric_target_extension",
+        "method_label": "legacy symmetric target",
+        "formula": "legacy",
+        "summary": "legacy mechanical target",
+        "recommended_value": 1.175,
+        "references": [],
+    }
+    legacy_plan = validate_plan(legacy_payload)
+    profile_id, version = store.save_draft(
+        symbol="159516.SZ",
+        market="SZ",
+        instrument_type="etf",
+        plan=legacy_plan,
+        evidence_manifest={"data_as_of": NOW.isoformat()},
+        input_snapshot_hash="holding-hash",
+        delivery_target_id=None,
+        model_id="legacy-autopilot",
+        created_by="autopilot",
+    )
+    store.activate_autonomous(
+        profile_id,
+        version,
+        trigger_type="holdings_changed",
+        evidence_fingerprint="legacy-evidence",
+    )
+    service = MonitoringService(store=store)
+    assert service._quarantine_unsafe_autopilot_profile("159516.SZ", blockers) == (
+        "level_method_migration"
+    )
+    assert store.get_profile(profile_id)["status"] == "closed"
+    with store.connect() as connection:
+        archived = connection.execute(
+            """SELECT status FROM monitor_plan_versions
+               WHERE profile_id=? AND version=?""",
+            (profile_id, version),
+        ).fetchone()[0]
+        enabled_rules = connection.execute(
+            """SELECT COUNT(*) FROM monitor_rules
+               WHERE profile_id=? AND plan_version=? AND enabled=1""",
+            (profile_id, version),
+        ).fetchone()[0]
+    assert archived == "superseded"
+    assert enabled_rules == 0
+
+    cards = service.list_monitoring_targets()
+    by_symbol = {card["symbol"]: card for card in cards}
+
+    assert set(by_symbol) == {"000651.SZ", "159516.SZ"}
+    assert by_symbol["000651.SZ"]["name"] == "格力电器"
+    assert by_symbol["000651.SZ"]["profile_status"] == "building"
+    assert by_symbol["000651.SZ"]["build_state"]["progress_percent"] == 5
+    assert by_symbol["159516.SZ"]["profile_status"] == "blocked"
+    assert [item["code"] for item in by_symbol["159516.SZ"]["blockers"]] == blockers
+    assert by_symbol["159516.SZ"]["continuity"]["post_event_bar_count"] == 9

@@ -93,6 +93,11 @@ class MonitoringRuntime:
         }
         self.leader = False
         self.fencing_token: int | None = None
+        self._price_volume_backfills = getattr(
+            self.store,
+            "price_volume_backfills",
+            {},
+        )
 
     @staticmethod
     def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
@@ -528,8 +533,10 @@ class MonitoringRuntime:
                         items=[(interval, "raw") for interval in intervals],
                         force=False,
                         read_only=True,
+                        require_volume_quorum=True,
                         deadline=deadline,
                     )
+                    self.price_volume_analyzer.invalidate(symbols)
                 except Exception as exc:
                     tick["refresh_error"] = f"{type(exc).__name__}: {exc}"
                     logger.warning("monitoring quote refresh failed: %s", exc)
@@ -564,6 +571,44 @@ class MonitoringRuntime:
                     tier = str(plan_payload.get("quote_tier") or "normal")
                     allow_single_source = plan_payload.get("data_mode") == "single_source"
                     seconds = self._tier_seconds(tier)
+                    source_deadlines = [
+                        str(plan_payload.get(field) or "")
+                        for field in ("review_due_at", "source_valid_until")
+                        if plan_payload.get(field)
+                    ]
+                    source_review_due = False
+                    if source_deadlines:
+                        try:
+                            parsed_deadlines = [
+                                datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+                                for value in source_deadlines
+                            ]
+                            source_review_due = now_utc >= min(parsed_deadlines)
+                        except ValueError:
+                            source_review_due = True
+                    if source_review_due:
+                        blocked_reason = "source_report_review_due"
+                        tick["blocked_profiles"] += 1
+                        tick["supported_blocked_profiles"] += 1
+                        tick["source_review_due_profiles"] = int(
+                            tick.get("source_review_due_profiles") or 0
+                        ) + 1
+                        self.store.schedule_next(
+                            profile["profile_id"],
+                            seconds=seconds,
+                            success=False,
+                            blocked_reasons=[blocked_reason],
+                            lease_guard=lease_guard,
+                        )
+                        self._record_profile_outcome(
+                            tick=tick,
+                            profile_id=str(profile["profile_id"]),
+                            status="blocked",
+                            reason_code=blocked_reason,
+                            lease_guard=lease_guard,
+                            outcomes=outcomes,
+                        )
+                        continue
                     quotes = [
                         quote
                         for interval in profile_intervals[profile["profile_id"]]
@@ -626,7 +671,39 @@ class MonitoringRuntime:
                                 now_utc=now_utc,
                                 policy=policy,
                                 allow_single_source=allow_single_source,
+                                require_pattern=schema_version < 5,
                             )
+                            reasons = set(price_volume.get("reason_codes") or [])
+                            if "insufficient_same_time_baseline" in reasons:
+                                backfill = await self._backfill_price_volume_history(
+                                    symbol=str(profile["symbol"]),
+                                    now_utc=now_utc,
+                                )
+                                if backfill.get("status") == "completed":
+                                    price_volume, price_volume_bar_time = self.price_volume_analyzer.analyze(
+                                        market_store=self.market_service.store,
+                                        symbol=str(profile["symbol"]),
+                                        now_utc=now_utc,
+                                        policy=policy,
+                                        allow_single_source=allow_single_source,
+                                        require_pattern=schema_version < 5,
+                                    )
+
+                    historical_price_volume: dict[str, Any] | None = None
+                    if (
+                        price_volume is not None
+                        and price_volume.get("status") != "ready"
+                        and isinstance(policy, dict)
+                        and bool(policy.get("enabled", True))
+                        and price_volume_config["mode"] != "off"
+                    ):
+                        historical_price_volume = self.price_volume_analyzer.analyze_historical(
+                            market_store=self.market_service.store,
+                            symbol=str(profile["symbol"]),
+                            now_utc=now_utc,
+                            policy=policy,
+                            allow_single_source=allow_single_source,
+                        )
 
                     cumulative_volume: dict[str, Any] | None = None
                     if schema_version >= 4 and any(
@@ -738,6 +815,13 @@ class MonitoringRuntime:
                         if price_volume is not None:
                             quote["price_volume"] = price_volume
                             quote["price_volume_bar_time"] = price_volume_bar_time
+                        if historical_price_volume is not None:
+                            quote["historical_price_volume"] = historical_price_volume
+                        backfill_state = self._price_volume_backfills.get(
+                            str(profile["symbol"]).upper()
+                        )
+                        if backfill_state is not None:
+                            quote["price_volume_backfill"] = dict(backfill_state)
                         if cumulative_volume is not None:
                             quote["cumulative_volume_evidence"] = cumulative_volume
                             quote["cumulative_volume"] = cumulative_volume.get("cumulative_volume")
@@ -973,6 +1057,59 @@ class MonitoringRuntime:
             ).encode("utf-8")
             hashes[symbol] = hashlib.sha256(encoded).hexdigest()
         return hashes
+
+    async def _backfill_price_volume_history(
+        self,
+        *,
+        symbol: str,
+        now_utc: datetime,
+    ) -> dict[str, Any]:
+        """Run at most one 60-session history repair per symbol and market day."""
+
+        normalized = symbol.upper()
+        market_day = now_utc.astimezone(_CN_TZ).date()
+        existing = self._price_volume_backfills.get(normalized)
+        if existing and existing.get("market_date") == market_day.isoformat():
+            return dict(existing)
+        state = {
+            "status": "running",
+            "market_date": market_day.isoformat(),
+            "started_at": now_utc.isoformat(),
+        }
+        self._price_volume_backfills[normalized] = state
+        try:
+            result = await asyncio.to_thread(
+                self.market_service.refresh_sync,
+                symbols=[normalized],
+                profile="portfolio_monitoring_price_volume_backfill",
+                items=[("5m", "raw")],
+                force=True,
+                start_date=(market_day - timedelta(days=90)).isoformat(),
+                end_date=market_day.isoformat(),
+                read_only=True,
+                require_volume_quorum=True,
+                deadline=time.monotonic() + 25,
+            )
+            result_status = str(result.get("status") or "failed")
+            state.update(
+                {
+                    "status": "completed" if result_status in {"completed", "partial"} else "failed",
+                    "refresh_status": result_status,
+                    "deduplicated": bool(result.get("deduplicated")),
+                    "completed_at": self.now_factory().astimezone(timezone.utc).isoformat(),
+                }
+            )
+        except Exception as exc:
+            state.update(
+                {
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "completed_at": self.now_factory().astimezone(timezone.utc).isoformat(),
+                }
+            )
+            logger.warning("price-volume history backfill failed for %s: %s", normalized, exc)
+        self.price_volume_analyzer.invalidate([normalized])
+        return dict(state)
 
     def _profile_intervals(self, profile: dict[str, Any]) -> list[str]:
         version = profile.get("active_plan_version")

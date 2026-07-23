@@ -19,6 +19,97 @@ _CN_TZ = ZoneInfo("Asia/Shanghai")
 _ACCEPTED_STATUSES = {"verified", "single_source"}
 
 
+def price_volume_interpretation(
+    regime: str | None,
+    *,
+    accelerated_decline: bool = False,
+    confidence: str = "medium",
+) -> dict[str, str]:
+    """Translate one deterministic regime into user-facing semantics.
+
+    This is deliberately not model-generated: the wording is a stable mapping
+    from closed-bar facts, so the UI can explain the classification without
+    turning an interpretation into a new monitoring condition.
+    """
+
+    mapping = {
+        "bullish_expansion": (
+            "bullish",
+            "价格上行且成交量显著高于同时间基准，说明主动买盘增强。",
+            "若后续迅速跌回突破位且量能衰减，可能是假突破。",
+            "观察后续 1–2 根 5 分钟K线能否守住突破位，且放量状态能否延续。",
+        ),
+        "bullish_contraction": (
+            "mixed",
+            "价格上涨但成交缩量，抛压有限，追价资金却仍不充分。",
+            "缩量上涨容易在前高或压力位附近失去动能。",
+            "等待放量站稳压力位，或回踩时缩量且不破关键支撑。",
+        ),
+        "bearish_expansion": (
+            "bearish",
+            (
+                "价格下行且成交放大，主动卖盘占优，并出现下跌加速。"
+                if accelerated_decline
+                else "价格下行且成交量显著高于同时间基准，主动卖盘占优。"
+            ),
+            "若临近报告支撑位仍持续放量收低，跌破风险上升；单根放量也可能包含恐慌换手。",
+            "观察后续 1–2 根 5 分钟K线是否止跌、收回支撑位，或量能回落后出现反包。",
+        ),
+        "bearish_contraction": (
+            "mixed",
+            "价格下跌但成交缩量，卖压有所减弱，但尚不能视为反转。",
+            "弱势缩量也可能只是买盘缺席，价格仍可能继续阴跌。",
+            "等待价格止跌并出现放量回升，或至少连续守住报告支撑位。",
+        ),
+        "high_volume_absorption": (
+            "mixed",
+            "价格变化不大但明显放量并收在区间高位，盘中承接较强。",
+            "高换手不等于突破，若下一根跌回区间中下部，承接判断失效。",
+            "观察后续是否放量突破区间高点并站稳。",
+        ),
+        "high_volume_rejection": (
+            "bearish",
+            "价格变化不大但明显放量并收在区间低位，上方抛压较重。",
+            "若靠近关键支撑，这可能演变为放量跌破；也可能是一次性换手。",
+            "观察后续能否快速收回区间中位和报告支撑位，否则按弱势确认。",
+        ),
+        "high_volume_stall": (
+            "mixed",
+            "价格变化不大但成交明显放大，多空分歧加剧，方向尚未确认。",
+            "放量滞涨后若收低，可能转为派发；向上突破前不宜只凭成交量追随。",
+            "等待价格脱离当前区间，并结合收盘位置确认方向。",
+        ),
+        "low_volume_balance": (
+            "neutral",
+            "价格变化不大且成交缩量，市场暂时处于观望和平衡状态。",
+            "低流动性下的小幅波动不具备趋势确认意义。",
+            "等待成交恢复并突破报告中的支撑或压力区间。",
+        ),
+        "neutral": (
+            "neutral",
+            "当前价格与成交量组合没有形成清晰的方向性信号。",
+            "中性状态不能单独支持加仓、减仓或突破判断。",
+            "继续观察量能是否扩张，以及价格是否触及报告监测点位。",
+        ),
+    }
+    bias, meaning, risk, next_confirmation = mapping.get(
+        regime,
+        (
+            "neutral",
+            "当前数据只能描述成交量状态，尚不足以判断多空方向。",
+            "数据不足时不应把量价标签作为交易或监测规则。",
+            "等待足够的同时间历史样本和连续已收盘K线。",
+        ),
+    )
+    return {
+        "bias": bias,
+        "meaning": meaning,
+        "risk": risk,
+        "next_confirmation": next_confirmation,
+        "confidence": confidence,
+    }
+
+
 def maximum_bar_lag_seconds(interval: str) -> int:
     """Use the same freshness budget for quotes and volume evidence."""
 
@@ -52,6 +143,13 @@ def disabled_price_volume(reason: str = "price_volume_mode_off") -> dict[str, An
         "close_location": None,
         "accelerated_decline": False,
         "reason_codes": [reason],
+        "interpretation": price_volume_interpretation(None, confidence="low"),
+        "analysis_scope": "live",
+        "data_as_of": None,
+        "volume_quality": "unavailable",
+        "volume_source_count": 0,
+        "volume_sources": [],
+        "volume_unit": None,
     }
 
 
@@ -75,6 +173,13 @@ def _insufficient(
         "close_location": close_location,
         "accelerated_decline": False,
         "reason_codes": list(dict.fromkeys(reasons)),
+        "interpretation": price_volume_interpretation(None, confidence="low"),
+        "analysis_scope": "live",
+        "data_as_of": None,
+        "volume_quality": "unavailable",
+        "volume_source_count": 0,
+        "volume_sources": [],
+        "volume_unit": None,
     }
 
 
@@ -101,7 +206,8 @@ def _number(value: Any, *, positive: bool = False) -> float | None:
 
 
 def _source_signature(bar: dict[str, Any]) -> tuple[str, ...]:
-    return tuple(sorted({str(value).strip() for value in (bar.get("sources") or []) if str(value).strip()}))
+    values = bar.get("volume_sources") or bar.get("sources") or []
+    return tuple(sorted({str(value).strip() for value in values if str(value).strip()}))
 
 
 def _volume_unit(bar: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -109,17 +215,33 @@ def _volume_unit(bar: dict[str, Any]) -> tuple[str | None, str | None]:
 
     explicit = str(bar.get("volume_unit") or "").strip().lower()
     observations = bar.get("observations") or []
+    has_volume_membership = any(
+        isinstance(item, dict) and "included_in_volume_consensus" in item
+        for item in observations
+    )
     included = [
         item
         for item in observations
-        if isinstance(item, dict) and item.get("included_in_consensus", True)
+        if isinstance(item, dict)
+        and (
+            item.get("included_in_volume_consensus", False)
+            if has_volume_membership
+            else item.get("included_in_consensus", True)
+        )
     ]
     raw_units = [str(item.get("volume_unit") or "").strip().lower() for item in included]
-    if explicit == "unknown" or any(unit in {"", "unknown"} for unit in raw_units):
+    canonical_explicit = _canonical_volume_unit(explicit) if explicit else None
+    canonical_raw_units = [_canonical_volume_unit(unit) for unit in raw_units]
+    if (
+        explicit == "unknown"
+        or (explicit and canonical_explicit is None)
+        or any(unit in {"", "unknown"} for unit in raw_units)
+        or any(unit is None for unit in canonical_raw_units)
+    ):
         return None, "volume_unit_unknown"
-    units = set(raw_units)
-    if explicit:
-        units.add(explicit)
+    units = {unit for unit in canonical_raw_units if unit is not None}
+    if canonical_explicit:
+        units.add(canonical_explicit)
     if not units:
         return None, "volume_unit_unknown"
     if len(units) != 1:
@@ -147,8 +269,13 @@ def _bar_quality(
     if status not in accepted_statuses:
         return False, "bar_status_not_actionable", (), None
     flags = {str(value) for value in (bar.get("quality_flags") or [])}
-    if "volume_conflict" in flags:
+    volume_status = str(bar.get("volume_status") or "")
+    if not volume_status:
+        volume_status = "conflict" if "volume_conflict" in flags else status
+    if volume_status == "conflict" or "volume_conflict" in flags:
         return False, "volume_conflict", (), None
+    if volume_status not in accepted_statuses:
+        return False, "volume_status_not_actionable", (), None
     if _number(bar.get("volume"), positive=True) is None:
         return False, "volume_missing", (), None
     if _number(bar.get("close"), positive=True) is None:
@@ -160,6 +287,19 @@ def _bar_quality(
     if unit_error:
         return False, unit_error, (), None
     return True, None, signature, unit
+
+
+def _bar_volume_metadata(bar: dict[str, Any], *, scope: str) -> dict[str, Any]:
+    signature = _source_signature(bar)
+    unit, _error = _volume_unit(bar)
+    return {
+        "analysis_scope": scope,
+        "data_as_of": bar.get("bar_time"),
+        "volume_quality": str(bar.get("volume_status") or bar.get("status") or "unknown"),
+        "volume_source_count": int(bar.get("volume_source_count") or len(signature)),
+        "volume_sources": list(signature),
+        "volume_unit": _canonical_volume_unit(unit),
+    }
 
 
 def target_distance_bps(rule: dict[str, Any], price: Any) -> float | None:
@@ -212,9 +352,26 @@ class PriceVolumeAnalyzer:
 
     def __init__(self) -> None:
         self._baseline_cache: dict[
-            tuple[str, str, str, str, tuple[str, ...], str, int],
-            tuple[float, int, tuple[str, ...]],
+            tuple[str, str, str, str, str, int],
+            tuple[float, int, float, int, tuple[str, ...]],
         ] = {}
+        self._historical_cache: dict[
+            tuple[Any, ...],
+            tuple[tuple[Any, ...], dict[str, Any]],
+        ] = {}
+
+    def invalidate(self, symbols: list[str] | set[str] | tuple[str, ...]) -> None:
+        normalized = {str(symbol).upper() for symbol in symbols}
+        self._baseline_cache = {
+            key: value
+            for key, value in self._baseline_cache.items()
+            if key[0] not in normalized
+        }
+        self._historical_cache = {
+            key: value
+            for key, value in self._historical_cache.items()
+            if key[0] not in normalized
+        }
 
     @staticmethod
     def _closed_bars(
@@ -314,7 +471,6 @@ class PriceVolumeAnalyzer:
             )
             if (
                 not good
-                or bar_signature != signature
                 or _canonical_volume_unit(raw_unit) != canonical_unit
             ):
                 invalid_sessions.add(session)
@@ -543,14 +699,18 @@ class PriceVolumeAnalyzer:
                 candidate,
                 accepted_statuses=accepted,
             )
-            if good and unit is not None:
+            amount_ready = (
+                str(candidate.get("status") or "") in accepted
+                and _number(candidate.get("amount"), positive=True) is not None
+            )
+            if amount_ready or (good and unit is not None):
                 current_item = (candidate_time, candidate)
                 current_signature = signature
                 current_unit = unit
                 break
             if candidate_error:
                 current_errors.append(candidate_error)
-        if current_item is None or current_unit is None:
+        if current_item is None:
             return _insufficient(
                 [*current_errors, "no_actionable_closed_bar"]
             ), None
@@ -570,7 +730,6 @@ class PriceVolumeAnalyzer:
             selected_interval,
             session_date,
             bucket,
-            signature,
             unit,
             baseline_sessions,
         )
@@ -608,6 +767,7 @@ class PriceVolumeAnalyzer:
                 interval=selected_interval,
             )
             by_session: dict[str, float] = {}
+            amount_by_session: dict[str, float] = {}
             baseline_issues: list[str] = []
             for bar_time, bar in reversed(
                 [item for item in history_closed if item[0] < current_time]
@@ -621,14 +781,14 @@ class PriceVolumeAnalyzer:
                     accepted_statuses=accepted,
                 )
                 volume = _number(bar.get("volume"), positive=True)
+                amount = _number(bar.get("amount"), positive=True)
+                if str(bar.get("status") or "") in accepted and amount is not None:
+                    amount_by_session.setdefault(bar_session, amount)
                 if not good:
                     if reason:
                         baseline_issues.append(reason)
                     continue
-                if bar_signature != signature:
-                    baseline_issues.append("source_signature_mismatch")
-                    continue
-                if bar_unit != unit:
+                if unit is None or bar_unit != unit:
                     baseline_issues.append("volume_unit_conflict")
                     continue
                 if (
@@ -637,23 +797,50 @@ class PriceVolumeAnalyzer:
                 ):
                     continue
                 by_session[bar_session] = volume
-                if len(by_session) >= baseline_sessions:
+                if (
+                    len(by_session) >= baseline_sessions
+                    and len(amount_by_session) >= baseline_sessions
+                ):
                     break
             values = list(by_session.values())
+            amount_values = list(amount_by_session.values())
             baseline = (
                 statistics.median(values) if values else 0.0,
                 len(values),
+                statistics.median(amount_values) if amount_values else 0.0,
+                len(amount_values),
                 tuple(dict.fromkeys(baseline_issues)),
             )
-            self._baseline_cache[cache_key] = baseline
-        median_volume, sample_count, baseline_issues = baseline
+            if (
+                (len(values) >= min_samples and baseline[0] > 0)
+                or (len(amount_values) >= min_samples and baseline[2] > 0)
+            ):
+                self._baseline_cache[cache_key] = baseline
+        median_volume, volume_sample_count, median_amount, amount_sample_count, baseline_issues = baseline
         current_volume = _number(current.get("volume"), positive=True)
+        current_amount = _number(current.get("amount"), positive=True)
         volume_ratio = (
             round(current_volume / median_volume, 4)
             if current_volume is not None and median_volume > 0
             else None
         )
-        if sample_count < min_samples or volume_ratio is None:
+        amount_ratio = (
+            round(current_amount / median_amount, 4)
+            if current_amount is not None and median_amount > 0
+            else None
+        )
+        amount_ready = amount_sample_count >= min_samples and amount_ratio is not None
+        volume_ready = volume_sample_count >= min_samples and volume_ratio is not None
+        confirmation_ratio = amount_ratio if amount_ready else volume_ratio if volume_ready else None
+        confirmation_metric = (
+            "same_bucket_5m_amount_ratio"
+            if amount_ready
+            else "same_bucket_5m_volume_ratio"
+            if volume_ready
+            else None
+        )
+        sample_count = amount_sample_count if amount_ready else volume_sample_count
+        if (require_pattern and not volume_ready) or confirmation_ratio is None:
             return (
                 _insufficient(
                     [*baseline_issues, "insufficient_same_time_baseline"],
@@ -665,25 +852,37 @@ class PriceVolumeAnalyzer:
 
         contraction = float(policy.get("contraction_ratio", 0.8))
         expansion = float(policy.get("expansion_ratio", 1.5))
-        if volume_ratio < contraction:
+        activity_ratio = volume_ratio if require_pattern else confirmation_ratio
+        assert activity_ratio is not None
+        if activity_ratio < contraction:
             volume_state = "contracted"
-        elif volume_ratio >= expansion:
+        elif activity_ratio >= expansion:
             volume_state = "expanded"
         else:
             volume_state = "normal"
         if not require_pattern:
+            interpretation = price_volume_interpretation(None, confidence="low")
+            interpretation["meaning"] = (
+                f"当前{('成交额' if confirmation_metric == 'same_bucket_5m_amount_ratio' else '成交量')}为同时间基准的 {activity_ratio:.2f} 倍，"
+                "但此规则只要求计算量比，未启用方向形态判断。"
+            )
             return (
                 {
                     "status": "ready",
                     "regime": None,
                     "volume_state": volume_state,
                     "volume_ratio": volume_ratio,
+                    "amount_ratio": amount_ratio,
+                    "confirmation_ratio": confirmation_ratio,
+                    "confirmation_metric": confirmation_metric,
                     "baseline_samples": sample_count,
                     "three_bar_return_bps": None,
                     "latest_return_bps": None,
                     "close_location": None,
                     "accelerated_decline": False,
                     "reason_codes": ["volume_ratio_only", f"volume_{volume_state}"],
+                    "interpretation": interpretation,
+                    **_bar_volume_metadata(current, scope="live"),
                 },
                 current.get("bar_time"),
             )
@@ -698,7 +897,7 @@ class PriceVolumeAnalyzer:
                 bar,
                 accepted_statuses=accepted,
             )
-            if good and bar_signature == signature and bar_unit == unit:
+            if good and bar_unit == unit:
                 current_session.append((bar_time, bar))
         if len(current_session) < 4:
             return (
@@ -775,7 +974,17 @@ class PriceVolumeAnalyzer:
                 else "neutral"
             )
         else:
-            regime = "high_volume_stall" if volume_state == "expanded" else "neutral"
+            regime = (
+                "high_volume_absorption"
+                if volume_state == "expanded" and close_location is not None and close_location >= 0.65
+                else "high_volume_rejection"
+                if volume_state == "expanded" and close_location is not None and close_location <= 0.35
+                else "high_volume_stall"
+                if volume_state == "expanded"
+                else "low_volume_balance"
+                if volume_state == "contracted"
+                else "neutral"
+            )
 
         previous_drop = numeric_closes[-2] / numeric_closes[-3] - 1
         latest_drop = numeric_closes[-1] / numeric_closes[-2] - 1
@@ -819,7 +1028,7 @@ class PriceVolumeAnalyzer:
             and numeric_volumes[-3] > numeric_volumes[-2] > numeric_volumes[-1]
         ):
             reasons.append("take_profit_price_up_volume_down")
-        if regime == "high_volume_stall":
+        if regime in {"high_volume_stall", "high_volume_rejection"}:
             reasons.append("take_profit_high_volume_stall")
         if (
             high is not None
@@ -843,6 +1052,117 @@ class PriceVolumeAnalyzer:
                 "close_location": close_location,
                 "accelerated_decline": accelerated_decline,
                 "reason_codes": list(dict.fromkeys(reasons)),
+                "interpretation": price_volume_interpretation(
+                    regime,
+                    accelerated_decline=accelerated_decline,
+                    confidence=(
+                        "high"
+                        if volume_state == "expanded" and regime != "high_volume_stall"
+                        else "medium"
+                    ),
+                ),
+                **_bar_volume_metadata(current, scope="live"),
             },
             current.get("bar_time"),
         )
+
+    def analyze_historical(
+        self,
+        *,
+        market_store: Any,
+        symbol: str,
+        now_utc: datetime,
+        policy: dict[str, Any],
+        allow_single_source: bool = False,
+        interval: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the latest complete display-only price/volume conclusion.
+
+        The live analyzer deliberately rejects stale bars.  Historical fallback
+        evaluates a bounded set of prior closed endpoints with a synthetic
+        evaluation clock, then labels the result as historical.  Callers must
+        never feed this payload into monitoring-event evaluation.
+        """
+
+        selected_interval = str(interval or policy.get("interval") or "5m")
+        interval_minutes = {"1m": 1, "5m": 5}.get(selected_interval)
+        if interval_minutes is None:
+            return None
+        cache_key = (
+            symbol.upper(),
+            selected_interval,
+            bool(allow_single_source),
+            int(policy.get("baseline_sessions", 10)),
+            int(policy.get("min_samples", 5)),
+            float(policy.get("contraction_ratio", 0.8)),
+            float(policy.get("expansion_ratio", 1.5)),
+            float(policy.get("flat_return_bps", 10)),
+            float(policy.get("acceleration_multiplier", 1.2)),
+        )
+        try:
+            recent_rows = market_store.query_bars(
+                symbol=symbol,
+                interval=selected_interval,
+                adjustment="raw",
+                view="consensus",
+                limit=64,
+            )
+        except Exception:
+            return None
+        if not recent_rows:
+            return None
+        latest = recent_rows[-1]
+        data_version = (
+            latest.get("bar_time"),
+            latest.get("verified_at"),
+            latest.get("batch_id"),
+            latest.get("status"),
+            latest.get("volume_status"),
+            latest.get("volume"),
+        )
+        cached = self._historical_cache.get(cache_key)
+        if cached is not None and cached[0] == data_version:
+            return dict(cached[1])
+        try:
+            rows = market_store.query_bars(
+                symbol=symbol,
+                interval=selected_interval,
+                adjustment="raw",
+                view="consensus",
+                limit=3000,
+            )
+        except Exception:
+            return None
+        closed = self._closed_bars(rows, now_utc=now_utc, interval=selected_interval)
+        accepted = set(_ACCEPTED_STATUSES if allow_single_source else {"verified"})
+        candidates: list[tuple[datetime, dict[str, Any]]] = []
+        for bar_time, bar in reversed(closed):
+            good, _reason, _signature, unit = _bar_quality(
+                bar,
+                accepted_statuses=accepted,
+            )
+            if good and unit is not None:
+                candidates.append((bar_time, bar))
+            if len(candidates) >= 24:
+                break
+
+        for bar_time, bar in candidates:
+            synthetic_now = bar_time + timedelta(minutes=interval_minutes, seconds=1)
+            payload, evidence_time = self.analyze(
+                market_store=market_store,
+                symbol=symbol,
+                now_utc=synthetic_now,
+                policy=policy,
+                allow_single_source=allow_single_source,
+                interval=selected_interval,
+            )
+            if payload.get("status") != "ready":
+                continue
+            payload.update(_bar_volume_metadata(bar, scope="historical"))
+            payload["data_as_of"] = evidence_time or bar.get("bar_time")
+            payload["reason_codes"] = list(
+                dict.fromkeys([*(payload.get("reason_codes") or []), "historical_reference"])
+            )
+            self._historical_cache[cache_key] = (data_version, dict(payload))
+            return payload
+        return None

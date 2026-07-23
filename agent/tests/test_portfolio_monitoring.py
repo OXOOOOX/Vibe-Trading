@@ -115,6 +115,7 @@ def test_plan_check_frequency_cannot_be_slower_than_enabled_rule_bars() -> None:
 
     one_minute_rule = copy.deepcopy(plan)
     one_minute_rule["market_rules"][0]["parameters"]["interval"] = "1m"
+    one_minute_rule["watch_scenarios"][0]["trigger"]["interval"] = "1m"
     one_minute_rule["quote_tier"] = "normal"
     with pytest.raises(PlanValidationError, match="cannot be slower"):
         validate_plan(one_minute_rule, expected_symbol="600036.SH")
@@ -140,33 +141,29 @@ def test_planner_builds_a_labeled_two_sided_price_target_ladder() -> None:
 
     assert blocked == []
     assert plan is not None
-    price_rules = [rule for rule in plan["market_rules"] if rule["kind"].startswith("price_cross")]
+    price_rules = [rule for rule in plan["market_rules"] if rule["kind"].startswith("price_")]
     assert len(price_rules) == 4
     by_id = {rule["client_rule_id"]: rule for rule in price_rules}
-    assert by_id["add-position-watch-level-1"]["target_intent"] == "add_position"
-    assert by_id["add-position-watch-level-1"]["target_level"] == 1
-    assert by_id["stop-loss-level-2"]["target_intent"] == "stop_loss"
-    assert by_id["stop-loss-level-2"]["target_level"] == 2
-    assert by_id["take-profit-level-1"]["target_intent"] == "take_profit"
-    assert by_id["take-profit-level-2"]["target_level"] == 2
-    take_profit_basis = by_id["take-profit-level-1"]["calculation_basis"]
-    assert take_profit_basis["method"] == "range_upper_with_noise_buffer"
-    assert take_profit_basis["recommended_value"] == pytest.approx(41.0)
-    assert "2026-06-20 高点" in take_profit_basis["summary"]
-    assert "震荡区间上沿" in take_profit_basis["method_label"]
-    stop_loss_basis = by_id["stop-loss-level-2"]["calculation_basis"]
-    assert stop_loss_basis["recommended_value"] == pytest.approx(37.1)
-    assert "2026-06-01 低点" in stop_loss_basis["summary"]
-    assert by_id["add-position-watch-level-1"]["calculation_basis"]["formula"] == "(最新价 + L2 止损点) ÷ 2"
-    assert "等距延展" in by_id["take-profit-level-2"]["calculation_basis"]["method_label"]
-    assert (
-        by_id["stop-loss-level-2"]["parameters"]["threshold"]
-        < by_id["add-position-watch-level-1"]["parameters"]["threshold"]
-        < 40.0
-        < by_id["take-profit-level-1"]["parameters"]["threshold"]
-        < by_id["take-profit-level-2"]["parameters"]["threshold"]
+    assert by_id["support-zone-test"]["kind"] == "price_zone_enter"
+    assert by_id["support-zone-test"]["target_intent"] == "add_position"
+    assert by_id["support-zone-test"]["target_level"] == 1
+    assert by_id["support-invalidation"]["target_intent"] == "stop_loss"
+    assert by_id["support-invalidation"]["target_level"] == 2
+    assert by_id["resistance-zone-test"]["target_intent"] == "take_profit"
+    assert by_id["resistance-breakout-confirmation"]["target_level"] == 2
+    assert all(
+        rule["calculation_basis"]["method"] == "multi_method_level_evidence"
+        for rule in price_rules
     )
-    assert evidence["target_ladder"]["upside"][1]["level"] == 2
+    assert (
+        by_id["support-invalidation"]["parameters"]["threshold"]
+        < by_id["support-zone-test"]["parameters"]["upper"]
+        < 40.0
+        < by_id["resistance-zone-test"]["parameters"]["lower"]
+        < by_id["resistance-breakout-confirmation"]["parameters"]["threshold"]
+    )
+    assert evidence["target_ladder"]["support"][0]["candidate_id"]
+    assert evidence["target_ladder"]["resistance"][0]["candidate_id"]
 
     invalid_intent = copy.deepcopy(plan)
     invalid_intent["market_rules"][0]["target_intent"] = "automatic_trade"
@@ -184,13 +181,13 @@ def test_planner_builds_a_labeled_two_sided_price_target_ladder() -> None:
         validate_plan(invalid_basis, expected_symbol="600036.SH")
 
 
-def test_v3_alert_cue_contract_and_planner_defaults() -> None:
+def test_v5_alert_cue_contract_and_planner_defaults() -> None:
     plan, _evidence, blocked = MonitoringPlanner(FakeMarketService()).build(
         {"symbol": "600036.SH", "name": "test", "quantity": 1, "cost_price": 38}
     )
     assert blocked == []
     assert plan is not None
-    assert plan["schema_version"] == 3
+    assert plan["schema_version"] == 5
     assert {rule["alert_cue"] for rule in plan["market_rules"]} == {"none"}
 
     above_indexes = [
@@ -210,15 +207,14 @@ def test_v3_alert_cue_contract_and_planner_defaults() -> None:
     assert normalized["market_rules"][above_indexes[0]]["alert_cue"] == "ymca_v1"
     assert normalized["market_rules"][below_indexes[0]]["alert_cue"] == "ymca_v1"
 
-    duplicate = copy.deepcopy(selected)
-    duplicate["market_rules"][above_indexes[1]]["alert_cue"] = "ymca_v1"
-    with pytest.raises(PlanValidationError, match="at most one price_cross_above"):
-        validate_plan(duplicate, expected_symbol="600036.SH")
-
-    duplicate_below = copy.deepcopy(selected)
-    duplicate_below["market_rules"][below_indexes[1]]["alert_cue"] = "ymca_v1"
-    with pytest.raises(PlanValidationError, match="at most one price_cross_below"):
-        validate_plan(duplicate_below, expected_symbol="600036.SH")
+    invalid_zone_cue = copy.deepcopy(selected)
+    zone_index = next(
+        index for index, rule in enumerate(invalid_zone_cue["market_rules"])
+        if rule["kind"] == "price_zone_enter"
+    )
+    invalid_zone_cue["market_rules"][zone_index]["alert_cue"] = "ymca_v1"
+    with pytest.raises(PlanValidationError, match="only allowed"):
+        validate_plan(invalid_zone_cue, expected_symbol="600036.SH")
 
     disabled = copy.deepcopy(selected)
     disabled["market_rules"][above_indexes[0]]["enabled"] = False
@@ -344,25 +340,14 @@ def test_autopilot_event_persists_holding_name(tmp_path, monkeypatch) -> None:
         fingerprint="approaching-600036",
     )
 
-    assert trigger is not None
-    assert trigger["payload"]["holding_name"] == "招商银行"
+    assert trigger is None
+    assert service.store.list_autopilot_triggers(limit=10) == []
 
 
 def test_monitoring_episode_dedup_and_outbox_are_durable(tmp_path, monkeypatch) -> None:
     service = _service(tmp_path, monkeypatch)
-    target = service.store.bind_target(channel="feishu", chat_id="ou_test")
-    batch = service.create_draft_batch(["600036.SH"], target["target_id"])
-    assert batch["status"] == "completed"
-    item = batch["items"][0]
-    assert item["status"] == "ready"
-
-    profile = service.store.activate(item["profile_id"], item["plan_version"], max_active=10)
-    plan = profile["plans"][0]["plan"]
-    threshold = next(
-        rule["parameters"]["threshold"]
-        for rule in plan["market_rules"]
-        if rule["kind"] == "price_cross_above"
-    )
+    profile, selected = _activate_single_cross_above(service)
+    threshold = selected["parameters"]["threshold"]
     quote = {
         "last_price": threshold - 1,
         "interval": "5m",
@@ -652,6 +637,42 @@ def test_monitoring_binding_code_api_claim_flow(tmp_path, monkeypatch) -> None:
     assert claimed.json()["target"]["chat_id"] == "ou_bound"
 
 
+def test_global_feishu_delivery_settings_resolve_multiple_targets_without_guessing(
+    tmp_path, monkeypatch
+) -> None:
+    service = _service(tmp_path, monkeypatch)
+    monkeypatch.setattr(api_server, "_portfolio_monitoring_service", service)
+    first = service.store.bind_target(
+        channel="feishu", chat_id="oc_global_one", chat_type="group"
+    )
+    second = service.store.bind_target(
+        channel="feishu", chat_id="ou_global_two", chat_type="p2p"
+    )
+    client = TestClient(api_server.app, client=("127.0.0.1", 50000))
+
+    unresolved = client.get("/settings/feishu-delivery")
+    assert unresolved.status_code == 200
+    assert unresolved.json()["requires_selection"] is True
+    assert unresolved.json()["effective_target_id"] is None
+
+    updated = client.put(
+        "/settings/feishu-delivery",
+        json={"default_target_id": second["target_id"]},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["default_target_id"] == second["target_id"]
+    assert updated.json()["effective_target_id"] == second["target_id"]
+    assert updated.json()["requires_selection"] is False
+
+    revoked = client.post(
+        f"/settings/feishu-delivery/targets/{second['target_id']}/revoke"
+    )
+    assert revoked.status_code == 200
+    resolved = client.get("/settings/feishu-delivery").json()
+    assert resolved["default_target_id"] is None
+    assert resolved["effective_target_id"] == first["target_id"]
+
+
 def test_runtime_is_default_off(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("VIBE_TRADING_MONITORING_ENABLED", raising=False)
     monkeypatch.delenv("VIBE_TRADING_MONITORING_MODE", raising=False)
@@ -743,7 +764,39 @@ def test_activation_requires_an_active_delivery_target(tmp_path, monkeypatch) ->
 def _activate(service: MonitoringService) -> dict:
     target = service.store.bind_target(channel="feishu", chat_id="ou_test")
     item = service.create_draft_batch(["600036.SH"], target["target_id"])["items"][0]
+    profile = service.store.get_profile(item["profile_id"])
+    assert profile is not None
+    plan = _legacy_evaluator_plan(profile["plans"][0]["plan"])
+    service.store.update_draft(
+        item["profile_id"],
+        item["plan_version"],
+        plan,
+        expected_revision=profile["profile_revision"],
+    )
     return service.store.activate(item["profile_id"], item["plan_version"], max_active=10)
+
+
+def _legacy_evaluator_plan(plan: dict) -> dict:
+    """Keep low-level evaluator regressions independent from v5 episode UX."""
+
+    value = copy.deepcopy(plan)
+    value["schema_version"] = 3
+    value.pop("analysis_ref", None)
+    value.pop("watch_scenarios", None)
+    value.pop("automation_policy", None)
+    for rule in value["market_rules"]:
+        if rule["kind"] != "price_zone_enter":
+            continue
+        parameters = rule["parameters"]
+        if rule.get("target_intent") == "add_position":
+            rule["kind"] = "price_cross_below"
+            parameters["threshold"] = parameters.pop("upper")
+        else:
+            rule["kind"] = "price_cross_above"
+            parameters["threshold"] = parameters.pop("lower")
+        parameters.pop("lower", None)
+        parameters.pop("upper", None)
+    return value
 
 
 def _activate_single_cross_above(
@@ -755,9 +808,11 @@ def _activate_single_cross_above(
     item = service.create_draft_batch(["600036.SH"], target["target_id"])["items"][0]
     profile = service.store.get_profile(item["profile_id"])
     assert profile is not None
-    plan = copy.deepcopy(profile["plans"][0]["plan"])
+    plan = _legacy_evaluator_plan(profile["plans"][0]["plan"])
     selected = next(
-        rule for rule in plan["market_rules"] if rule["kind"] == "price_cross_above"
+        rule for rule in plan["market_rules"]
+        if rule["kind"] == "price_cross_above"
+        and int(rule["parameters"]["confirmation_count"]) == 2
     )
     for rule in plan["market_rules"]:
         rule["enabled"] = rule["client_rule_id"] == selected["client_rule_id"]
@@ -1231,13 +1286,8 @@ def test_shadow_replay_persists_would_deliver_without_outbound_call(
     monkeypatch,
 ) -> None:
     service = _service(tmp_path, monkeypatch)
-    profile = _activate(service)
-    plan = service.store.get_plan(profile["profile_id"], int(profile["active_plan_version"]))
-    threshold = next(
-        rule["parameters"]["threshold"]
-        for rule in plan["plan"]["market_rules"]
-        if rule["kind"] == "price_cross_above"
-    )
+    profile, selected = _activate_single_cross_above(service)
+    threshold = selected["parameters"]["threshold"]
     result = replay_quotes(
         service.store,
         profile["profile_id"],
@@ -1294,18 +1344,49 @@ def test_shadow_replay_persists_would_deliver_without_outbound_call(
     assert calls == 0
 
 
-def test_global_kill_switch_suppresses_already_pending_delivery(
+def test_historical_price_volume_never_creates_live_price_volume_events(
     tmp_path,
     monkeypatch,
 ) -> None:
     service = _service(tmp_path, monkeypatch)
     profile = _activate(service)
-    plan = service.store.get_plan(profile["profile_id"], int(profile["active_plan_version"]))
-    threshold = next(
-        rule["parameters"]["threshold"]
-        for rule in plan["plan"]["market_rules"]
-        if rule["kind"] == "price_cross_above"
+    historical = {
+        **_ready_price_volume(accelerated=True),
+        "analysis_scope": "historical",
+        "data_as_of": "2026-07-11T06:55:00+00:00",
+    }
+
+    events = service.store.evaluate_quote(
+        profile["profile_id"],
+        {
+            "last_price": 40.0,
+            "interval": "5m",
+            "bar_time": "2026-07-14T02:05:00+00:00",
+            "status": "verified",
+            "sources": ["tencent", "mootdx"],
+            "historical_price_volume": historical,
+        },
+        delivery_mode="shadow",
+        price_volume_mode="deliver",
     )
+
+    assert all(event["kind"] != "price_volume_accelerated_decline" for event in events)
+    with service.store.connect() as connection:
+        price_volume_states = connection.execute(
+            """SELECT COUNT(*) FROM monitor_signal_states
+               WHERE profile_id=? AND signal_type='price_volume'""",
+            (profile["profile_id"],),
+        ).fetchone()[0]
+    assert price_volume_states == 0
+
+
+def test_global_kill_switch_suppresses_already_pending_delivery(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    service = _service(tmp_path, monkeypatch)
+    profile, selected = _activate_single_cross_above(service)
+    threshold = selected["parameters"]["threshold"]
     replay_quotes(
         service.store,
         profile["profile_id"],
@@ -1881,7 +1962,7 @@ def test_monitoring_schema_migrates_shadow_delivery_columns(tmp_path) -> None:
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()[0]
     assert {"delivery_mode", "would_deliver", "suppressed_at", "suppression_reason"} <= columns
-    assert version == "9"
+    assert version == "10"
 
 
 def test_v5_rule_migration_backfills_targets_and_disables_legacy_cues(
@@ -1963,7 +2044,7 @@ def test_v5_rule_migration_backfills_targets_and_disables_legacy_cues(
         "target_level": 1,
         "alert_cue": "none",
     }
-    assert version == "9"
+    assert version == "10"
 
 
 def test_monitoring_maintenance_backs_up_and_prunes_unreferenced_data(
@@ -2069,14 +2150,20 @@ def _price_volume_rows(
 
 
 @pytest.mark.parametrize(
-    ("closes", "latest_volume", "expected_regime", "expected_volume_state"),
+    (
+        "closes",
+        "latest_volume",
+        "expected_regime",
+        "expected_volume_state",
+        "expected_bias",
+    ),
     [
-        ([100, 100.2, 100.4, 100.6], 200, "bullish_expansion", "expanded"),
-        ([100, 100.2, 100.4, 100.6], 50, "bullish_contraction", "contracted"),
-        ([100, 99.8, 99.6, 99.4], 200, "bearish_expansion", "expanded"),
-        ([100, 99.8, 99.6, 99.4], 50, "bearish_contraction", "contracted"),
-        ([100, 100.02, 100.01, 100.03], 200, "high_volume_stall", "expanded"),
-        ([100, 100.02, 100.01, 100.03], 100, "neutral", "normal"),
+        ([100, 100.2, 100.4, 100.6], 200, "bullish_expansion", "expanded", "bullish"),
+        ([100, 100.2, 100.4, 100.6], 50, "bullish_contraction", "contracted", "mixed"),
+        ([100, 99.8, 99.6, 99.4], 200, "bearish_expansion", "expanded", "bearish"),
+        ([100, 99.8, 99.6, 99.4], 50, "bearish_contraction", "contracted", "mixed"),
+        ([100, 100.02, 100.01, 100.03], 200, "high_volume_absorption", "expanded", "mixed"),
+        ([100, 100.02, 100.01, 100.03], 100, "neutral", "normal", "neutral"),
     ],
 )
 def test_price_volume_analyzer_classifies_same_bucket_regimes(
@@ -2084,6 +2171,7 @@ def test_price_volume_analyzer_classifies_same_bucket_regimes(
     latest_volume,
     expected_regime,
     expected_volume_state,
+    expected_bias,
 ) -> None:
     store = _PriceVolumeRowsStore(_price_volume_rows(closes, latest_volume))
     analyzer = PriceVolumeAnalyzer()
@@ -2099,6 +2187,10 @@ def test_price_volume_analyzer_classifies_same_bucket_regimes(
     assert result["volume_state"] == expected_volume_state
     assert result["volume_ratio"] == pytest.approx(latest_volume / 100)
     assert result["baseline_samples"] == 10
+    assert result["interpretation"]["bias"] == expected_bias
+    assert result["interpretation"]["meaning"]
+    assert result["interpretation"]["risk"]
+    assert result["interpretation"]["next_confirmation"]
     assert evidence_bar_time == "2026-07-14T01:50:00+00:00"
     assert store.limits == [64, 2000]
 
@@ -2111,8 +2203,18 @@ def test_price_volume_analyzer_classifies_same_bucket_regimes(
     assert repeated["volume_ratio"] == result["volume_ratio"]
     assert store.limits == [64, 2000, 64]
 
+    analyzer.invalidate(["600036.SH"])
+    refreshed, _ = analyzer.analyze(
+        market_store=store,
+        symbol="600036.SH",
+        now_utc=datetime(2026, 7, 14, 1, 57, tzinfo=timezone.utc),
+        policy=dict(DEFAULT_PRICE_VOLUME_POLICY),
+    )
+    assert refreshed["status"] == "ready"
+    assert store.limits == [64, 2000, 64, 64, 2000]
 
-def test_price_volume_baseline_uses_median_and_fails_closed_on_incompatible_history() -> None:
+
+def test_price_volume_baseline_uses_median_and_allows_source_rotation() -> None:
     outlier_rows = _price_volume_rows([100, 100.2, 100.4, 100.6], 200)
     outlier_rows[0]["volume"] = 10000
     outlier, _ = PriceVolumeAnalyzer().analyze(
@@ -2125,8 +2227,16 @@ def test_price_volume_baseline_uses_median_and_fails_closed_on_incompatible_hist
     assert outlier["volume_ratio"] == pytest.approx(2.0)
 
     source_mismatch = _price_volume_rows([100, 100.2, 100.4, 100.6], 200)
+    for row in source_mismatch:
+        row["volume_status"] = "verified"
+        row["volume_unit"] = "shares"
+        row["volume_sources"] = list(row["sources"])
+        for observation in row["observations"]:
+            observation["volume_unit"] = "share"
+            observation["included_in_volume_consensus"] = True
     for row in source_mismatch[:6]:
         row["sources"] = ["tencent"]
+        row["volume_sources"] = ["tencent"]
         row["observations"] = [row["observations"][0]]
     mismatched, _ = PriceVolumeAnalyzer().analyze(
         market_store=_PriceVolumeRowsStore(source_mismatch),
@@ -2134,12 +2244,9 @@ def test_price_volume_baseline_uses_median_and_fails_closed_on_incompatible_hist
         now_utc=datetime(2026, 7, 14, 1, 55, tzinfo=timezone.utc),
         policy=dict(DEFAULT_PRICE_VOLUME_POLICY),
     )
-    assert mismatched["status"] == "insufficient_data"
-    assert mismatched["baseline_samples"] == 4
-    assert mismatched["reason_codes"] == [
-        "source_signature_mismatch",
-        "insufficient_same_time_baseline",
-    ]
+    assert mismatched["status"] == "ready"
+    assert mismatched["baseline_samples"] == 10
+    assert mismatched["volume_ratio"] == pytest.approx(2.0)
 
     conflict = _price_volume_rows([100, 100.2, 100.4, 100.6], 200)
     for row in conflict[-4:]:
@@ -2155,6 +2262,32 @@ def test_price_volume_baseline_uses_median_and_fails_closed_on_incompatible_hist
         "volume_conflict",
         "no_actionable_closed_bar",
     ]
+
+
+def test_price_volume_historical_fallback_is_timestamped_and_display_only() -> None:
+    store = _PriceVolumeRowsStore(_price_volume_rows([100, 100.2, 100.4, 100.6], 200))
+    analyzer = PriceVolumeAnalyzer()
+
+    live, _ = analyzer.analyze(
+        market_store=store,
+        symbol="600036.SH",
+        now_utc=datetime(2026, 7, 15, 1, 55, tzinfo=timezone.utc),
+        policy=dict(DEFAULT_PRICE_VOLUME_POLICY),
+    )
+    historical = analyzer.analyze_historical(
+        market_store=store,
+        symbol="600036.SH",
+        now_utc=datetime(2026, 7, 15, 1, 55, tzinfo=timezone.utc),
+        policy=dict(DEFAULT_PRICE_VOLUME_POLICY),
+    )
+
+    assert live["status"] == "insufficient_data"
+    assert "stale_price_volume_bar" in live["reason_codes"]
+    assert historical is not None
+    assert historical["status"] == "ready"
+    assert historical["analysis_scope"] == "historical"
+    assert historical["data_as_of"] == "2026-07-14T01:50:00+00:00"
+    assert "historical_reference" in historical["reason_codes"]
 
 
 def test_volume_ratio_only_uses_rule_history_and_does_not_require_four_bars() -> None:
@@ -2175,6 +2308,30 @@ def test_volume_ratio_only_uses_rule_history_and_does_not_require_four_bars() ->
     assert result["volume_ratio"] == pytest.approx(1.8)
     assert result["reason_codes"] == ["volume_ratio_only", "volume_expanded"]
     assert store.limits == [64, 2000]
+
+
+def test_confirmation_gate_prefers_amount_when_volume_contract_conflicts() -> None:
+    rows = _price_volume_rows([100, 100.1, 100.2, 100.3], 18_000)
+    for row in rows:
+        row["amount"] = 1_000
+        row["volume_status"] = "conflict"
+        row["quality_flags"] = ["volume_conflict"]
+    rows[-1]["amount"] = 1_600
+    rows = [*rows[:10], rows[-1]]
+
+    result, _ = PriceVolumeAnalyzer().analyze(
+        market_store=_PriceVolumeRowsStore(rows),
+        symbol="600036.SH",
+        now_utc=datetime(2026, 7, 14, 1, 52, tzinfo=timezone.utc),
+        policy={**DEFAULT_PRICE_VOLUME_POLICY, "interval": "1m"},
+        interval="1m",
+        require_pattern=False,
+    )
+
+    assert result["status"] == "ready"
+    assert result["confirmation_metric"] == "same_bucket_5m_amount_ratio"
+    assert result["confirmation_ratio"] == pytest.approx(1.6)
+    assert result["amount_ratio"] == pytest.approx(1.6)
 
 
 def test_price_volume_baseline_prefers_targeted_same_bucket_cache_query() -> None:
@@ -2274,6 +2431,8 @@ def test_price_volume_analyzer_detects_accelerated_decline() -> None:
     assert result["accelerated_decline"] is True
     assert result["close_location"] == pytest.approx(0.1)
     assert "accelerated_decline" in result["reason_codes"]
+    assert result["interpretation"]["bias"] == "bearish"
+    assert "下跌加速" in result["interpretation"]["meaning"]
 
     only_two_consecutive_declines, _ = PriceVolumeAnalyzer().analyze(
         market_store=_PriceVolumeRowsStore(
@@ -2423,7 +2582,12 @@ def test_v2_plus_policy_validation_and_v1_price_only_compatibility() -> None:
     assert blocked == []
     assert plan is not None
     assert plan["schema_version"] >= 2
-    assert plan["price_volume_policy"] == DEFAULT_PRICE_VOLUME_POLICY
+    assert plan["price_volume_policy"] == {
+        **DEFAULT_PRICE_VOLUME_POLICY,
+        "baseline_sessions": 20,
+        "min_samples": 10,
+        "expansion_ratio": 1.2,
+    }
 
     invalid = copy.deepcopy(plan)
     invalid["price_volume_policy"]["expansion_ratio"] = 0.9
@@ -3022,7 +3186,7 @@ def test_mixed_intervals_cannot_reopen_another_rules_target_episode(
     target = service.store.bind_target(channel="feishu", chat_id="ou_mixed_intervals")
     item = service.create_draft_batch(["600036.SH"], target["target_id"])["items"][0]
     profile = service.store.get_profile(item["profile_id"])
-    plan = copy.deepcopy(profile["plans"][0]["plan"])
+    plan = _legacy_evaluator_plan(profile["plans"][0]["plan"])
     add_rule = next(
         rule for rule in plan["market_rules"] if rule["target_intent"] == "add_position"
     )
@@ -3081,7 +3245,10 @@ def test_near_target_uses_near_trigger_tier() -> None:
     plan["quote_tier"] = "normal"
     plan["near_trigger_tier"] = "active"
     plan["near_trigger_distance_bps"] = 100
-    plan["market_rules"] = [copy.deepcopy(plan["market_rules"][0])]
+    cross_rule = next(
+        rule for rule in plan["market_rules"] if rule["kind"] == "price_cross_above"
+    )
+    plan["market_rules"] = [copy.deepcopy(cross_rule)]
     plan["market_rules"][0]["parameters"]["threshold"] = 40.2
 
     assert MonitoringRuntime._effective_quote_tier(plan, {"last_price": 40.0}) == "active"
@@ -3153,7 +3320,7 @@ def test_explicit_volume_ratio_rule_triggers_clears_and_rearms_when_price_volume
     item = service.create_draft_batch(["600036.SH"], target["target_id"])["items"][0]
     profile = service.store.get_profile(item["profile_id"])
     assert profile is not None
-    plan = copy.deepcopy(profile["plans"][0]["plan"])
+    plan = _legacy_evaluator_plan(profile["plans"][0]["plan"])
     plan["market_rules"].append({
         "client_rule_id": "volume-expansion",
         "kind": "volume_ratio_above",
