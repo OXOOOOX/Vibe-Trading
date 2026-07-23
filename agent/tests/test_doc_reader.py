@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -138,6 +139,24 @@ def test_pptx_slides(tmp_path: Path) -> None:
     assert result["format"] == "pptx"
     assert result["slides"] == 1
     assert "Alpha Title" in result["text"]
+
+
+def test_pdf_uses_pure_python_text_extraction(tmp_path: Path) -> None:
+    from reportlab.pdfgen import canvas
+
+    buffer = BytesIO()
+    document = canvas.Canvas(buffer)
+    document.drawString(72, 720, "Traceable PDF evidence")
+    document.save()
+    path = tmp_path / "evidence.pdf"
+    path.write_bytes(buffer.getvalue())
+
+    result = _call(path)
+
+    assert result["status"] == "ok"
+    assert result["total_pages"] == 1
+    assert result["ocr_pages"] == 0
+    assert "Traceable PDF evidence" in result["text"]
 
 
 # ---------------- Error handling ----------------

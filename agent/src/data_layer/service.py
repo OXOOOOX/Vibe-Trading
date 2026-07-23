@@ -135,7 +135,7 @@ class UnifiedDataService:
         requested_days = max(int(lookback_days or 0), 0)
         effective_days = max(requested_days, int(profile["lookback_days"]))
         include_set = {entry.strip().lower() for entry in (include or ["market", "fundamentals", "news", "reports"])}
-        invalid_include = include_set - {"market", "fundamentals", "news", "reports"}
+        invalid_include = include_set - {"market", "fundamentals", "news", "reports", "etf_product"}
         if invalid_include:
             raise ValueError(f"unsupported data domains: {', '.join(sorted(invalid_include))}")
         live = bool(profile["live"] if force_live is None else force_live)
@@ -226,6 +226,10 @@ class UnifiedDataService:
                 tasks.append(("news", pool.submit(self._research_context, "news", symbols, started, cancel_event)))
             if "reports" in include:
                 tasks.append(("reports", pool.submit(self._research_context, "report", symbols, started, cancel_event)))
+            if "etf_product" in include:
+                tasks.append(("etf_product", pool.submit(
+                    self._etf_product_context, symbols, live, started, cancel_event
+                )))
             done, _ = wait([task for _, task in tasks], timeout=max(0.1, _LIVE_TIMEOUT_SECONDS - (time.monotonic() - started)))
             if len(done) != len(tasks):
                 # Every data task checks this before starting another provider or
@@ -587,6 +591,79 @@ class UnifiedDataService:
         }
 
     @staticmethod
+    def _etf_product_context(
+        symbols: list[str],
+        force_refresh: bool,
+        started: float,
+        cancel_event: threading.Event,
+    ) -> dict[str, Any]:
+        """Return ETF share-change flow separately from order-size flow."""
+
+        from src.portfolio.instruments import infer_portfolio_instrument_type
+        from src.reports.etf_product_profile import get_etf_product_profile_service
+
+        service = get_etf_product_profile_service()
+        items: dict[str, Any] = {}
+        errors: dict[str, str] = {}
+        for symbol in symbols:
+            if cancel_event.is_set():
+                errors[symbol] = "request deadline reached"
+                continue
+            if infer_portfolio_instrument_type(symbol) != "etf":
+                items[symbol] = {
+                    "status": "not_applicable",
+                    "symbol": symbol,
+                    "reason": "instrument is not an ETF",
+                }
+                continue
+            try:
+                profile = service.get_or_refresh(symbol, force_refresh=force_refresh)
+                share = dict(profile.get("share_history") or {})
+                peer = dict(profile.get("peer_group") or {})
+                items[symbol] = {
+                    "status": str(profile.get("quality_status") or "partial"),
+                    "symbol": symbol,
+                    "metric_family": "etf_fund_unit_change_estimated_flow",
+                    "data_as_of": profile.get("data_as_of"),
+                    "retrieved_at": profile.get("retrieved_at"),
+                    "fund_units": share.get("current_units"),
+                    "fund_unit_delta_1d": share.get("delta_1d"),
+                    "estimated_net_flow_1d": share.get("estimated_net_flow_1d"),
+                    "estimated_net_flow_unit": "CNY",
+                    "estimated_net_flow_semantics": share.get("estimated_net_flow_semantics"),
+                    "peer_group": {
+                        "tracked_index_code": peer.get("tracked_index_code"),
+                        "member_count": peer.get("member_count"),
+                        "estimated_net_flow_1d": peer.get("estimated_net_flow_1d"),
+                        "unit_change_coverage_ratio": peer.get("unit_change_coverage_ratio"),
+                    },
+                    "source_ids": sorted({
+                        str(item.get("source_id"))
+                        for item in (profile.get("sources") or [])
+                        if isinstance(item, dict) and item.get("source_id")
+                    }),
+                    "coverage": peer.get("unit_change_coverage_ratio"),
+                    "disclaimer": (
+                        "Estimated flow is fund-unit/share change multiplied by an available "
+                        "exchange price or NAV proxy. It is not turnover, order-size flow, or "
+                        "fund-company-confirmed subscriptions/redemptions."
+                    ),
+                }
+            except Exception as exc:  # noqa: BLE001 - one ETF must not abort the batch
+                errors[symbol] = str(exc)
+        actionable = [
+            item for item in items.values()
+            if item.get("status") not in {"not_applicable", "failed_validation"}
+        ]
+        return {
+            "status": "verified" if actionable and not errors else "partial" if items else "offline",
+            "metric_family": "etf_fund_unit_change_estimated_flow",
+            "items": items,
+            "errors": errors,
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
+
+    @staticmethod
     def _is_preopen_intraday_bar(
         symbol: str, interval: str, latest: dict[str, Any] | None
     ) -> bool:
@@ -691,7 +768,35 @@ class UnifiedDataService:
                 source = envelope.get("source")
                 self._record_research_sources(kind, symbol, source, succeeded=True, latency_ms=round((time.monotonic() - before) * 1000, 1))
                 self._record_declared_source_statuses(kind, data.get("source_statuses"))
-                self.research.replace_documents(kind, symbol, [item for item in documents if isinstance(item, dict)], source=str(source) if source else None)
+                normalized_documents = [
+                    item for item in documents if isinstance(item, dict)
+                ]
+                self.research.replace_documents(
+                    kind,
+                    symbol,
+                    normalized_documents,
+                    source=str(source) if source else None,
+                )
+                try:
+                    from src.research import (
+                        get_source_ingestion_service,
+                        knowledge_enabled,
+                    )
+
+                    if knowledge_enabled():
+                        get_source_ingestion_service().ingest_provider_documents(
+                            kind=kind,
+                            symbol=symbol,
+                            documents=normalized_documents,
+                            provider_id=str(source or "unknown"),
+                            origin_type="data_context",
+                            origin_id=(
+                                f"data-context:{symbol}:{kind}:{int(started * 1000)}"
+                            ),
+                        )
+                except Exception:
+                    # Unified archiving is a shadow write; provider data remains usable.
+                    pass
                 output["items"][symbol] = {
                     "mode": "live",
                     "source": source,
@@ -1003,7 +1108,24 @@ class UnifiedDataService:
                     "status": "not_requested",
                     "actionability": "analysis_only",
                     "as_of": None,
-                    "reason": "fund flow is provided by a separate live tool",
+                    "reason": "compatibility alias; use order_flow or etf_share_flow",
+                },
+                "order_flow": {
+                    "status": "not_requested",
+                    "actionability": "analysis_only",
+                    "as_of": None,
+                    "metric_family": "secondary_market_order_size_net_flow",
+                    "reason": "order-size flow is provided by get_fund_flow",
+                },
+                "etf_share_flow": {
+                    "status": str(
+                        (((research.get("etf_product") or {}).get("items") or {}).get(symbol) or {}).get("status")
+                        or "not_requested"
+                    ),
+                    "actionability": "analysis_only",
+                    "as_of": (((research.get("etf_product") or {}).get("items") or {}).get(symbol) or {}).get("data_as_of"),
+                    "metric_family": "etf_fund_unit_change_estimated_flow",
+                    "reason": (((research.get("etf_product") or {}).get("items") or {}).get(symbol) or {}).get("disclaimer"),
                 },
                 "news": self._research_scope(research, "news", symbol),
                 "fundamentals": self._research_scope(research, "fundamentals", symbol),
@@ -1183,6 +1305,18 @@ class UnifiedDataService:
             ("research_cache", self.research.path),
         ]:
             entries.append({"kind": kind, "path": str(path), "bytes": path.stat().st_size if path.exists() else 0})
+        research_objects = Path(
+            os.getenv(
+                "VIBE_TRADING_RESEARCH_OBJECT_DIR",
+                str(self.research.path.parent / "research_objects"),
+            )
+        ).expanduser()
+        if research_objects.exists():
+            entries.append({
+                "kind": "research_objects",
+                "path": str(research_objects),
+                "bytes": self._dir_size(research_objects),
+            })
         loader_path = self._loader_cache_path()
         if loader_path is not None:
             entries.append({"kind": "loader_cache", "path": str(loader_path), "bytes": self._dir_size(loader_path)})
@@ -1255,12 +1389,26 @@ class UnifiedDataService:
         if not symbols:
             raise ValueError("no holdings or explicit watchlist symbols to prewarm")
         purpose = "intraday" if phase == "intraday" else "premarket"
-        return self.get_context(
+        result = self.get_context(
             symbols=symbols,
             purpose=purpose,
             include=["market", "news", "reports"],
             force_live=True,
         )
+        try:
+            from src.research import get_official_filing_service, knowledge_enabled
+
+            if knowledge_enabled():
+                result["official_filings"] = get_official_filing_service().refresh_many(
+                    symbols,
+                    force=False,
+                )
+        except Exception as exc:
+            result["official_filings"] = {
+                "status": "completed_with_gaps",
+                "error": str(exc),
+            }
+        return result
 
 
 _service: UnifiedDataService | None = None

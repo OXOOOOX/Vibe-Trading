@@ -6,6 +6,8 @@ from src.market_cache.service import (
     MarketRefreshService,
     _actual_adjustment,
     _source_fingerprint,
+    _volume_consensus,
+    _volume_policy,
     source_candidates,
 )
 from src.market_cache.storage import MarketCacheStore
@@ -79,6 +81,170 @@ def test_schema_is_idempotent_and_running_jobs_are_interrupted(tmp_path) -> None
 
     assert store.mark_running_interrupted() == 1
     assert store.get_run("run-1")["status"] == "interrupted"
+
+
+def test_volume_consensus_fails_closed_when_units_conflict() -> None:
+    result = _volume_consensus([
+        {"actual_source": "source-a", "volume": 10_000, "volume_unit": "shares"},
+        {"actual_source": "source-b", "volume": 10_000, "volume_unit": "lots"},
+    ])
+
+    assert result["status"] == "conflict"
+    assert result["volume"] is None
+    assert result["unit"] is None
+    assert result["sources"] == []
+
+
+def test_mootdx_china_volume_is_normalized_from_lots_to_shares() -> None:
+    assert _volume_policy("mootdx", "000651.SZ", "1D") == ("lot", 100.0)
+    assert _volume_policy("mootdx", "000651.SZ", "1m") == ("share", 1.0)
+
+
+def test_mootdx_volume_contract_migration_preserves_raw_evidence(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch, lambda **kwargs: _outcome(kwargs))
+    outcome = _outcome(
+        {
+            "requested_source": "mootdx",
+            "start_date": "2026-07-10",
+            "end_date": "2026-07-10",
+            "adjustment": "raw",
+        },
+        actual_source="mootdx",
+    )
+    normalized = service._normalize_records(
+        outcome,
+        symbol="000651.SZ",
+        interval="1D",
+        batch_id="legacy",
+        acquisition_mode="cache",
+    )[0]
+    legacy = dict(normalized, volume=normalized["raw_volume"], volume_unit="share")
+    service.store.upsert_source_bars([legacy])
+
+    assert service.store.migrate_mootdx_volume_contract_v3() == [("000651.SZ", "1D", "raw")]
+    migrated = service.store.source_bars("000651.SZ", "1D", "raw")[0]
+    assert migrated["raw_volume"] == 100
+    assert migrated["raw_volume_unit"] == "lot"
+    assert migrated["volume"] == 10_000
+    assert migrated["volume_unit"] == "share"
+    assert service.store.migrate_mootdx_volume_contract_v3() == []
+
+
+def test_mootdx_intraday_migration_restores_share_unit(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch, lambda **kwargs: _outcome(kwargs))
+    outcome = _outcome(
+        {
+            "requested_source": "mootdx",
+            "start_date": "2026-07-10",
+            "end_date": "2026-07-10",
+            "adjustment": "raw",
+        },
+        actual_source="mootdx",
+    )
+    normalized = service._normalize_records(
+        outcome,
+        symbol="000651.SZ",
+        interval="1m",
+        batch_id="legacy-intraday",
+        acquisition_mode="cache",
+    )[0]
+    corrupted = dict(
+        normalized,
+        volume=normalized["raw_volume"] * 100,
+        raw_volume_unit="lot",
+    )
+    service.store.upsert_source_bars([corrupted])
+
+    assert service.store.migrate_mootdx_intraday_volume_contract_v4() == [
+        ("000651.SZ", "1m", "raw")
+    ]
+    repaired = service.store.source_bars("000651.SZ", "1m", "raw")[0]
+    assert repaired["raw_volume"] == 100
+    assert repaired["raw_volume_unit"] == "share"
+    assert repaired["volume"] == 100
+
+
+def test_baostock_etf_qfq_rows_are_quarantined_as_unverified_source_default(
+    tmp_path, monkeypatch
+) -> None:
+    service = _service(tmp_path, monkeypatch, lambda **kwargs: _outcome(kwargs))
+    probe = _outcome(
+        {
+            "requested_source": "baostock",
+            "start_date": "2026-07-10",
+            "end_date": "2026-07-10",
+            "adjustment": "qfq",
+        },
+        actual_source="baostock",
+    )
+    normalized = service._normalize_records(
+        probe,
+        symbol="159516.SZ",
+        interval="1D",
+        batch_id="legacy-qfq",
+        acquisition_mode="cache",
+    )
+    service.store.upsert_source_bars(normalized)
+
+    assert service.store.migrate_etf_adjustment_contract_v2() == ["159516.SZ"]
+    assert service.store.source_bars("159516.SZ", "1D", "qfq") == []
+    quarantined = service.store.source_bars("159516.SZ", "1D", "source_default")
+    assert len(quarantined) == 1
+    assert quarantined[0]["adjustment_confidence"] == "provider_etf_adjustment_unverified"
+    assert service.store.migrate_etf_adjustment_contract_v2() == []
+
+
+def test_two_continuous_qfq_sources_validate_event_factor(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch, lambda **kwargs: _outcome(kwargs))
+    start = date(2026, 1, 1)
+    raw_records = []
+    qfq_records = []
+    for offset in range(130):
+        day = start + timedelta(days=offset)
+        raw_close = 100.0 if offset < 80 else 50.0
+        raw_records.append({
+            "trade_date": day.isoformat(), "open": raw_close, "high": raw_close + 1,
+            "low": raw_close - 1, "close": raw_close, "volume": 1000,
+            "amount": raw_close * 1000,
+        })
+        qfq_records.append({
+            "trade_date": day.isoformat(), "open": 50.0, "high": 51.0,
+            "low": 49.0, "close": 50.0, "volume": 2000,
+            "amount": 100_000,
+        })
+
+    def normalized(source: str, adjustment: str, records: list[dict]):
+        return service._normalize_records(
+            {
+                "requested_source": source,
+                "actual_source": source,
+                "adapter_name": "tests.fake",
+                "source_fingerprint": source,
+                "requested_adjustment": adjustment,
+                "actual_adjustment": adjustment,
+                "adjustment_confidence": "test",
+                "records": records,
+            },
+            symbol="159999.SZ",
+            interval="1D",
+            batch_id=f"{source}-{adjustment}",
+            acquisition_mode="cache",
+        )
+
+    for source in ("raw-a", "raw-b"):
+        service.store.upsert_source_bars(normalized(source, "raw", raw_records))
+    service._recompute_consensus("159999.SZ", "1D", "raw", "test-factor")
+    for source in ("qfq-a", "qfq-b"):
+        service.store.upsert_source_bars(normalized(source, "qfq", qfq_records))
+
+    candidates = service.derive_adjustment_factor_candidates("159999.SZ")
+    rows = service.store.list_adjustment_factors("159999.SZ")
+
+    assert len(candidates) == 2
+    assert {row["source"] for row in rows} == {
+        "derived_qfq:qfq-a", "derived_qfq:qfq-b",
+    }
+    assert {row["factor"] for row in rows} == {0.5}
 
 
 def test_daily_upserts_remove_legacy_timestamp_variants(tmp_path, monkeypatch) -> None:
@@ -168,6 +334,9 @@ def test_a_share_raw_sources_try_fast_independent_pair_first() -> None:
     ]
     assert source_candidates("600036.SH", "1D", "qfq") == [
         "tencent", "baostock", "eastmoney", "akshare",
+    ]
+    assert source_candidates("159516.SZ", "1D", "qfq") == [
+        "tencent", "eastmoney",
     ]
     assert source_candidates("UNRESOLVED", "1D", "raw") == []
 
@@ -543,6 +712,55 @@ def test_third_source_excludes_one_price_outlier(tmp_path, monkeypatch) -> None:
     assert summary["source_count"] == 2
     assert excluded["included_in_consensus"] is False
     assert excluded["exclude_reason"] == "price_outlier"
+
+
+def test_intraday_mootdx_volume_uses_same_share_contract_as_other_cn_sources(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    raw_volumes = {"tencent": 100, "mootdx": 10_100, "eastmoney": 102}
+    calls: list[str] = []
+
+    def fetcher(**kwargs):
+        source = kwargs["requested_source"]
+        calls.append(source)
+        outcome = _outcome(kwargs, actual_source=source, close=2.0)
+        outcome["records"] = [{
+            "trade_date": "2026-07-10 10:00:00",
+            "open": 2.0,
+            "high": 2.01,
+            "low": 1.99,
+            "close": 2.0,
+            "volume": raw_volumes[source],
+            "amount": 20_200,
+        }]
+        return outcome
+
+    service = _service(tmp_path, monkeypatch, fetcher)
+    service.refresh_sync(
+        symbols=["588870.SH"],
+        profile="volume-majority",
+        sources=["tencent", "mootdx", "eastmoney"],
+        start_date="2026-07-10",
+        end_date="2026-07-10",
+        items=[("5m", "raw")],
+        require_volume_quorum=True,
+    )
+
+    summary = service.store.cache_summaries()[0]
+    assert calls == ["tencent", "mootdx"]
+    assert summary["status"] == "verified"
+    assert summary["volume_status"] == "verified"
+    assert summary["volume_source_count"] == 2
+    assert summary["volume_sources"] == ["tencent", "mootdx"]
+    assert summary["volume"] == 10_050
+    mootdx = next(
+        row for row in summary["observations"] if row["actual_source"] == "mootdx"
+    )
+    assert mootdx["raw_volume"] == 10_100
+    assert mootdx["raw_volume_unit"] == "share"
+    assert mootdx["volume"] == 10_100
+    assert mootdx["included_in_volume_consensus"] is True
 
 
 def test_adjustments_are_isolated_and_amount_builds_vwap(tmp_path, monkeypatch) -> None:

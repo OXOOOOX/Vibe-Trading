@@ -145,6 +145,7 @@ export default function MarketCacheKlineDialog({ symbol, name, cacheRows, onClos
     [bars, interval],
   );
   const latest = bars.length > 0 ? bars[bars.length - 1] : undefined;
+  const displayName = name ? `${name}（${symbol.split(".")[0]}）` : symbol;
 
   return (
     <div
@@ -164,11 +165,11 @@ export default function MarketCacheKlineDialog({ symbol, name, cacheRows, onClos
             <div className="flex items-center gap-2">
               <ChartCandlestick className="h-4 w-4 shrink-0" />
               <h2 id="market-cache-chart-title" className="truncate text-sm font-semibold">
-                {symbol} K线检阅
+                {displayName} K线检阅
               </h2>
             </div>
             <p className="mt-1 truncate text-xs text-muted-foreground">
-              {name || "缓存行情"} · SQLite 共识数据
+              {name ? symbol : "缓存行情"} · SQLite 共识数据
             </p>
           </div>
           <button

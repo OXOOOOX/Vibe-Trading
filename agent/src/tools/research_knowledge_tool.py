@@ -52,12 +52,17 @@ class QueryResearchKnowledgeTool(BaseTool):
     name = "query_research_knowledge"
     description = (
         "Query verified historical research Facts, source Evidence, prior Claims, and "
-        "report-to-report changes. Prior Claims are context only and never new Evidence."
+        "report-to-report changes. command=financials replays validated structured "
+        "official filing snapshots without downloading or OCRing the filing again. "
+        "Prior Claims are context only and never new Evidence."
     )
     parameters = {
         "type": "object",
         "properties": {
-            "command": {"type": "string", "enum": ["history", "search", "inspect", "diff"]},
+            "command": {
+                "type": "string",
+                "enum": ["history", "search", "inspect", "diff", "financials"],
+            },
             "symbol": {"type": "string"},
             "query": {"type": "string"},
             "domains": {"type": "array", "items": {"type": "string"}},
@@ -78,6 +83,12 @@ class QueryResearchKnowledgeTool(BaseTool):
         store = get_research_knowledge_store()
         if command == "history":
             result = store.history(str(kwargs.get("symbol") or ""), limit=int(kwargs.get("limit") or 20))
+        elif command == "financials":
+            result = store.list_financial_snapshots(
+                str(kwargs.get("symbol") or ""),
+                validated_only=True,
+                limit=int(kwargs.get("limit") or 20),
+            )
         elif command == "diff":
             refs = [str(item) for item in kwargs.get("refs") or [] if str(item)]
             if not refs:
