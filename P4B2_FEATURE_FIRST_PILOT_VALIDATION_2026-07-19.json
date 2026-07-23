@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "result": "completed",
+  "mode": "feature_first",
+  "provider": "openai-codex",
+  "model": "gpt-5.6-terra",
+  "scope": {
+    "etf_symbol": "588870.SH",
+    "component_symbols": ["688256.SH", "688041.SH", "688981.SH"],
+    "expanded": false
+  },
+  "relaxed_gates": [
+    "daily_component_budget",
+    "daily_model_call_budget",
+    "component_output_token_budget",
+    "daily_output_token_budget"
+  ],
+  "retained_gates": [
+    "exact_component_scope",
+    "component_input_token_budget",
+    "batch_input_token_budget",
+    "complete_evidence_pack",
+    "evidence_id_allowlist",
+    "structured_output_validation",
+    "future_data_exclusion",
+    "transactional_publication",
+    "single_flight",
+    "idempotency"
+  ],
+  "backup": {
+    "path": "C:\\Users\\23479\\.vibe-trading\\cache\\backups\\research_cache.pre-p4b2.20260718T164042Z.sqlite3",
+    "size_bytes": 24182784,
+    "sha256": "ceae883676564e27ef066b6d43ae681237414f1d48374186aa0ed1dc970c600c"
+  },
+  "preflight": {
+    "preflight_id": "p4b2preflight_07901abe8b281ab1a7216a1f",
+    "passed": true,
+    "blocked_reasons": [],
+    "estimated_input_tokens": 17207
+  },
+  "plan": {
+    "plan_id": "p4b2plan_83804aef10b2067a306de9d1",
+    "status": "completed",
+    "dry_run": false,
+    "authorized": true,
+    "job_statuses": ["published", "published", "published"]
+  },
+  "jobs": [
+    {
+      "component_symbol": "688256.SH",
+      "job_id": "p4b2job_bdf43871947bdec3aca77eb8",
+      "status": "published",
+      "input_tokens": 1896,
+      "output_tokens": 1340,
+      "publish_id": "p4b2publish_757296df66cd186ef69ff75a",
+      "report_id": "componentreport_bdf43871947bdec3aca77eb8",
+      "p4b1_status_after": "partial_reusable"
+    },
+    {
+      "component_symbol": "688041.SH",
+      "job_id": "p4b2job_93eaee6ab13e2f295858d46a",
+      "status": "published",
+      "input_tokens": 1869,
+      "output_tokens": 1304,
+      "publish_id": "p4b2publish_c2f094dc9ff483e5bb52e374",
+      "report_id": "componentreport_93eaee6ab13e2f295858d46a",
+      "p4b1_status_after": "partial_reusable"
+    },
+    {
+      "component_symbol": "688981.SH",
+      "job_id": "p4b2job_83c2ee6a38a899edb794bcb5",
+      "status": "published",
+      "input_tokens": 1852,
+      "output_tokens": 1350,
+      "publish_id": "p4b2publish_59c5a64325a153b76d438706",
+      "report_id": "componentreport_83c2ee6a38a899edb794bcb5",
+      "p4b1_status_after": "partial_reusable"
+    }
+  ],
+  "batch_actual": {
+    "model_calls": 3,
+    "input_tokens": 5617,
+    "output_tokens": 3994,
+    "publish_results": 3,
+    "component_research_reports": 3,
+    "claims": 21,
+    "all_claims_sourced": true
+  },
+  "knowledge_links_per_report": {
+    "evidence": 5,
+    "facts": 3,
+    "claims": 7
+  },
+  "idempotency_check": {
+    "second_execution_model_calls": 0,
+    "same_publish_results": true,
+    "budget_unchanged": true
+  },
+  "runtime_api": {
+    "health": "healthy",
+    "report_library_http_status": 200,
+    "report_count": 3,
+    "plan_status": "completed",
+    "job_statuses": ["published", "published", "published"],
+    "digest_statuses": ["partial_reusable", "partial_reusable", "partial_reusable"]
+  },
+  "fixes_during_validation": [
+    "future analysis cutoff can no longer shadow the current digest",
+    "plan status is aggregated from current job states",
+    "plan API hydrates current job payloads"
+  ],
+  "safety": {
+    "database_integrity_check": "ok",
+    "persistent_generation_gate": false,
+    "persistent_live_run_gate": false,
+    "pdf_generated": false,
+    "artifact_links_created": 0,
+    "scope_expanded": false
+  },
+  "verification": {
+    "tests_passed": 61,
+    "tests_failed": 0,
+    "git_diff_check": "passed"
+  }
+}
