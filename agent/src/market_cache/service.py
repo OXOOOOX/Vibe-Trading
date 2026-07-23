@@ -31,7 +31,7 @@ FetchSource = Callable[..., dict[str, Any]]
 TERMINAL_RUN_STATUSES = {"completed", "partial", "failed", "interrupted"}
 PROFILE_ITEMS: tuple[tuple[str, str, int, int], ...] = (
     ("1m", "raw", 10, 5),
-    ("5m", "raw", 35, 20),
+    ("5m", "raw", 90, 60),
     ("1D", "raw", 1100, 750),
     ("1D", "qfq", 1100, 750),
 )
@@ -223,12 +223,15 @@ def _normalize_bar_time(value: Any, symbol: str, interval: str, source: str) -> 
     return utc.isoformat(), local.date().isoformat()
 
 
-def _volume_policy(source: str, symbol: str) -> tuple[str, float]:
+def _volume_policy(source: str, symbol: str, interval: str = "1D") -> tuple[str, float]:
     is_a_share = symbol.upper().endswith((".SH", ".SZ", ".BJ"))
+    if is_a_share and source == "mootdx":
+        # TDX daily bars encode volume in lots, while its minute records are
+        # already shares.  Applying one multiplier to both intervals merely
+        # moves the 100x conflict from daily to intraday confirmation.
+        return ("lot", 100.0) if interval == "1D" else ("share", 1.0)
     if is_a_share and source in {"tencent", "eastmoney"}:
         return "lot", 100.0
-    if is_a_share and source == "mootdx":
-        return "share", 1.0
     return "unknown", 1.0
 
 
@@ -374,10 +377,15 @@ def source_candidates(symbol: str, interval: str, adjustment: str) -> list[str]:
             # throttled or temporarily closes connections.
             return ["tencent", "mootdx", "eastmoney"]
         if adjustment == "qfq":
-            # BaoStock is slower than Tencent but much less prone to public-HTTP
-            # throttling than Eastmoney.  Put the reliable quorum pair first;
-            # the remaining adapters are only needed for failure/conflict.
-            return ["tencent", "baostock", "eastmoney", "akshare"]
+            is_etf = upper[:2] in {"15", "16", "50", "51", "52", "56", "58"}
+            # BaoStock's ETF path has returned raw-equivalent rows under an
+            # adjustflag request. ETFs therefore require two providers whose
+            # returned series actually proves qfq continuity.
+            return (
+                ["tencent", "eastmoney"]
+                if is_etf
+                else ["tencent", "baostock", "eastmoney", "akshare"]
+            )
         return ["tencent", "mootdx", "eastmoney"]
     if upper.endswith(".US"):
         if interval in {"1m", "5m"}:
@@ -415,6 +423,93 @@ def _spread(values: list[float]) -> float | None:
         return 0.0 if values else None
     median = statistics.median(values)
     return ((max(values) - min(values)) / median * 100.0) if median else None
+
+
+def _canonical_volume_unit(value: Any) -> str | None:
+    unit = str(value or "").strip().lower()
+    if unit in {"share", "shares"}:
+        return "shares"
+    if unit in {"lot", "lots"}:
+        return "lots"
+    if unit in {"cny", "rmb", "yuan"}:
+        return "CNY"
+    return None
+
+
+def _volume_consensus(
+    observations: list[dict[str, Any]],
+    *,
+    tolerance_pct: float = 5.0,
+) -> dict[str, Any]:
+    """Resolve volume independently from price using a same-unit majority."""
+
+    valid_by_source: dict[str, tuple[dict[str, Any], float, str]] = {}
+    for row in observations:
+        volume = _float(row.get("volume"))
+        unit = _canonical_volume_unit(row.get("volume_unit"))
+        if volume is not None and volume > 0 and unit is not None:
+            source = str(row.get("actual_source") or row.get("source") or "").strip()
+            if source:
+                valid_by_source[source] = (row, volume, unit)
+    valid = list(valid_by_source.values())
+    if not valid:
+        return {
+            "status": "unavailable",
+            "volume": None,
+            "unit": None,
+            "sources": [],
+            "included": [],
+            "spread_pct": None,
+        }
+
+    best: tuple[float, list[tuple[dict[str, Any], float, str]]] | None = None
+    units = sorted({unit for _, _, unit in valid})
+    for unit in units:
+        candidates = sorted(
+            (item for item in valid if item[2] == unit),
+            key=lambda item: item[1],
+        )
+        for left_index in range(len(candidates)):
+            for right_index in range(left_index + 1, len(candidates)):
+                cluster = candidates[left_index : right_index + 1]
+                values = [item[1] for item in cluster]
+                spread = float(_spread(values) or 0.0)
+                if spread > tolerance_pct:
+                    break
+                if best is None or len(cluster) > len(best[1]) or (
+                    len(cluster) == len(best[1]) and spread < best[0]
+                ):
+                    best = (spread, cluster)
+
+    if best is not None:
+        spread, included = best
+        values = [item[1] for item in included]
+        return {
+            "status": "verified",
+            "volume": float(statistics.median(values)),
+            "unit": included[0][2],
+            "sources": [str(item[0]["actual_source"]) for item in included],
+            "included": [item[0] for item in included],
+            "spread_pct": spread,
+        }
+    if len(valid) == 1:
+        row, volume, unit = valid[0]
+        return {
+            "status": "single_source",
+            "volume": volume,
+            "unit": unit,
+            "sources": [str(row["actual_source"])],
+            "included": [row],
+            "spread_pct": 0.0,
+        }
+    return {
+        "status": "conflict",
+        "volume": None,
+        "unit": valid[0][2] if len({item[2] for item in valid}) == 1 else None,
+        "sources": [],
+        "included": [],
+        "spread_pct": _spread([item[1] for item in valid]),
+    }
 
 
 def _price_tolerance(*, price: float, interval: str, tick_size: float) -> float:
@@ -476,7 +571,131 @@ class MarketRefreshService:
                 "price-basis-contract-v2",
             )
             self.store.refresh_latest_quote(symbol)
+        volume_targets = self.store.volume_consensus_v2_targets()
+        for symbol, interval, adjustment in volume_targets:
+            self._recompute_consensus(
+                symbol,
+                interval,
+                adjustment,
+                "volume-consensus-v2",
+            )
+            self.store.refresh_latest_quote(symbol)
+        self.store.mark_volume_consensus_v2_complete()
+        volume_v3_targets = self.store.migrate_mootdx_volume_contract_v3()
+        for symbol, interval, adjustment in volume_v3_targets:
+            self._recompute_consensus(
+                symbol,
+                interval,
+                adjustment,
+                "mootdx-volume-contract-v3",
+            )
+            self.store.refresh_latest_quote(symbol)
+        volume_v4_targets = self.store.migrate_mootdx_intraday_volume_contract_v4()
+        for symbol, interval, adjustment in volume_v4_targets:
+            self._recompute_consensus(
+                symbol,
+                interval,
+                adjustment,
+                "mootdx-intraday-volume-contract-v4",
+            )
+            self.store.refresh_latest_quote(symbol)
+        self.store.migrate_raw_volume_unit_contract_v5()
+        adjustment_symbols = self.store.migrate_etf_adjustment_contract_v2()
+        for symbol in adjustment_symbols:
+            self._recompute_consensus(
+                symbol,
+                "1D",
+                "qfq",
+                "etf-adjustment-contract-v2",
+            )
         return interrupted
+
+    def derive_adjustment_factor_candidates(
+        self,
+        symbol: str,
+        *,
+        raw_bars: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Derive factor evidence only from qfq series continuous across a reset."""
+
+        from src.portfolio.analysis_methods import analyze_price_continuity
+
+        normalized_symbol = symbol.upper()
+        raw = raw_bars or self.store.query_bars(
+            symbol=normalized_symbol,
+            interval="1D",
+            adjustment="raw",
+            view="consensus",
+            limit=1000,
+        )
+        events = list(
+            analyze_price_continuity(raw, factor_rows=[]).get("events") or []
+        )
+        if not events:
+            return []
+        raw_by_date = {
+            str(row.get("session_date") or row.get("bar_time") or "")[:10]: row
+            for row in raw
+            if row.get("close") is not None
+        }
+        ordered_dates = sorted(raw_by_date)
+        qfq_rows = self.store.source_bars(normalized_symbol, "1D", "qfq")
+        by_source: dict[str, dict[str, dict[str, Any]]] = {}
+        for row in qfq_rows:
+            source = str(row.get("actual_source") or "").lower()
+            day = str(row.get("session_date") or row.get("bar_time") or "")[:10]
+            if source and day and row.get("close") is not None:
+                by_source.setdefault(source, {})[day] = row
+
+        candidates: list[dict[str, Any]] = []
+        retrieved_at = utc_now()
+        for event in events:
+            effective_date = str(event.get("effective_date") or "")[:10]
+            if effective_date not in raw_by_date:
+                continue
+            event_index = ordered_dates.index(effective_date)
+            before_dates = ordered_dates[max(0, event_index - 5) : event_index]
+            after_dates = ordered_dates[event_index : event_index + 5]
+            if not before_dates or not after_dates:
+                continue
+            for source, source_rows in by_source.items():
+                before_ratios = [
+                    float(source_rows[day]["close"]) / float(raw_by_date[day]["close"])
+                    for day in before_dates
+                    if day in source_rows and float(raw_by_date[day].get("close") or 0) > 0
+                ]
+                after_ratios = [
+                    float(source_rows[day]["close"]) / float(raw_by_date[day]["close"])
+                    for day in after_dates
+                    if day in source_rows and float(raw_by_date[day].get("close") or 0) > 0
+                ]
+                if len(before_ratios) < 2 or len(after_ratios) < 2:
+                    continue
+                prior_qfq = source_rows.get(before_dates[-1])
+                current_qfq = source_rows.get(after_dates[0])
+                if not prior_qfq or not current_qfq:
+                    continue
+                prior_close = float(prior_qfq.get("close") or 0)
+                current_close = float(current_qfq.get("close") or 0)
+                if prior_close <= 0 or abs(current_close / prior_close - 1) > 0.25:
+                    # A purported qfq series that kept the raw reset is not
+                    # adjustment evidence, irrespective of its request flag.
+                    continue
+                factor = statistics.median(before_ratios) / statistics.median(after_ratios)
+                if not math.isfinite(factor) or factor <= 0:
+                    continue
+                candidates.append(
+                    {
+                        "symbol": normalized_symbol,
+                        "effective_date": effective_date,
+                        "source": f"derived_qfq:{source}",
+                        "factor": round(factor, 10),
+                        "confidence": "independent_adjusted_source",
+                        "retrieved_at": retrieved_at,
+                    }
+                )
+        self.store.upsert_adjustment_factors(candidates)
+        return candidates
 
     def create_refresh(
         self,
@@ -489,6 +708,7 @@ class MarketRefreshService:
         end_date: str | None = None,
         items: list[tuple[str, str]] | None = None,
         read_only: bool = False,
+        require_volume_quorum: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         normalized = sorted({str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()})
         if not normalized:
@@ -501,6 +721,7 @@ class MarketRefreshService:
             "end_date": end_date,
             "items": item_specs,
             "read_only": bool(read_only),
+            "require_volume_quorum": bool(require_volume_quorum),
         }
         dedupe_payload = {"symbols": normalized, "profile": profile, **config}
         dedupe_key = _json_hash(dedupe_payload)
@@ -588,6 +809,7 @@ class MarketRefreshService:
                         explicit_end=config.get("end_date"),
                         deadline=deadline,
                         should_cancel=should_cancel,
+                        require_volume_quorum=bool(config.get("require_volume_quorum")),
                     )
                     if result["status"] == "interrupted":
                         interrupted = True
@@ -670,6 +892,7 @@ class MarketRefreshService:
         explicit_end: str | None,
         deadline: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        require_volume_quorum: bool = False,
     ) -> dict[str, Any]:
         default_sources = source_candidates(symbol, interval, adjustment)
         if sources:
@@ -718,7 +941,11 @@ class MarketRefreshService:
                 "bar_time": latest["bar_time"],
                 "close": float(latest["close"]),
                 "bars": {
-                    str(row["bar_time"]): float(row["close"])
+                    str(row["bar_time"]): {
+                        "close": float(row["close"]),
+                        "volume": _float(row.get("volume")),
+                        "volume_unit": _canonical_volume_unit(row.get("volume_unit")),
+                    }
                     for row in bars[-20:]
                     if row.get("close") is not None
                 },
@@ -735,12 +962,12 @@ class MarketRefreshService:
                 return False, False
             grouped_successes: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for success in successes.values():
-                for candidate_time, candidate_close in success["bars"].items():
+                for candidate_time, candidate in success["bars"].items():
                     grouped_successes[candidate_time].append(
                         {
                             **success,
                             "bar_time": candidate_time,
-                            "close": candidate_close,
+                            **candidate,
                         }
                     )
             newest_time = max(
@@ -767,7 +994,24 @@ class MarketRefreshService:
                 for left_index, left in enumerate(group)
                 for right in group[left_index + 1:]
             )
-            return has_quorum, any(len(group) >= 3 for group in recent_groups.values())
+            has_volume_quorum = any(
+                left.get("volume") is not None
+                and right.get("volume") is not None
+                and left.get("volume_unit") is not None
+                and left.get("volume_unit") == right.get("volume_unit")
+                and float(_spread([float(left["volume"]), float(right["volume"])]) or 0.0) <= 5.0
+                for group in recent_groups.values()
+                for left_index, left in enumerate(group)
+                for right in group[left_index + 1:]
+            )
+            return (
+                has_quorum and (
+                    has_volume_quorum
+                    or not require_volume_quorum
+                    or interval not in {"1m", "5m"}
+                ),
+                any(len(group) >= 3 for group in recent_groups.values()),
+            )
 
         def should_stop_after(index: int) -> bool:
             has_quorum, has_three_sources = confirmation_state()
@@ -1142,7 +1386,7 @@ class MarketRefreshService:
         acquisition_mode: str,
     ) -> list[dict[str, Any]]:
         source = str(outcome["actual_source"])
-        unit, multiplier = _volume_policy(source, symbol)
+        unit, multiplier = _volume_policy(source, symbol, interval)
         result: list[dict[str, Any]] = []
         for record in outcome.get("records") or []:
             timestamp = (
@@ -1189,6 +1433,7 @@ class MarketRefreshService:
                     "close": close,
                     "volume": volume,
                     "raw_volume": raw_volume,
+                    "raw_volume_unit": unit,
                     "volume_unit": "share" if volume is not None else unit,
                     "amount": amount,
                     "vwap": vwap,
@@ -1237,7 +1482,8 @@ class MarketRefreshService:
                     "adjustment_confidence": first["adjustment_confidence"],
                     "open": payload["open"], "high": payload["high"], "low": payload["low"],
                     "close": payload["close"], "volume": volume,
-                    "raw_volume": None, "volume_unit": "share" if volume is not None else "unknown",
+                    "raw_volume": None, "raw_volume_unit": "share",
+                    "volume_unit": "share" if volume is not None else "unknown",
                     "amount": amount,
                     "vwap": amount / volume if amount is not None and volume not in (None, 0) else None,
                     "retrieved_at": utc_now(), "batch_id": batch_id,
@@ -1368,12 +1614,19 @@ class MarketRefreshService:
             ):
                 flags.append("forming_bar")
 
-            volumes = [float(row["volume"]) for row in included if row["volume"] is not None]
+            volume_consensus = _volume_consensus(observations)
+            volume_included = list(volume_consensus["included"])
             amounts = [float(row["amount"]) for row in included if row["amount"] is not None]
-            volume_spread = _spread(volumes) if included and len(volumes) == len(included) else None
+            volume_spread = volume_consensus["spread_pct"]
             amount_spread = _spread(amounts) if included and len(amounts) == len(included) else None
-            if volume_spread is not None and volume_spread > 5:
+            if volume_consensus["status"] == "conflict":
                 flags.append("volume_conflict")
+            elif volume_consensus["status"] == "verified" and len(volume_included) < len(
+                [row for row in observations if _float(row.get("volume")) is not None]
+            ):
+                flags.append("volume_outlier_excluded")
+            elif volume_consensus["status"] == "unavailable":
+                flags.append("volume_unavailable")
             if amount_spread is not None and amount_spread > 5:
                 flags.append("amount_conflict")
 
@@ -1389,6 +1642,7 @@ class MarketRefreshService:
                     "date": row["bar_time"],
                     "open": row["open"], "high": row["high"], "low": row["low"], "close": row["close"],
                     "volume": row["volume"], "raw_volume": row["raw_volume"],
+                    "raw_volume_unit": row.get("raw_volume_unit"),
                     "volume_unit": row["volume_unit"], "amount": row["amount"], "vwap": row["vwap"],
                     "requested_adjustment": row["requested_adjustment"],
                     "actual_adjustment": row["actual_adjustment"],
@@ -1398,16 +1652,28 @@ class MarketRefreshService:
                     "retrieved_at": row["retrieved_at"],
                     "batch_id": row["batch_id"],
                     "included_in_consensus": row in included,
+                    "included_in_volume_consensus": row in volume_included,
                     "exclude_reason": (
                         None if row in included
                         else "stale_observation" if row not in observations
                         else "price_outlier" if "outlier_excluded" in flags
                         else "no_source_majority"
                     ),
+                    "volume_exclude_reason": (
+                        None
+                        if row in volume_included
+                        else "volume_missing"
+                        if _float(row.get("volume")) is None
+                        else "volume_unit_unknown"
+                        if _canonical_volume_unit(row.get("volume_unit")) is None
+                        else "volume_outlier"
+                        if volume_consensus["status"] == "verified"
+                        else "volume_conflict"
+                    ),
                 }
                 for row in all_observations
             ]
-            volume = float(representative["volume"]) if representative and representative["volume"] is not None else None
+            volume = volume_consensus["volume"]
             amount = float(representative["amount"]) if representative and representative["amount"] is not None else None
             rows.append(
                 {
@@ -1417,7 +1683,12 @@ class MarketRefreshService:
                     "high": representative["high"] if representative else None,
                     "low": representative["low"] if representative else None,
                     "close": representative["close"] if representative else None,
-                    "volume": volume, "amount": amount,
+                    "volume": volume,
+                    "volume_status": volume_consensus["status"],
+                    "volume_source_count": len(volume_consensus["sources"]),
+                    "volume_sources_json": json.dumps(volume_consensus["sources"]),
+                    "volume_unit": volume_consensus["unit"],
+                    "amount": amount,
                     "vwap": amount / volume if amount is not None and volume not in (None, 0) else None,
                     "status": status, "price_spread_pct": price_spread,
                     "volume_spread_pct": volume_spread, "amount_spread_pct": amount_spread,

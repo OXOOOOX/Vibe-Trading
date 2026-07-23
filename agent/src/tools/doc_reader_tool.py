@@ -1,7 +1,7 @@
 """Universal document reader: dispatches by file extension.
 
 Supported formats:
-  - PDF (.pdf) — pypdfium2 + OCR fallback for image pages
+  - PDF (.pdf) — pure-Python pypdf text extraction
   - Word (.docx) — python-docx (paragraphs + table cells)
   - Excel (.xlsx/.xls) — pandas preview, all sheets
   - PowerPoint (.pptx) — python-pptx (slide text)
@@ -117,57 +117,42 @@ def _parse_pages(pages_str: str, total: int) -> list[int]:
 
 
 def _read_pdf(path: Path, pages: str) -> str:
-    """Extract PDF text; OCR pages with too little text."""
+    """Extract PDF text without loading native PDFium in the API process."""
     try:
-        import pypdfium2 as pdfium  # type: ignore
+        from pypdf import PdfReader  # type: ignore
     except ImportError:
-        return _err("pypdfium2 not installed; cannot read PDF")
+        return _err("pypdf not installed; cannot read PDF")
 
-    doc = pdfium.PdfDocument(str(path))
     try:
-        total_pages = len(doc)
+        doc = PdfReader(str(path))
+        total_pages = len(doc.pages)
         targets = _parse_pages(pages, total_pages) if pages.strip() else list(range(total_pages))
-        total_targets = len(targets)
         chunks: list[str] = []
-        ocr_pages = 0
+        image_only_pages: list[int] = []
         for idx, i in enumerate(targets, start=1):
             if not 0 <= i < total_pages:
                 continue
-            page = doc[i]
-            text = page.get_textpage().get_text_range().strip()
-            if len(text) >= _MIN_TEXT_PER_PAGE:
+            text = str(doc.pages[i].extract_text() or "").strip()
+            if text:
                 chunks.append(f"--- Page {i + 1} ---\n{text}")
-                emit_progress(
-                    "reading_pdf",
-                    current=idx,
-                    total=total_targets,
-                    message=f"page {i + 1}/{total_pages}",
-                )
-                continue
-            # OCR fallback for image pages
-            bitmap = page.render(scale=300 / 72)
-            img = bitmap.to_numpy()
-            ocr_text = _ocr_image_array(img)
-            if ocr_text.strip():
-                chunks.append(f"--- Page {i + 1} [OCR] ---\n{ocr_text}")
-                ocr_pages += 1
-            elif text:
-                chunks.append(f"--- Page {i + 1} ---\n{text}")
+            else:
+                image_only_pages.append(i + 1)
             emit_progress(
                 "reading_pdf",
                 current=idx,
-                total=total_targets,
-                message=f"page {i + 1}/{total_pages} (OCR)" if ocr_text.strip() else f"page {i + 1}/{total_pages}",
+                total=len(targets),
+                message=f"page {i + 1}/{total_pages}",
             )
         full = "\n\n".join(chunks)
         return _envelope(
             path, "pdf", full,
             total_pages=total_pages,
             pages_read=len(targets),
-            ocr_pages=ocr_pages,
+            ocr_pages=0,
+            image_only_pages=image_only_pages,
         )
-    finally:
-        doc.close()
+    except Exception as exc:
+        return _err(f"PDF text extraction failed with pypdf: {exc}")
 
 
 # ---------------- DOCX ----------------

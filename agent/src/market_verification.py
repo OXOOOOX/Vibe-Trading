@@ -130,6 +130,15 @@ def source_adjustment_policy(source: str, symbol: str) -> dict[str, Any]:
     is_cn = upper.endswith((".SH", ".SZ", ".BJ"))
     is_cn_etf = is_cn and upper[:2] in {"15", "16", "50", "51", "52", "56", "58"}
 
+    if src == "baostock" and is_cn_etf:
+        return {
+            "adjustment": "source_default",
+            "confidence": "provider_etf_adjustment_unverified",
+            "note": (
+                "BaoStock ETF rows can remain raw-equivalent even when "
+                "adjustflag=2 is requested; they cannot prove qfq continuity."
+            ),
+        }
     if src in {"tencent", "eastmoney", "baostock"}:
         return {
             "adjustment": "qfq",

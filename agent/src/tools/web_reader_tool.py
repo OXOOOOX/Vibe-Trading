@@ -7,6 +7,8 @@ import json
 import logging
 import re
 import time
+from pathlib import Path
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 import requests
@@ -14,7 +16,7 @@ import requests
 from src.agent.progress import emit_progress
 from src.agent.tools import BaseTool
 from src.security.scanner import with_security_warnings
-from src.usage import record_current_resource
+from src.usage import get_current_usage_recorder, record_current_resource
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +63,7 @@ def _url_allowed(url: str) -> tuple[bool, str]:
     return True, ""
 
 
-def read_url(url: str, no_cache: bool = False) -> str:
+def read_url(url: str, no_cache: bool = False, subject_key: str = "") -> str:
     """Fetch web page content via the Jina Reader API.
 
     The full URL (including query string) is sent to the third-party Jina
@@ -71,6 +73,8 @@ def read_url(url: str, no_cache: bool = False) -> str:
     Args:
         url: Target URL.
         no_cache: When true, ask the reader for a fresh (uncached) fetch.
+        subject_key: Optional normalized security symbol. Deep/research sessions
+            pass it so every opened page is attached to the subject dossier.
 
     Returns:
         JSON result with title, content, url; ``cached: true`` is added
@@ -132,16 +136,50 @@ def read_url(url: str, no_cache: bool = False) -> str:
 
         knowledge_payload: dict[str, object] = {}
         try:
-            from src.research import get_research_knowledge_store, knowledge_enabled
+            from src.research import (
+                get_research_knowledge_store,
+                knowledge_enabled,
+                market_for_symbol,
+            )
 
             if knowledge_enabled():
-                stored = get_research_knowledge_store().store_document(
+                knowledge = get_research_knowledge_store()
+                stored = knowledge.store_document(
                     url=target_url,
                     content=full_text,
                     title=title,
                     published_at=published_at or None,
                     cached_status=("jina_cache" if _CACHED_MARKER in full_text else "network"),
                 )
+                normalized_subject = str(subject_key or "").strip().upper()
+                if normalized_subject:
+                    recorder = get_current_usage_recorder()
+                    origin_id = (
+                        str(getattr(recorder, "attempt_id", "") or "")
+                        or str(getattr(recorder, "session_id", "") or "")
+                        or f"read-url:{stored.document_ref}"
+                    )
+                    document = knowledge.document(stored.document_ref) or {}
+                    knowledge.record_source_observation(
+                        document_ref=stored.document_ref,
+                        subject_key=normalized_subject,
+                        source_kind=(
+                            "official_filing"
+                            if document.get("source_class") == "regulatory_filing"
+                            else "news"
+                        ),
+                        origin_type="deep_research_web",
+                        origin_id=origin_id,
+                        market=market_for_symbol(normalized_subject),
+                        provider_id="jina_reader",
+                        verification_status=(
+                            "historical_context"
+                            if _CACHED_MARKER in full_text
+                            else "live_retrieved"
+                        ),
+                        body_status="full_text",
+                        metadata={"title": title, "url": target_url},
+                    )
                 knowledge_payload = {
                     "document_ref": stored.document_ref,
                     "canonical_url": stored.canonical_url,
@@ -226,11 +264,50 @@ class WebReaderTool(BaseTool):
         "properties": {
             "url": {"type": "string", "description": "URL of the web page to read"},
             "no_cache": {"type": "boolean", "description": "Request a fresh (uncached) fetch", "default": False},
+            "subject_key": {
+                "type": "string",
+                "description": "Optional normalized security symbol; attaches the opened page to that subject dossier.",
+            },
         },
         "required": ["url"],
     }
     repeatable = True
 
+    def __init__(
+        self,
+        default_session_id: str | None = None,
+        event_callback: Callable[[str, dict], None] | None = None,
+        session_store: Any | None = None,
+    ) -> None:
+        self.default_session_id = str(default_session_id or "")
+        self.event_callback = event_callback
+        self._session_store = session_store
+
+    def _session_subject_key(self) -> str:
+        if not self.default_session_id:
+            return ""
+        try:
+            if self._session_store is None:
+                from src.session.store import SessionStore
+
+                self._session_store = SessionStore(
+                    Path(__file__).resolve().parents[2] / "sessions"
+                )
+            session = self._session_store.get_session(self.default_session_id)
+            research = dict((session.config or {}).get("research_session") or {})
+            return str(
+                research.get("resolved_symbol") or research.get("symbol") or ""
+            ).strip().upper()
+        except Exception:
+            return ""
+
     def execute(self, **kwargs) -> str:
         """Fetch web page."""
-        return read_url(kwargs["url"], no_cache=bool(kwargs.get("no_cache", False)))
+        subject_key = str(
+            kwargs.get("subject_key") or self._session_subject_key() or ""
+        ).strip().upper()
+        return read_url(
+            kwargs["url"],
+            no_cache=bool(kwargs.get("no_cache", False)),
+            subject_key=subject_key,
+        )

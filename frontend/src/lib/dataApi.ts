@@ -20,7 +20,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
 export type DataStatus = "live" | "partial" | "offline" | "ok";
 export interface WatchlistEntry { symbol: string; added_at: string; note: string | null }
-export interface CoverageRow { symbol: string; actual_source: string; interval: string; actual_adjustment: string; min_bar_time: string; max_bar_time: string; row_count: number; last_success_at: string }
+export interface CoverageRow { symbol: string; name?: string | null; actual_source: string; interval: string; actual_adjustment: string; min_bar_time: string; max_bar_time: string; row_count: number; last_success_at: string }
 export interface SourceHealth {
   source: string;
   requested_source: string;

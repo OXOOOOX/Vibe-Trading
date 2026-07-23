@@ -37,7 +37,7 @@ class _ResearchTool:
 
     def execute(self, **kwargs):
         if self.kind == "news":
-            return '{"ok": true, "source": "test-news", "data": {"articles": [{"title": "Live headline", "published_at": "2026-07-13"}]}}'
+            return '{"ok": true, "source": "test-news", "data": {"articles": [{"title": "Live headline", "published_at": "2026-07-13", "url": "https://example.com/live-news"}]}}'
         if self.kind == "fundamental":
             return '{"ok": true, "source": "test-fundamentals", "data": {"periods": [{"REPORT_DATE": "2025-12-31"}]}}'
         return '{"ok": true, "source": "test-report", "data": {"reports": [{"title": "Live report", "publish_date": "2026-07-13"}]}}'
@@ -108,6 +108,43 @@ def test_mixed_market_context_preserves_one_canonical_adjustment_semantics(
         call["symbol"] == "588870.SH" and call["adjustment"] == "source_default"
         for call in calls
     )
+
+
+def test_live_news_context_automatically_archives_linked_articles(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import src.research as research_module
+
+    captured: list[dict] = []
+
+    class _Ingestion:
+        @staticmethod
+        def ingest_provider_documents(**kwargs):
+            captured.append(kwargs)
+            return []
+
+    monkeypatch.setattr(research_module, "knowledge_enabled", lambda: True)
+    monkeypatch.setattr(
+        research_module,
+        "get_source_ingestion_service",
+        lambda: _Ingestion(),
+    )
+    service = _unified(tmp_path, lambda **kwargs: _outcome(kwargs))
+
+    result = service.get_context(
+        symbols=["000651.SZ"],
+        purpose="holding",
+        lookback_days=30,
+        include=["news"],
+    )
+
+    assert result["status"] == "live"
+    assert len(captured) == 1
+    assert captured[0]["kind"] == "news"
+    assert captured[0]["symbol"] == "000651.SZ"
+    assert captured[0]["documents"][0]["url"] == "https://example.com/live-news"
+    assert captured[0]["origin_type"] == "data_context"
 
 
 def test_live_failure_uses_explicit_stale_market_cache_fallback(tmp_path, monkeypatch) -> None:

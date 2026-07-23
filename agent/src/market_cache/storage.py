@@ -12,7 +12,7 @@ from typing import Any, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 
 def utc_now() -> str:
@@ -94,6 +94,7 @@ class MarketCacheStore:
                     close REAL NOT NULL,
                     volume REAL,
                     raw_volume REAL,
+                    raw_volume_unit TEXT NOT NULL DEFAULT 'unknown',
                     volume_unit TEXT NOT NULL DEFAULT 'unknown',
                     amount REAL,
                     vwap REAL,
@@ -118,6 +119,10 @@ class MarketCacheStore:
                     low REAL,
                     close REAL,
                     volume REAL,
+                    volume_status TEXT NOT NULL DEFAULT 'unavailable',
+                    volume_source_count INTEGER NOT NULL DEFAULT 0,
+                    volume_sources_json TEXT NOT NULL DEFAULT '[]',
+                    volume_unit TEXT,
                     amount REAL,
                     vwap REAL,
                     status TEXT NOT NULL,
@@ -143,6 +148,10 @@ class MarketCacheStore:
                     adjustment TEXT NOT NULL,
                     last_price REAL,
                     volume REAL,
+                    volume_status TEXT NOT NULL DEFAULT 'unavailable',
+                    volume_source_count INTEGER NOT NULL DEFAULT 0,
+                    volume_sources_json TEXT NOT NULL DEFAULT '[]',
+                    volume_unit TEXT,
                     amount REAL,
                     vwap REAL,
                     status TEXT NOT NULL,
@@ -241,6 +250,38 @@ class MarketCacheStore:
                 conn.execute(
                     "ALTER TABLE refresh_items ADD COLUMN attempts_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            source_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(source_bars)").fetchall()
+            }
+            if "raw_volume_unit" not in source_columns:
+                conn.execute(
+                    "ALTER TABLE source_bars ADD COLUMN raw_volume_unit TEXT NOT NULL DEFAULT 'unknown'"
+                )
+            consensus_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(consensus_bars)").fetchall()
+            }
+            for column, definition in (
+                ("volume_status", "TEXT NOT NULL DEFAULT 'unavailable'"),
+                ("volume_source_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("volume_sources_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("volume_unit", "TEXT"),
+            ):
+                if column not in consensus_columns:
+                    conn.execute(f"ALTER TABLE consensus_bars ADD COLUMN {column} {definition}")
+            quote_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(latest_quotes)").fetchall()
+            }
+            for column, definition in (
+                ("volume_status", "TEXT NOT NULL DEFAULT 'unavailable'"),
+                ("volume_source_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("volume_sources_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("volume_unit", "TEXT"),
+            ):
+                if column not in quote_columns:
+                    conn.execute(f"ALTER TABLE latest_quotes ADD COLUMN {column} {definition}")
             conn.execute(
                 "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -343,6 +384,301 @@ class MarketCacheStore:
 
             conn.execute(
                 "INSERT INTO schema_meta(key, value) VALUES(?, ?)",
+                (migration_key, utc_now()),
+            )
+        return symbols
+
+    def volume_consensus_v2_targets(self) -> list[tuple[str, str, str]]:
+        """Return retained intraday series that still need volume-v2 rebuild."""
+
+        migration_key = "volume_consensus_v2"
+        with self.connect() as conn:
+            completed = conn.execute(
+                "SELECT value FROM schema_meta WHERE key=?",
+                (migration_key,),
+            ).fetchone()
+            if completed:
+                return []
+            rows = conn.execute(
+                """
+                SELECT DISTINCT symbol, interval, actual_adjustment
+                FROM source_bars
+                WHERE interval IN ('1m', '5m')
+                ORDER BY symbol, interval, actual_adjustment
+                """
+            ).fetchall()
+        return [
+            (str(row["symbol"]), str(row["interval"]), str(row["actual_adjustment"]))
+            for row in rows
+        ]
+
+    def mark_volume_consensus_v2_complete(self) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO schema_meta(key, value) VALUES('volume_consensus_v2', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (utc_now(),),
+            )
+
+    def migrate_mootdx_volume_contract_v3(self) -> list[tuple[str, str, str]]:
+        """Normalize retained China-market Mootdx volume from lots to shares.
+
+        ``raw_volume`` is immutable provider evidence.  Only the canonical
+        derived volume, unit and VWAP are repaired, after which the service
+        rebuilds consensus for the returned series.  The migration is
+        idempotent and records its completion in ``schema_meta``.
+        """
+
+        migration_key = "mootdx_volume_contract_v3"
+        with self.transaction() as conn:
+            completed = conn.execute(
+                "SELECT value FROM schema_meta WHERE key=?",
+                (migration_key,),
+            ).fetchone()
+            if completed:
+                return []
+            rows = conn.execute(
+                """
+                SELECT DISTINCT symbol, interval, actual_adjustment
+                FROM source_bars
+                WHERE LOWER(actual_source)='mootdx'
+                  AND interval='1D'
+                  AND (UPPER(symbol) LIKE '%.SH'
+                       OR UPPER(symbol) LIKE '%.SZ'
+                       OR UPPER(symbol) LIKE '%.BJ')
+                  AND raw_volume IS NOT NULL
+                ORDER BY symbol, interval, actual_adjustment
+                """
+            ).fetchall()
+            targets = [
+                (
+                    str(row["symbol"]).upper(),
+                    str(row["interval"]),
+                    str(row["actual_adjustment"]),
+                )
+                for row in rows
+            ]
+            conn.execute(
+                """
+                UPDATE source_bars
+                SET volume=raw_volume * 100.0,
+                    raw_volume_unit='lot',
+                    volume_unit='share',
+                    vwap=CASE
+                        WHEN amount IS NOT NULL AND raw_volume > 0
+                        THEN amount / (raw_volume * 100.0)
+                        ELSE vwap
+                    END
+                WHERE LOWER(actual_source)='mootdx'
+                  AND interval='1D'
+                  AND (UPPER(symbol) LIKE '%.SH'
+                       OR UPPER(symbol) LIKE '%.SZ'
+                       OR UPPER(symbol) LIKE '%.BJ')
+                  AND raw_volume IS NOT NULL
+                """
+            )
+            conn.execute(
+                "INSERT INTO schema_meta(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (migration_key, utc_now()),
+            )
+        return targets
+
+    def migrate_mootdx_intraday_volume_contract_v4(self) -> list[tuple[str, str, str]]:
+        """Restore TDX minute evidence, which is already expressed in shares."""
+
+        migration_key = "mootdx_intraday_volume_contract_v4"
+        with self.transaction() as conn:
+            if conn.execute(
+                "SELECT 1 FROM schema_meta WHERE key=?", (migration_key,)
+            ).fetchone():
+                return []
+            rows = conn.execute(
+                """
+                SELECT DISTINCT symbol,interval,actual_adjustment
+                FROM source_bars
+                WHERE LOWER(actual_source)='mootdx'
+                  AND interval IN ('1m','5m')
+                  AND raw_volume IS NOT NULL
+                  AND (UPPER(symbol) LIKE '%.SH'
+                       OR UPPER(symbol) LIKE '%.SZ'
+                       OR UPPER(symbol) LIKE '%.BJ')
+                ORDER BY symbol,interval,actual_adjustment
+                """
+            ).fetchall()
+            targets = [
+                (str(row["symbol"]), str(row["interval"]), str(row["actual_adjustment"]))
+                for row in rows
+            ]
+            conn.execute(
+                """
+                UPDATE source_bars
+                SET volume=raw_volume,
+                    raw_volume_unit='share',
+                    volume_unit='share',
+                    vwap=CASE
+                        WHEN amount IS NOT NULL AND raw_volume>0
+                        THEN amount/raw_volume
+                        ELSE vwap
+                    END
+                WHERE LOWER(actual_source)='mootdx'
+                  AND interval IN ('1m','5m')
+                  AND raw_volume IS NOT NULL
+                  AND (UPPER(symbol) LIKE '%.SH'
+                       OR UPPER(symbol) LIKE '%.SZ'
+                       OR UPPER(symbol) LIKE '%.BJ')
+                """
+            )
+            conn.execute(
+                """
+                UPDATE source_bars
+                SET raw_volume_unit=CASE
+                    WHEN interval='1D' THEN 'lot'
+                    WHEN interval IN ('1m','5m') THEN 'share'
+                    ELSE raw_volume_unit
+                END
+                WHERE LOWER(actual_source)='mootdx'
+                  AND (UPPER(symbol) LIKE '%.SH'
+                       OR UPPER(symbol) LIKE '%.SZ'
+                       OR UPPER(symbol) LIKE '%.BJ')
+                """
+            )
+            conn.execute(
+                "INSERT INTO schema_meta(key,value) VALUES(?,?)",
+                (migration_key, utc_now()),
+            )
+        return targets
+
+    def migrate_raw_volume_unit_contract_v5(self) -> int:
+        """Backfill the provider unit beside immutable raw volume evidence."""
+
+        migration_key = "raw_volume_unit_contract_v5"
+        with self.transaction() as conn:
+            if conn.execute(
+                "SELECT 1 FROM schema_meta WHERE key=?", (migration_key,)
+            ).fetchone():
+                return 0
+            cursor = conn.execute(
+                """
+                UPDATE source_bars
+                SET raw_volume_unit=CASE
+                    WHEN LOWER(actual_source) IN ('tencent','eastmoney') THEN 'lot'
+                    WHEN LOWER(actual_source)='mootdx' AND interval='1D' THEN 'lot'
+                    WHEN LOWER(actual_source)='mootdx' AND interval IN ('1m','5m') THEN 'share'
+                    ELSE raw_volume_unit
+                END
+                WHERE raw_volume IS NOT NULL
+                  AND (raw_volume_unit IS NULL OR raw_volume_unit IN ('','unknown'))
+                  AND (UPPER(symbol) LIKE '%.SH'
+                       OR UPPER(symbol) LIKE '%.SZ'
+                       OR UPPER(symbol) LIKE '%.BJ')
+                """
+            )
+            conn.execute(
+                "INSERT INTO schema_meta(key,value) VALUES(?,?)",
+                (migration_key, utc_now()),
+            )
+        return int(cursor.rowcount)
+
+    def list_adjustment_factors(self, symbol: str) -> list[dict[str, Any]]:
+        """Return traceable corporate-action factors for continuity checks."""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT symbol,effective_date,source,factor,confidence,retrieved_at
+                FROM adjustment_factors
+                WHERE symbol=?
+                ORDER BY effective_date,source
+                """,
+                (symbol.upper(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_adjustment_factors(self, rows: Iterable[dict[str, Any]]) -> int:
+        """Persist factor evidence without changing its revision on no-op runs."""
+
+        normalized = [
+            {
+                "symbol": str(row["symbol"]).upper(),
+                "effective_date": str(row["effective_date"])[:10],
+                "source": str(row["source"]),
+                "factor": float(row["factor"]),
+                "confidence": str(row.get("confidence") or "candidate"),
+                "retrieved_at": str(row.get("retrieved_at") or utc_now()),
+            }
+            for row in rows
+            if float(row.get("factor") or 0) > 0
+        ]
+        if not normalized:
+            return 0
+        with self.connect() as conn:
+            for row in normalized:
+                conn.execute(
+                    """
+                    INSERT INTO adjustment_factors(
+                        symbol,effective_date,source,factor,confidence,retrieved_at
+                    ) VALUES(?,?,?,?,?,?)
+                    ON CONFLICT(symbol,effective_date,source) DO UPDATE SET
+                        factor=excluded.factor,
+                        confidence=excluded.confidence,
+                        retrieved_at=CASE
+                            WHEN ABS(adjustment_factors.factor-excluded.factor)>0.00000001
+                              OR adjustment_factors.confidence<>excluded.confidence
+                            THEN excluded.retrieved_at
+                            ELSE adjustment_factors.retrieved_at
+                        END
+                    """,
+                    (
+                        row["symbol"], row["effective_date"], row["source"],
+                        row["factor"], row["confidence"], row["retrieved_at"],
+                    ),
+                )
+        return len(normalized)
+
+    def migrate_etf_adjustment_contract_v2(self) -> list[str]:
+        """Quarantine BaoStock ETF rows whose requested qfq basis was not proven."""
+
+        migration_key = "etf_adjustment_contract_v2"
+        with self.connect() as conn:
+            if conn.execute(
+                "SELECT 1 FROM schema_meta WHERE key=?", (migration_key,)
+            ).fetchone():
+                return []
+            rows = conn.execute(
+                """
+                SELECT DISTINCT symbol FROM source_bars
+                WHERE LOWER(actual_source)='baostock'
+                  AND actual_adjustment='qfq'
+                  AND SUBSTR(UPPER(symbol),1,2) IN ('15','16','50','51','52','56','58')
+                  AND (UPPER(symbol) LIKE '%.SH' OR UPPER(symbol) LIKE '%.SZ')
+                """
+            ).fetchall()
+            symbols = [str(row["symbol"]) for row in rows]
+            if symbols:
+                placeholders = ",".join("?" for _ in symbols)
+                conn.execute(
+                    f"""
+                    DELETE FROM cache_coverage
+                    WHERE LOWER(actual_source)='baostock'
+                      AND actual_adjustment='qfq'
+                      AND symbol IN ({placeholders})
+                    """,
+                    symbols,
+                )
+                conn.execute(
+                    f"""
+                    UPDATE source_bars
+                    SET actual_adjustment='source_default',
+                        adjustment_confidence='provider_etf_adjustment_unverified'
+                    WHERE LOWER(actual_source)='baostock'
+                      AND actual_adjustment='qfq'
+                      AND symbol IN ({placeholders})
+                    """,
+                    symbols,
+                )
+            conn.execute(
+                "INSERT INTO schema_meta(key,value) VALUES(?,?)",
                 (migration_key, utc_now()),
             )
         return symbols
@@ -657,7 +993,7 @@ class MarketCacheStore:
             "symbol", "interval", "bar_time", "session_date", "requested_source",
             "actual_source", "adapter_name", "source_fingerprint", "acquisition_mode",
             "requested_adjustment", "actual_adjustment", "adjustment_confidence",
-            "open", "high", "low", "close", "volume", "raw_volume", "volume_unit",
+            "open", "high", "low", "close", "volume", "raw_volume", "raw_volume_unit", "volume_unit",
             "amount", "vwap", "retrieved_at", "batch_id", "payload_hash", "quality_flags",
         )
         placeholders = ",".join("?" for _ in columns)
@@ -757,7 +1093,8 @@ class MarketCacheStore:
             return 0
         columns = (
             "symbol", "interval", "bar_time", "session_date", "adjustment", "open",
-            "high", "low", "close", "volume", "amount", "vwap", "status",
+            "high", "low", "close", "volume", "volume_status", "volume_source_count",
+            "volume_sources_json", "volume_unit", "amount", "vwap", "status",
             "price_spread_pct", "volume_spread_pct", "amount_spread_pct", "source_count",
             "sources_json", "observations_json", "quality_flags", "verified_at", "batch_id",
         )
@@ -835,13 +1172,18 @@ class MarketCacheStore:
                 """
                 INSERT INTO latest_quotes(
                     symbol, interval, bar_time, session_date, adjustment, last_price,
-                    volume, amount, vwap, status, price_spread_pct, source_count,
+                    volume, volume_status, volume_source_count, volume_sources_json,
+                    volume_unit, amount, vwap, status, price_spread_pct, source_count,
                     sources_json, verified_at, batch_id
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(symbol) DO UPDATE SET
                     interval=excluded.interval, bar_time=excluded.bar_time,
                     session_date=excluded.session_date, adjustment=excluded.adjustment,
                     last_price=excluded.last_price, volume=excluded.volume,
+                    volume_status=excluded.volume_status,
+                    volume_source_count=excluded.volume_source_count,
+                    volume_sources_json=excluded.volume_sources_json,
+                    volume_unit=excluded.volume_unit,
                     amount=excluded.amount, vwap=excluded.vwap, status=excluded.status,
                     price_spread_pct=excluded.price_spread_pct,
                     source_count=excluded.source_count, sources_json=excluded.sources_json,
@@ -849,7 +1191,9 @@ class MarketCacheStore:
                 """,
                 (
                     row["symbol"], row["interval"], row["bar_time"], row["session_date"],
-                    row["adjustment"], row["close"], row["volume"], row["amount"], row["vwap"],
+                    row["adjustment"], row["close"], row["volume"], row["volume_status"],
+                    row["volume_source_count"], row["volume_sources_json"], row["volume_unit"],
+                    row["amount"], row["vwap"],
                     row["status"], row["price_spread_pct"], row["source_count"],
                     row["sources_json"], row["verified_at"], row["batch_id"],
                 ),
@@ -863,6 +1207,7 @@ class MarketCacheStore:
             return None
         result = dict(row)
         result["sources"] = json.loads(result.pop("sources_json") or "[]")
+        result["volume_sources"] = json.loads(result.pop("volume_sources_json") or "[]")
         return self._with_freshness(result)
 
     def list_quotes(self, symbols: list[str] | None = None) -> list[dict[str, Any]]:
@@ -879,6 +1224,7 @@ class MarketCacheStore:
         for row in rows:
             item = dict(row)
             item["sources"] = json.loads(item.pop("sources_json") or "[]")
+            item["volume_sources"] = json.loads(item.pop("volume_sources_json") or "[]")
             result.append(self._with_freshness(item))
         return result
 
@@ -955,7 +1301,9 @@ class MarketCacheStore:
             ).fetchall()
         result = [dict(row) for row in reversed(rows)]
         for item in result:
-            for key in ("sources_json", "observations_json", "quality_flags"):
+            for key in (
+                "sources_json", "volume_sources_json", "observations_json", "quality_flags"
+            ):
                 if key in item:
                     item[key.removesuffix("_json")] = json.loads(item.pop(key) or "[]")
         return result
@@ -1004,7 +1352,9 @@ class MarketCacheStore:
             ).fetchall()
         result = [dict(row) for row in reversed(rows)]
         for item in result:
-            for key in ("sources_json", "observations_json", "quality_flags"):
+            for key in (
+                "sources_json", "volume_sources_json", "observations_json", "quality_flags"
+            ):
                 if key in item:
                     item[key.removesuffix("_json")] = json.loads(item.pop(key) or "[]")
         return result
@@ -1048,6 +1398,7 @@ class MarketCacheStore:
         for row in rows:
             item = dict(row)
             sources = json.loads(item.pop("sources_json") or "[]")
+            volume_sources = json.loads(item.pop("volume_sources_json") or "[]")
             observations = json.loads(item.pop("observations_json") or "[]")
             quality_flags = json.loads(item.pop("quality_flags") or "[]")
             matching = [
@@ -1075,6 +1426,10 @@ class MarketCacheStore:
                         for obs in observations
                     },
                     "sources": sources,
+                    "volume_sources": volume_sources,
+                    "volume_status": item["volume_status"],
+                    "volume_source_count": item["volume_source_count"],
+                    "volume_unit": item["volume_unit"],
                     "observations": observations,
                     "quality_flags": quality_flags,
                     "interval": item["interval"],
