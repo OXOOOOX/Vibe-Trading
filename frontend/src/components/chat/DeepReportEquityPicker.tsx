@@ -15,12 +15,12 @@ export function DeepReportEquityPicker({
 
   return (
     <section
-      aria-label="上市公司候选"
+      aria-label="证券候选"
       className="rounded-xl border border-cyan-500/25 bg-cyan-500/5 p-3"
     >
-      <div className="mb-2 text-sm font-medium text-foreground">请选择正确的上市公司</div>
+      <div className="mb-2 text-sm font-medium text-foreground">请选择正确的证券</div>
       <p className="mb-3 text-xs text-muted-foreground">
-        已按名称和简称进行模糊搜索。确认后将使用对应股票代码开始穿透式深度研究。
+        已按名称、简称和代码进行识别。确认后将自动使用上市公司或 ETF 的正确研究模板。
       </p>
       <div className="grid gap-2 sm:grid-cols-2">
         {candidates.map((candidate) => (
@@ -37,7 +37,7 @@ export function DeepReportEquityPicker({
                 {candidate.security_name}
               </span>
               <span className="block font-mono text-xs text-muted-foreground">
-                {candidate.symbol}
+                {candidate.symbol} · {candidate.instrument_type === "etf" ? "ETF" : candidate.instrument_type === "index" ? "指数" : "上市公司"}
               </span>
             </span>
             <span className="shrink-0 text-xs font-medium text-cyan-700 dark:text-cyan-300">

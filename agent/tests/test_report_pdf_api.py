@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import pypdfium2 as pdfium
 
 import api_server
 
@@ -76,6 +77,24 @@ def test_reportlab_fallback_embeds_available_cjk_font() -> None:
         assert b"/FontFile2" in pdf
 
 
+def test_reportlab_footer_contains_subject_date_revision_and_page_number() -> None:
+    pdf = api_server._render_pdf_reportlab(
+        "格力电器（000651.SZ）穿透式深度研究",
+        "> - 报告版本：第 3 版\n"
+        "> - 数据更新至：2026-07-20 15:00\n\n"
+        + ("研究正文用于分页验证。\n\n" * 260),
+    )
+    reader = pdfium.PdfDocument(pdf)
+
+    assert len(reader) >= 2
+    for page_number, page in enumerate(reader, start=1):
+        text_page = page.get_textpage()
+        text = text_page.get_text_range()
+        assert "000651.SZ" in text
+        assert "2026-07-20" in text
+        assert str(page_number) in text
+
+
 def test_reportlab_fallback_renders_markdown_table() -> None:
     pdf = api_server._render_pdf_reportlab(
         "Markdown Report",
@@ -98,6 +117,16 @@ def test_reportlab_fallback_renders_colored_condition_table() -> None:
 
     assert pdf.startswith(b"%PDF-")
     assert len(pdf) > 1_000
+
+
+def test_holding_penetration_table_gives_summary_nearly_half_the_page() -> None:
+    widths = api_server._reportlab_table_width_shares(
+        ["成分", "权重", "入选原因", "研究状态", "可用摘要"]
+    )
+
+    assert sum(widths) == 1.0
+    assert widths == [0.16, 0.08, 0.14, 0.14, 0.48]
+    assert widths[-1] > sum(widths[1:4])
 
 
 def test_condition_table_blank_targets_become_one_rowspan() -> None:

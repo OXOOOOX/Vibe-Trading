@@ -7,7 +7,7 @@ describe("DeepReportMenuItem", () => {
     const user = userEvent.setup();
     render(<DeepReportMenuItem onSelect={vi.fn()} />);
 
-    const entry = screen.getByRole("button", { name: "单股穿透式深度研究" });
+    const entry = screen.getByRole("button", { name: "股票 / ETF 穿透式深度研究" });
     const hint = screen.getByRole("tooltip");
     expect(entry).toHaveAttribute("aria-describedby", hint.id);
     expect(hint).toHaveClass("invisible", "group-hover:visible", "group-focus-within:visible");
@@ -24,7 +24,7 @@ describe("DeepReportMenuItem", () => {
     const user = userEvent.setup();
     render(<DeepReportMenuItem onSelect={onSelect} />);
 
-    await user.click(screen.getByRole("button", { name: "单股穿透式深度研究" }));
+    await user.click(screen.getByRole("button", { name: "股票 / ETF 穿透式深度研究" }));
 
     expect(onSelect).toHaveBeenCalledTimes(1);
   });

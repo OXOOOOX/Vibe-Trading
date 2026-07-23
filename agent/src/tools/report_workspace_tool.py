@@ -1,4 +1,4 @@
-"""Compiler-owned section workspace for equity Deep Reports."""
+"""Compiler-owned section workspace for registered Deep Report Profiles."""
 
 from __future__ import annotations
 
@@ -21,7 +21,15 @@ class ReportWorkspaceTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "command": {"type": "string", "enum": ["inspect", "submit_section"]},
+            "command": {
+                "type": "string",
+                "enum": [
+                    "inspect",
+                    "record_research_attempt",
+                    "submit_section",
+                    "submit_monitoring_bundle",
+                ],
+            },
             "section_ids": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -47,16 +55,40 @@ class ReportWorkspaceTool(BaseTool):
             },
             "section_id": {
                 "type": "string",
-                "enum": [
-                    "executive_summary", "business_position", "financial_quality",
-                    "accounting_review", "implied_expectations", "terminal_narrative",
-                    "counter_thesis", "conclusion_watchlist",
-                ],
+                "description": "Registered section ID returned by inspect for the active Profile.",
             },
             "body_markdown": {
                 "type": "string",
                 "description": "Section body only; H1 and H2 headings are forbidden.",
             },
+            "monitoring_bundle": {
+                "type": "object",
+                "description": (
+                    "Optional structural monitoring context and 0-6 research/watch candidates. "
+                    "It never activates monitoring or permits trade execution."
+                ),
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Server-owned task ID from research_enrichment in inspect.",
+            },
+            "outcome": {
+                "type": "string",
+                "enum": [
+                    "evidence_accepted",
+                    "no_results",
+                    "retrieval_failed",
+                    "evidence_rejected",
+                    "source_unavailable",
+                ],
+            },
+            "query": {"type": "string"},
+            "document_refs": {"type": "array", "items": {"type": "string"}},
+            "fact_ids": {"type": "array", "items": {"type": "string"}},
+            "evidence_ids": {"type": "array", "items": {"type": "string"}},
+            "independence_groups": {"type": "array", "items": {"type": "string"}},
+            "covered_years": {"type": "array", "items": {"type": "integer"}},
+            "detail": {"type": "string"},
         },
         "required": ["command"],
     }
@@ -82,9 +114,21 @@ class ReportWorkspaceTool(BaseTool):
             payload = self.handler(command, dict(kwargs))
         except (KeyError, TypeError, ValueError) as exc:
             return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
-        if command == "submit_section" and self.event_callback is not None:
-            self.event_callback("report.workspace_section", {
-                "section_id": kwargs.get("section_id"),
-                "status": payload.get("status"),
-            })
+        if self.event_callback is not None:
+            if command == "submit_section":
+                self.event_callback("report.workspace_section", {
+                    "section_id": kwargs.get("section_id"),
+                    "status": payload.get("status"),
+                })
+            elif command == "submit_monitoring_bundle":
+                self.event_callback("report.monitoring_bundle", {
+                    "status": payload.get("status"),
+                    "candidate_count": payload.get("candidate_count", 0),
+                })
+            elif command == "record_research_attempt":
+                self.event_callback("report.research_enrichment", {
+                    "task_id": kwargs.get("task_id"),
+                    "outcome": kwargs.get("outcome"),
+                    "status": payload.get("task", {}).get("status"),
+                })
         return json.dumps(payload, ensure_ascii=False, default=str)

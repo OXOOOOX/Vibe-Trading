@@ -104,7 +104,7 @@ describe("MessageBubble", () => {
       expect(screen.queryByText("passed_with_gaps")).not.toBeInTheDocument();
       expect(screen.getByText("AI 自主监控生成")).toBeInTheDocument();
       expect(screen.getByText("自动触发原因：原报告过期")).toBeInTheDocument();
-      expect(screen.getByTitle("下载已校验的穿透式深度研究 PDF")).toHaveAttribute(
+      expect(screen.getByTitle("下载已校验的深度研究 PDF")).toHaveAttribute(
         "href", "/api/reports/report_0123456789abcdef/artifacts/pdf",
       );
       expect(api.deepReportArtifactUrl).toHaveBeenCalledWith(
@@ -143,6 +143,51 @@ describe("MessageBubble", () => {
         attemptId: "attempt-refresh",
         messageId: "msg-refresh",
       });
+    });
+
+    it("requires explicit consent before starting higher-cost evidence enrichment", async () => {
+      const onDeepReportTaskStarted = vi.fn();
+      const confirm = vi.spyOn(window, "confirm")
+        .mockReturnValueOnce(false)
+        .mockReturnValueOnce(true);
+      const enrich = vi.spyOn(api, "enrichDeepReport").mockResolvedValue({
+        message_id: "msg-enrich",
+        attempt_id: "attempt-enrich",
+        parent_report_id: "report_with_gaps",
+        revision_mode: "full_refresh",
+        research_depth: "extended",
+        token_notice_acknowledged: true,
+      });
+      render(<MessageBubble
+        msg={makeMsg({
+          type: "answer",
+          reportId: "report_with_gaps",
+          reportQualityStatus: "passed_with_gaps",
+          reportMissingModules: ["holding_penetration"],
+        })}
+        onDeepReportTaskStarted={onDeepReportTaskStarted}
+      />);
+
+      const button = screen.getByRole("button", { name: "补齐资料并重新生成" });
+      expect(button).toHaveAccessibleDescription(/耗时和 Token 消耗通常更高/);
+      await userEvent.setup().click(button);
+      expect(enrich).not.toHaveBeenCalled();
+
+      await userEvent.setup().click(button);
+
+      expect(confirm).toHaveBeenCalledTimes(2);
+      expect(enrich).toHaveBeenCalledWith(
+        "report_with_gaps",
+        expect.stringContaining("缺少的往年数据"),
+      );
+      expect(onDeepReportTaskStarted).toHaveBeenCalledWith({
+        action: "enrich",
+        reportId: "report_with_gaps",
+        parentReportId: "report_with_gaps",
+        attemptId: "attempt-enrich",
+        messageId: "msg-enrich",
+      });
+      confirm.mockRestore();
     });
 
     it("creates an immutable repair revision for a failed validation report", async () => {
@@ -280,7 +325,7 @@ describe("MessageBubble", () => {
       expect(missingModules).toHaveTextContent("核心结论");
       expect(missingModules).toHaveTextContent("三张报表与财务质量");
       expect(missingModules).toHaveTextContent("长期经营情景");
-      expect(screen.queryByTitle("下载已校验的穿透式深度研究 PDF")).not.toBeInTheDocument();
+      expect(screen.queryByTitle("下载已校验的深度研究 PDF")).not.toBeInTheDocument();
       expect(screen.queryByTitle("Generate PDF")).not.toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "保存到 Obsidian" })).not.toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "修复报告" })).not.toBeInTheDocument();

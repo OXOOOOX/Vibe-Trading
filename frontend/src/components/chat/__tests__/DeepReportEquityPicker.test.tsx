@@ -4,8 +4,8 @@ import { describe, expect, it, vi } from "vitest";
 import { DeepReportEquityPicker } from "../DeepReportEquityPicker";
 
 const candidates = [
-  { symbol: "603738.SH", security_name: "泰晶科技", market: "cn", source: "tencent" },
-  { symbol: "300738.SZ", security_name: "奥飞数据", market: "cn", source: "tencent" },
+  { symbol: "603738.SH", security_name: "泰晶科技", market: "cn", source: "tencent", instrument_type: "company_equity" as const },
+  { symbol: "588870.SH", security_name: "科创板新能源ETF", market: "cn_etf", source: "index_mapping", instrument_type: "etf" as const },
 ];
 
 describe("DeepReportEquityPicker", () => {
@@ -15,7 +15,8 @@ describe("DeepReportEquityPicker", () => {
     render(<DeepReportEquityPicker candidates={candidates} onConfirm={onConfirm} />);
 
     expect(screen.getByText("泰晶科技")).toBeInTheDocument();
-    expect(screen.getByText("603738.SH")).toBeInTheDocument();
+    expect(screen.getByText(/603738\.SH.*上市公司/)).toBeInTheDocument();
+    expect(screen.getByText(/588870\.SH.*ETF/)).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "确认并研究 泰晶科技（603738.SH）" }));
 

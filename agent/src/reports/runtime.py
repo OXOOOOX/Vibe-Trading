@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 class DeepReportRuntimeService(Protocol):
     def inspect_workspace(self, report_id: str, **kwargs: Any) -> dict[str, Any]: ...
+    def subject_profile(self, report_id: str) -> dict[str, Any] | None: ...
 
     def submit_section(
         self,
@@ -24,7 +25,22 @@ class DeepReportRuntimeService(Protocol):
         monitoring_bundle: dict[str, Any],
     ) -> dict[str, Any]: ...
 
+    def record_research_attempt(self, report_id: str, **kwargs: Any) -> dict[str, Any]: ...
+
     def attach_analysis(self, report_id: str, analysis: dict[str, Any]) -> Any: ...
+
+    def attach_etf_analysis(self, report_id: str, analysis: dict[str, Any]) -> Any: ...
+
+    def attach_etf_component_selection(
+        self, report_id: str, selection: dict[str, Any]
+    ) -> Any: ...
+
+    def attach_component_digest_resolution(
+        self,
+        report_id: str,
+        resolution: dict[str, Any],
+        materialization: dict[str, Any] | None = None,
+    ) -> Any: ...
 
     def attach_external_evidence(self, report_id: str, bundle: dict[str, Any]) -> Any: ...
 
@@ -98,6 +114,24 @@ def handle_report_workspace_command(
             body_markdown=str(payload.get("body_markdown") or ""),
         )
         return {"status": "ok", "section": section.to_dict()}
+    if command == "record_research_attempt":
+        return {
+            "status": "ok",
+            **reports.record_research_attempt(
+                report_id,
+                task_id=str(payload.get("task_id") or ""),
+                outcome=str(payload.get("outcome") or ""),
+                query=str(payload.get("query") or ""),
+                document_refs=_string_list(payload.get("document_refs")),
+                fact_ids=_string_list(payload.get("fact_ids")),
+                evidence_ids=_string_list(payload.get("evidence_ids")),
+                independence_groups=_string_list(payload.get("independence_groups")),
+                covered_years=[
+                    int(value) for value in (payload.get("covered_years") or [])
+                ],
+                detail=str(payload.get("detail") or ""),
+            ),
+        }
     if command == "submit_monitoring_bundle":
         raw_bundle = payload.get("monitoring_bundle")
         if not isinstance(raw_bundle, dict):
@@ -127,7 +161,29 @@ def persist_report_event(
         analysis = data.get("analysis")
         if not isinstance(analysis, dict):
             return False
-        reports.attach_analysis(report_id, analysis)
+        if profile == "etf_deep_research":
+            reports.attach_etf_analysis(report_id, analysis)
+        else:
+            reports.attach_analysis(report_id, analysis)
+        return True
+
+    if event_type == "report.etf_component_selection":
+        selection = data.get("selection")
+        if profile != "etf_deep_research" or not isinstance(selection, dict):
+            return False
+        reports.attach_etf_component_selection(report_id, selection)
+        return True
+
+    if event_type == "report.component_digest_resolution":
+        resolution = data.get("resolution")
+        materialization = data.get("materialization")
+        if profile != "etf_deep_research" or not isinstance(resolution, dict):
+            return False
+        reports.attach_component_digest_resolution(
+            report_id,
+            resolution,
+            materialization if isinstance(materialization, dict) else None,
+        )
         return True
 
     if event_type == "report.external_evidence":

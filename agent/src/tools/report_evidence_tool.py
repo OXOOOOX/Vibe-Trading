@@ -172,8 +172,12 @@ class RecordReportEvidenceTool(BaseTool):
             return json.dumps({"status": "error", "error": "provide document_ref or complete source/source_locator/published_at metadata"}, ensure_ascii=False)
         if read_status not in {"opened_webpage", "opened_document", "api_payload"}:
             return json.dumps({"status": "error", "error": "search snippets cannot be registered as evidence"}, ensure_ascii=False)
-        if len(excerpt) < 20:
-            return json.dumps({"status": "error", "error": "opened source excerpt must contain at least 20 characters"}, ensure_ascii=False)
+        minimum_excerpt_length = 8 if document_ref else 20
+        if len(excerpt) < minimum_excerpt_length:
+            return json.dumps({
+                "status": "error",
+                "error": f"opened source excerpt must contain at least {minimum_excerpt_length} characters",
+            }, ensure_ascii=False)
         if not isinstance(raw_facts, list) or not raw_facts:
             return json.dumps({"status": "error", "error": "at least one extracted fact is required"}, ensure_ascii=False)
         if domain == "consensus":

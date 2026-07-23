@@ -1,0 +1,294 @@
+{
+  "schema_version": "etf-source-rules-v1",
+  "rules": [
+    {
+      "rule_id": "sse.etf_product_catalog.v1",
+      "label": "上交所 ETF 产品目录",
+      "phase": "product_profile",
+      "slot": "sse_catalog",
+      "source_kind": "fund_product",
+      "publisher": "上海证券交易所",
+      "verification_status": "official_primary",
+      "priority": 100,
+      "parser_id": "sse_fund_list_v1",
+      "title": "上海证券交易所 ETF 产品列表",
+      "request": {
+        "url": "https://query.sse.com.cn/commonSoaQuery.do",
+        "response_type": "json",
+        "params": {
+          "isPagination": "true",
+          "pageHelp.pageSize": "10000",
+          "pageHelp.pageNo": "1",
+          "pageHelp.beginPage": "1",
+          "pageHelp.cacheSize": "1",
+          "pageHelp.endPage": "1",
+          "pagecache": "false",
+          "sqlId": "FUND_LIST",
+          "fundType": "00"
+        }
+      },
+      "scope": {"exchanges": ["SH"]},
+      "provides": ["identity", "tracked_index_code", "tracked_index_name", "peer_mapping"],
+      "required_for_publish": true,
+      "freshness": {
+        "ttl_days": 1,
+        "refresh_trigger": "explicit_refresh_and_report_generation"
+      },
+      "failure_policy": "warn_and_use_cache"
+    },
+    {
+      "rule_id": "szse.etf_product_catalog.v1",
+      "label": "深交所 ETF 产品目录",
+      "phase": "product_profile",
+      "slot": "szse_catalog",
+      "source_kind": "fund_product",
+      "publisher": "深圳证券交易所",
+      "verification_status": "official_primary",
+      "priority": 100,
+      "parser_id": "szse_etf_list_v1",
+      "title": "深圳证券交易所 ETF 产品列表 {fund_code}",
+      "request": {
+        "url": "https://www.szse.cn/api/report/ShowReport/data",
+        "response_type": "json",
+        "params": {
+          "SHOWTYPE": "JSON",
+          "CATALOGID": "1945",
+          "TABKEY": "tab1",
+          "txtQueryKeyAndJC": "{fund_code}",
+          "PAGENO": "1",
+          "tab1PAGESIZE": "20"
+        }
+      },
+      "scope": {"exchanges": ["SZ"]},
+      "provides": ["identity", "manager", "tracked_index_code", "peer_mapping"],
+      "required_for_publish": true,
+      "freshness": {
+        "ttl_days": 1,
+        "refresh_trigger": "explicit_refresh_and_report_generation"
+      },
+      "failure_policy": "warn_and_use_cache"
+    },
+    {
+      "rule_id": "99fund.product_detail.v1",
+      "label": "汇添富产品资料与费率",
+      "phase": "product_profile",
+      "slot": "product",
+      "source_kind": "fund_product",
+      "publisher": "汇添富基金管理股份有限公司",
+      "verification_status": "official_primary",
+      "priority": 95,
+      "parser_id": "manager_fee_page_v1",
+      "title": "{fund_code} 产品资料与费率",
+      "request": {
+        "url": "https://qy.99fund.com/isp/solveScheme/schemeFundDetail.htm?fundId={fund_code}",
+        "response_type": "html"
+      },
+      "scope": {"manager_keywords": ["汇添富"]},
+      "provides": ["management_fee_rate", "custody_fee_rate"],
+      "required_for_publish": false,
+      "freshness": {
+        "ttl_days": 30,
+        "refresh_trigger": "when_stale_or_explicit_refresh"
+      },
+      "failure_policy": "warn_and_use_cache",
+      "encodings": ["declared", "utf-8", "gb18030", "gbk"]
+    },
+    {
+      "rule_id": "sse.etf_peer_catalog.v1",
+      "label": "上交所 ETF 同指数产品目录",
+      "phase": "share_flow",
+      "slot": "peer_catalog",
+      "source_kind": "fund_product",
+      "publisher": "上海证券交易所",
+      "verification_status": "official_primary",
+      "priority": 100,
+      "parser_id": "sse_fund_list_v1",
+      "title": "上海证券交易所 ETF 产品列表",
+      "request": {
+        "url": "https://query.sse.com.cn/commonSoaQuery.do",
+        "response_type": "json",
+        "params": {
+          "isPagination": "true",
+          "pageHelp.pageSize": "10000",
+          "pageHelp.pageNo": "1",
+          "pageHelp.beginPage": "1",
+          "pageHelp.cacheSize": "1",
+          "pageHelp.endPage": "1",
+          "pagecache": "false",
+          "sqlId": "FUND_LIST",
+          "fundType": "00"
+        }
+      },
+      "scope": {},
+      "provides": ["peer_mapping", "manager", "tracked_index_code"],
+      "required_for_publish": false,
+      "freshness": {
+        "ttl_days": 1,
+        "refresh_trigger": "explicit_refresh_and_report_generation"
+      },
+      "failure_policy": "warn_and_use_cache"
+    },
+    {
+      "rule_id": "99fund.pcf.v1",
+      "label": "汇添富净值与 PCF",
+      "phase": "product_profile",
+      "slot": "pcf",
+      "source_kind": "fund_product",
+      "publisher": "汇添富基金管理股份有限公司",
+      "verification_status": "official_primary",
+      "priority": 95,
+      "parser_id": "manager_pcf_page_v1",
+      "title": "{fund_code} 净值与申购赎回清单",
+      "request": {
+        "url": "https://www.99fund.com/main/products/pofund/{fund_code}/ETFlist.shtml",
+        "response_type": "html"
+      },
+      "scope": {"manager_keywords": ["汇添富"]},
+      "provides": ["unit_nav", "iopv", "pcf"],
+      "required_for_publish": false,
+      "freshness": {
+        "ttl_days": 1,
+        "refresh_trigger": "explicit_refresh_and_report_generation"
+      },
+      "failure_policy": "warn_and_use_cache",
+      "encodings": ["declared", "utf-8", "gb18030", "gbk"]
+    },
+    {
+      "rule_id": "99fund.588870.annual_report_2025.v1",
+      "label": "588870 法定年度报告",
+      "phase": "product_profile",
+      "slot": "annual_report",
+      "source_kind": "fund_product",
+      "publisher": "汇添富基金管理股份有限公司",
+      "verification_status": "official_primary",
+      "priority": 100,
+      "parser_id": "fund_annual_report_pdf_v1",
+      "title": "汇添富上证科创板50成份ETF 2025年年度报告",
+      "published_at": "2026-03-31",
+      "request": {
+        "url": "https://www.99fund.com/announcement/zx/upload/2026/20260330/47cbb2cf1640423f95e5420e009777b1.pdf",
+        "response_type": "pdf"
+      },
+      "scope": {"fund_codes": ["588870"]},
+      "provides": ["identity", "published_net_assets", "published_fund_units", "published_unit_nav"],
+      "required_for_publish": true,
+      "freshness": {
+        "ttl_days": 180,
+        "refresh_trigger": "when_stale_or_explicit_refresh"
+      },
+      "failure_policy": "block_if_no_cache"
+    },
+    {
+      "rule_id": "csindex.methodology_pdf.v1",
+      "label": "中证指数编制方案",
+      "phase": "product_profile",
+      "slot": "methodology",
+      "source_kind": "index_methodology",
+      "publisher": "中证指数有限公司",
+      "verification_status": "official_primary",
+      "priority": 100,
+      "parser_id": "csindex_methodology_pdf_v1",
+      "title": "{index_code} 指数编制方案",
+      "request": {
+        "url": "https://oss-ch.csindex.com.cn/static/html/csindex/public/uploads/indices/detail/files/zh_CN/{index_number}_Index_Methodology_cn.pdf",
+        "response_type": "pdf"
+      },
+      "scope": {"index_code_patterns": ["^[0-9]{6}\\.(SH|SZ|CSI)$"]},
+      "provides": ["index_methodology", "methodology_version", "weight_rules", "rebalance_rules"],
+      "required_for_publish": true,
+      "freshness": {
+        "ttl_days": 180,
+        "refresh_trigger": "when_stale_or_explicit_refresh"
+      },
+      "failure_policy": "block_if_no_cache"
+    },
+    {
+      "rule_id": "sse.etf_share_scale_history.v1",
+      "label": "上交所 ETF 日终份额",
+      "phase": "share_flow",
+      "slot": "sse_scale",
+      "source_kind": "fund_share_scale",
+      "publisher": "上海证券交易所",
+      "verification_status": "official_primary",
+      "priority": 100,
+      "parser_id": "sse_etf_scale_v1",
+      "title": "上海证券交易所 ETF 基金份额 {data_as_of}",
+      "request": {
+        "url": "https://query.sse.com.cn/commonQuery.do",
+        "response_type": "json",
+        "params": {
+          "isPagination": "true",
+          "pageHelp.pageSize": "10000",
+          "pageHelp.pageNo": "1",
+          "pageHelp.beginPage": "1",
+          "pageHelp.cacheSize": "1",
+          "pageHelp.endPage": "1",
+          "sqlId": "COMMON_SSE_ZQPZ_ETFZL_XXPL_ETFGM_SEARCH_L",
+          "STAT_DATE": "{data_as_of}"
+        }
+      },
+      "scope": {},
+      "provides": ["fund_units", "fund_units_history", "fund_units_change"],
+      "required_for_publish": false,
+      "freshness": {
+        "ttl_days": 1,
+        "refresh_trigger": "explicit_refresh_and_report_generation"
+      },
+      "failure_policy": "warn_and_use_cache"
+    },
+    {
+      "rule_id": "szse.etf_share_scale_current.v1",
+      "label": "深交所 ETF 最新份额",
+      "phase": "share_flow",
+      "slot": "szse_scale",
+      "source_kind": "fund_share_scale",
+      "publisher": "深圳证券交易所",
+      "verification_status": "official_primary",
+      "priority": 100,
+      "parser_id": "szse_etf_scale_xlsx_v1",
+      "title": "深圳证券交易所 ETF 基金份额",
+      "request": {
+        "url": "https://fund.szse.cn/api/report/ShowReport",
+        "response_type": "xlsx",
+        "params": {
+          "SHOWTYPE": "xlsx",
+          "CATALOGID": "1000_lf",
+          "TABKEY": "tab1"
+        }
+      },
+      "scope": {},
+      "provides": ["fund_units", "fund_units_current", "cross_exchange_peers"],
+      "required_for_publish": false,
+      "freshness": {
+        "ttl_days": 1,
+        "refresh_trigger": "explicit_refresh_and_report_generation"
+      },
+      "failure_policy": "warn_and_use_cache"
+    },
+    {
+      "rule_id": "sse.etf_market_price.v1",
+      "label": "上交所 ETF 行情",
+      "phase": "share_flow",
+      "slot": "sse_price",
+      "source_kind": "market_data",
+      "publisher": "上海证券交易所",
+      "verification_status": "official_primary",
+      "priority": 90,
+      "parser_id": "sse_etf_quote_v1",
+      "title": "上海证券交易所 ETF 行情快照",
+      "request": {
+        "url": "https://yunhq.sse.com.cn:32042/v1/sh1/list/exchange/ebs",
+        "response_type": "json",
+        "params": {"select": "code,name,last", "begin": "0", "end": "2000"}
+      },
+      "scope": {},
+      "provides": ["market_price", "estimated_net_flow_proxy"],
+      "required_for_publish": false,
+      "freshness": {
+        "ttl_days": 0,
+        "refresh_trigger": "explicit_refresh_and_report_generation"
+      },
+      "failure_policy": "warn_and_use_cache"
+    }
+  ]
+}

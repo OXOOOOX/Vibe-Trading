@@ -1,11 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertCircle, FileText, Loader2, RefreshCw, X } from "lucide-react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import rehypeHighlight from "rehype-highlight";
 
 import { ApiError, api } from "@/lib/api";
 import type { ReportPreviewTarget } from "@/types/agent";
+import { ReportMarkdownContent } from "@/components/reports/ReportMarkdownContent";
 
 interface PreviewDocument {
   title: string;
@@ -24,9 +22,6 @@ interface Props {
   target: ReportPreviewTarget;
   onClose: () => void;
 }
-
-const remarkPlugins = [remarkGfm];
-const rehypePlugins = [rehypeHighlight];
 
 function textCell(value: unknown): string {
   return String(value ?? "—").split("|").join("｜").split("\n").join(" ");
@@ -310,11 +305,7 @@ export function ReportPreviewPanel({ target, onClose }: Props) {
             </div>
           )}
           {document && (
-            <article className="prose prose-sm max-w-none break-words dark:prose-invert prose-headings:scroll-mt-4 prose-table:border prose-table:border-border/50 prose-th:bg-muted/30 prose-th:px-3 prose-th:py-1.5 prose-td:px-3 prose-td:py-1.5 prose-th:text-left prose-th:text-xs prose-th:font-medium prose-td:text-xs [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto">
-              <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins}>
-                {document.content}
-              </ReactMarkdown>
-            </article>
+            <ReportMarkdownContent content={document.content} />
           )}
         </div>
       </aside>

@@ -6,7 +6,6 @@ import {
   ArrowRight,
   CheckCircle2,
   BookOpen,
-  Download,
   FileText,
   GitCompare,
   Loader2,
@@ -15,14 +14,94 @@ import {
   XCircle,
 } from "lucide-react";
 import { api, type DeepReportRecord, type RunListItem } from "@/lib/api";
+import {
+  ReportLibraryPanel,
+  type ReportLibraryMode,
+} from "@/components/reports/ReportLibraryPanel";
+import {
+  ReportPreviewSplitLayout,
+  type ReportArtifactPreviewTarget,
+} from "@/components/reports/ReportArtifactPreviewPane";
+import { ReportSubjectGroup } from "@/components/reports/ReportSubjectGroup";
 import { formatMetricVal } from "@/lib/formatters";
 import { cn } from "@/lib/utils";
+import {
+  deepReportModuleLabel,
+  deepReportTitle,
+  deepReportTypeLabel,
+  etfReadinessMessage,
+} from "@/lib/deepReportPresentation";
 
 const REPORT_SCAN_LIMIT = 100;
 
 type SortMode = "created_desc" | "created_asc" | "return_desc" | "sharpe_desc";
 
 export function Reports() {
+  const [activeView, setActiveView] = useState<ReportLibraryMode | "legacy">("dossiers");
+  const [previewTarget, setPreviewTarget] = useState<ReportArtifactPreviewTarget | null>(null);
+  const tabs: Array<{ id: ReportLibraryMode | "legacy"; label: string }> = [
+    { id: "dossiers", label: "标的档案" },
+    { id: "all", label: "全部新报告" },
+    { id: "portfolio", label: "组合档案" },
+    { id: "legacy", label: "旧版报告" },
+  ];
+
+  function selectView(view: ReportLibraryMode | "legacy") {
+    setActiveView(view);
+    setPreviewTarget(null);
+  }
+
+  return (
+    <ReportPreviewSplitLayout target={previewTarget} onClose={() => setPreviewTarget(null)}>
+      <div className="h-full min-h-0 overflow-y-auto overscroll-contain p-6 lg:p-8">
+        <div className="mx-auto flex w-full max-w-[1600px] flex-col gap-6">
+          <section className="space-y-5 border-b pb-6">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+            <div className="space-y-3">
+              <div className="inline-flex items-center gap-2 rounded-md border px-2.5 py-1 text-xs font-medium text-muted-foreground">
+                <BookOpen className="h-3.5 w-3.5" />
+                统一研究档案
+              </div>
+              <div>
+                <h1 className="text-3xl font-bold tracking-tight">统一报告中心</h1>
+                <p className="mt-2 max-w-3xl text-sm text-muted-foreground">
+                  按标的、报告周期和数据时点整理深度研究、日报与监控报告；先展示确定性的观点变化，再按需生成 AI 解释。
+                </p>
+              </div>
+            </div>
+          </div>
+          <nav aria-label="报告中心视图" className="flex flex-wrap gap-2">
+            {tabs.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => selectView(tab.id)}
+                aria-pressed={activeView === tab.id}
+                className={cn(
+                  "rounded-md border px-3 py-2 text-sm font-medium transition",
+                  activeView === tab.id
+                    ? "border-primary bg-primary text-primary-foreground"
+                    : "bg-background hover:bg-muted",
+                )}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </nav>
+          </section>
+
+          {activeView === "legacy" ? (
+            <LegacyReports onPreview={setPreviewTarget} />
+          ) : (
+            <ReportLibraryPanel mode={activeView} onPreview={setPreviewTarget} />
+          )}
+        </div>
+      </div>
+    </ReportPreviewSplitLayout>
+  );
+}
+
+function LegacyReports({ onPreview }: { onPreview: (target: ReportArtifactPreviewTarget) => void }) {
   const { t } = useTranslation();
   const [runs, setRuns] = useState<RunListItem[]>([]);
   const [deepReports, setDeepReports] = useState<DeepReportRecord[]>([]);
@@ -88,10 +167,12 @@ export function Reports() {
       .sort((left, right) => compareRuns(left, right, sortMode));
   }, [runs, query, statusFilter, startDate, endDate, sortMode]);
 
+  const deepReportGroups = useMemo(() => groupDeepReports(deepReports), [deepReports]);
+  const runGroups = useMemo(() => groupLegacyRuns(filtered), [filtered]);
+
   return (
-    <div className="min-h-screen p-6 lg:p-8">
-      <div className="mx-auto flex w-full max-w-6xl flex-col gap-6">
-        <section className="flex flex-col gap-4 border-b pb-6 lg:flex-row lg:items-end lg:justify-between">
+    <div className="min-w-0 space-y-6">
+      <section className="flex flex-col gap-4 border-b pb-6 lg:flex-row lg:items-end lg:justify-between">
           <div className="space-y-3">
             <div className="inline-flex items-center gap-2 rounded-md border px-2.5 py-1 text-xs font-medium text-muted-foreground">
               <FileText className="h-3.5 w-3.5" />
@@ -113,27 +194,38 @@ export function Reports() {
           </button>
         </section>
 
-        {deepReports.length > 0 ? (
+      {deepReports.length > 0 ? (
           <section className="space-y-3 rounded-md border border-cyan-500/30 bg-cyan-500/[0.02] p-4">
             <div className="flex items-center justify-between gap-3">
               <div>
                 <h2 className="flex items-center gap-2 text-base font-semibold">
                   <BookOpen className="h-4 w-4 text-cyan-600" />
-                  穿透式单股深度研究
+                  结构与穿透式深度研究
                 </h2>
                 <p className="mt-1 text-xs text-muted-foreground">独立于回测报告；每份报告都显示质量门控和数据缺口，仅在校验通过且产物可用时提供 PDF。</p>
               </div>
               <span className="rounded border px-2 py-0.5 font-mono text-xs text-muted-foreground">{deepReports.length}</span>
             </div>
-            <div className="grid gap-2">
-              {deepReports.slice(0, 12).map((report) => (
-                <DeepReportRow key={report.report_id} report={report} />
+            <div className="grid gap-3" aria-label="旧版深度研究按标的分组">
+              {deepReportGroups.map((group) => (
+                <ReportSubjectGroup
+                  key={group.subjectKey}
+                  subjectName={group.securityName}
+                  subjectKey={group.symbol}
+                  reportCount={group.reports.length}
+                  latestLabel={`最近生成 ${formatRunDate(group.latestCreatedAt)}`}
+                  badges={["深度研究"]}
+                >
+                  {group.reports.map((report) => (
+                    <DeepReportRow key={report.report_id} report={report} onPreview={onPreview} />
+                  ))}
+                </ReportSubjectGroup>
               ))}
             </div>
           </section>
         ) : null}
 
-        <section className="grid gap-3 lg:grid-cols-[minmax(220px,1fr)_160px_150px_150px_170px]">
+      <section className="grid gap-3 lg:grid-cols-[minmax(220px,1fr)_160px_150px_150px_170px]">
           <label className="relative block">
             <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             <input
@@ -150,7 +242,7 @@ export function Reports() {
           >
             {statusOptions.map((status) => (
               <option key={status} value={status}>
-                {status === "all" ? t("reports.allStatuses") : status}
+                {status === "all" ? t("reports.allStatuses") : legacyStatusLabel(status)}
               </option>
             ))}
           </select>
@@ -181,11 +273,11 @@ export function Reports() {
           </select>
         </section>
 
-        <div className="text-sm text-muted-foreground">
-          {t("reports.count", { shown: filtered.length, total: runs.length })}
+      <div className="text-sm text-muted-foreground">
+          {t("reports.count", { shown: filtered.length, total: runs.length })} · {runGroups.length} 个标的
         </div>
 
-        {loading ? (
+      {loading ? (
           <div className="grid gap-3">
             {[1, 2, 3, 4].map((item) => (
               <div key={item} className="h-28 animate-pulse rounded-md border bg-muted/40" />
@@ -193,7 +285,7 @@ export function Reports() {
           </div>
         ) : null}
 
-        {!loading && error ? (
+      {!loading && error ? (
           <section className="rounded-md border border-amber-500/30 bg-amber-500/5 p-5">
             <div className="flex items-center gap-2 font-medium text-amber-700 dark:text-amber-300">
               <AlertTriangle className="h-5 w-5" />
@@ -203,7 +295,7 @@ export function Reports() {
           </section>
         ) : null}
 
-        {!loading && !error && filtered.length === 0 ? (
+      {!loading && !error && filtered.length === 0 ? (
           <section className="rounded-md border border-dashed p-8 text-center">
             <FileText className="mx-auto h-8 w-8 text-muted-foreground" />
             <h2 className="mt-3 font-medium">{runs.length === 0 ? t("reports.emptyTitle") : t("reports.noMatchesTitle")}</h2>
@@ -213,19 +305,34 @@ export function Reports() {
           </section>
         ) : null}
 
-        {!loading && !error && filtered.length > 0 ? (
-          <section className="grid gap-3">
-            {filtered.map((run) => (
-              <ReportRow key={run.run_id} run={run} />
+      {!loading && !error && filtered.length > 0 ? (
+          <section className="grid gap-3" aria-label="旧版回测报告按标的分组">
+            {runGroups.map((group) => (
+              <ReportSubjectGroup
+                key={group.subjectKey}
+                subjectName={group.subjectName}
+                subjectKey={group.subjectLabel}
+                reportCount={group.reports.length}
+                latestLabel={`最近生成 ${formatRunDate(group.latestCreatedAt)}`}
+              >
+                {group.reports.map((run) => (
+                  <ReportRow key={run.run_id} run={run} onPreview={onPreview} />
+                ))}
+              </ReportSubjectGroup>
             ))}
           </section>
         ) : null}
-      </div>
     </div>
   );
 }
 
-function DeepReportRow({ report }: { report: DeepReportRecord }) {
+function DeepReportRow({
+  report,
+  onPreview,
+}: {
+  report: DeepReportRecord;
+  onPreview: (target: ReportArtifactPreviewTarget) => void;
+}) {
   const qualityTone = report.quality_status === "passed"
     ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
     : report.quality_status === "failed_validation"
@@ -233,7 +340,10 @@ function DeepReportRow({ report }: { report: DeepReportRecord }) {
       : "bg-amber-500/10 text-amber-700 dark:text-amber-300";
   const gapStatuses = new Set(["warning", "failed_validation", "insufficient_evidence", "not_requested"]);
   const inheritedGapModules = new Set(["executive_summary", "counter_thesis", "conclusion_watchlist"]);
-  const gapModules = Object.entries(report.analysis_modules || {}).filter(([moduleId, item], index, entries) => {
+  const moduleStatuses = Object.keys(report.report_sections || {}).length > 0
+    ? report.report_sections || {}
+    : report.analysis_modules || {};
+  const gapModules = Object.entries(moduleStatuses).filter(([moduleId, item], index, entries) => {
     if (
       !gapStatuses.has(item.status)
       || (inheritedGapModules.has(moduleId) && item.status !== "failed_validation")
@@ -258,9 +368,20 @@ function DeepReportRow({ report }: { report: DeepReportRecord }) {
   const pdfAvailable = report.artifacts?.some(
     (artifact) => artifact.artifact_id === "pdf" && artifact.available === true,
   );
+  const monitoringBundleAvailable = report.artifacts?.some(
+    (artifact) => artifact.artifact_id === "monitoring_bundle" && artifact.available === true,
+  );
   const canDownloadPdf = report.status === "completed" && !failedValidation && pdfAvailable;
   const automated = report.generation_source === "portfolio_monitor_autopilot";
-  const reportTitle = `${report.security_name || report.symbol || "单股"}${report.symbol ? `（${report.symbol}）` : ""}穿透式深度研究`;
+  const reportTitle = deepReportTitle(
+    report.security_name,
+    report.symbol,
+    report.profile,
+    report.quality_status,
+    report.etf_readiness,
+  );
+  const reportType = deepReportTypeLabel(report.profile, report.quality_status, report.etf_readiness);
+  const componentCoverage = report.etf_readiness?.metrics?.component_research_coverage;
   return (
     <article className="flex flex-col gap-3 rounded-md border bg-background/80 p-3 sm:flex-row sm:items-center sm:justify-between">
       <div className="min-w-0">
@@ -269,7 +390,7 @@ function DeepReportRow({ report }: { report: DeepReportRecord }) {
             {failedValidation ? "尚未形成正式报告" : report.quality_status === "passed" ? "证据完整，已通过校验" : "已完成，部分结论保留"}
           </span>
           <span className="rounded border border-primary/30 bg-primary/5 px-2 py-0.5 text-[11px] font-medium text-primary">
-            穿透式深度研究
+            {reportType}
           </span>
           {automated ? (
             <span className="rounded border border-violet-500/30 bg-violet-500/5 px-2 py-0.5 text-[11px] font-medium text-violet-700 dark:text-violet-300">
@@ -281,8 +402,14 @@ function DeepReportRow({ report }: { report: DeepReportRecord }) {
         <div className="mt-1 font-medium">{reportTitle}</div>
         <div className="mt-1 text-xs text-muted-foreground">
           第 {report.revision} 版 · 数据更新至 {formatDeepReportDataTime(report.data_as_of)}
+          {typeof componentCoverage === "number" ? ` · 成分研究覆盖 ${(componentCoverage * 100).toFixed(1)}%` : ""}
           {gapModules.length > 0 ? ` · ${gapModules.length} 项研究内容仍需补充` : ""}
         </div>
+        {report.etf_readiness && report.etf_readiness.status !== "penetration_ready" ? (
+          <div className="mt-2 rounded border border-amber-500/30 bg-amber-500/5 px-2.5 py-1.5 text-xs text-amber-700 dark:text-amber-300">
+            {etfReadinessMessage(report.etf_readiness)}
+          </div>
+        ) : null}
         {failedValidation ? (
           <div role="alert" className="mt-2 rounded border border-destructive/30 bg-destructive/5 px-2.5 py-1.5 text-xs text-destructive">
             关键数据或内容没有通过发布前校验；当前只提供诊断结果，不会生成 PDF。
@@ -309,55 +436,47 @@ function DeepReportRow({ report }: { report: DeepReportRecord }) {
       </div>
       <div className="flex shrink-0 flex-wrap gap-2">
         {markdownAvailable || diagnosticAvailable ? (
-          <a
-            href={api.deepReportArtifactUrl(
-              report.report_id,
+          <button
+            type="button"
+            onClick={() => onPreview(deepReportPreviewTarget(
+              report,
               failedValidation ? "diagnostic" : "markdown",
-            )}
+            ))}
             className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition hover:bg-muted"
           >
             <FileText className="h-3.5 w-3.5" /> {failedValidation ? "查看未发布原因" : "阅读完整报告"}
-          </a>
+          </button>
         ) : null}
         {diffAvailable ? (
-          <a
-            href={api.deepReportArtifactUrl(report.report_id, "diff")}
+          <button
+            type="button"
+            onClick={() => onPreview(deepReportPreviewTarget(report, "diff"))}
             className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition hover:bg-muted"
           >
             <FileText className="h-3.5 w-3.5" /> 版本差异
-          </a>
+          </button>
+        ) : null}
+        {monitoringBundleAvailable ? (
+          <button
+            type="button"
+            onClick={() => onPreview(deepReportPreviewTarget(report, "monitoring_bundle"))}
+            className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition hover:bg-muted"
+          >
+            <FileText className="h-3.5 w-3.5" /> 结构监控 JSON
+          </button>
         ) : null}
         {canDownloadPdf && (
-          <a
-            href={api.deepReportArtifactUrl(report.report_id, "pdf")}
+          <button
+            type="button"
+            onClick={() => onPreview(deepReportPreviewTarget(report, "pdf"))}
             className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition hover:opacity-90"
           >
-            <Download className="h-3.5 w-3.5" /> PDF
-          </a>
+            <FileText className="h-3.5 w-3.5" /> 预览 PDF
+          </button>
         )}
       </div>
     </article>
   );
-}
-
-const DEEP_REPORT_MODULE_LABELS: Record<string, string> = {
-  executive_summary: "核心结论",
-  business_position: "公司业务与产业位置",
-  financial_quality: "三张报表与财务质量",
-  accounting_review: "会计异常核查",
-  implied_expectations: "市值隐含预期",
-  terminal_narrative: "长期经营情景与叙事阶段",
-  terminal_scenarios: "长期经营情景",
-  counter_thesis: "反方、风险与催化剂",
-  conclusion_watchlist: "结论与跟踪框架",
-  report_gate: "整份报告门控",
-  market_data: "市场数据",
-  symbol_identity: "证券身份",
-  latest_quarter: "最新季度",
-};
-
-function deepReportModuleLabel(moduleId: string): string {
-  return DEEP_REPORT_MODULE_LABELS[moduleId] || moduleId;
 }
 
 function moduleStatusLabel(status: string): string {
@@ -385,7 +504,71 @@ function formatDeepReportDataTime(value?: string | null): string {
   }).format(date);
 }
 
-function ReportRow({ run }: { run: RunListItem }) {
+function deepReportPreviewTarget(
+  report: DeepReportRecord,
+  initialArtifactId: "markdown" | "pdf" | "diagnostic" | "diff" | "monitoring_bundle",
+): ReportArtifactPreviewTarget {
+  const supported = new Set(["markdown", "pdf", "diagnostic", "diff", "monitoring_bundle"]);
+  const artifacts = (report.artifacts || [])
+    .filter((artifact) => artifact.available && supported.has(artifact.artifact_id))
+    .map((artifact) => {
+      const artifactId = artifact.artifact_id as "markdown" | "pdf" | "diagnostic" | "diff" | "monitoring_bundle";
+      return {
+        artifactId,
+        label: artifactId === "pdf" ? "PDF"
+          : artifactId === "diagnostic" ? "诊断 Markdown"
+            : artifactId === "diff" ? "版本差异"
+              : artifactId === "monitoring_bundle" ? "结构监控 JSON"
+              : "Markdown",
+        filename: artifact.filename,
+        mediaType: artifactId === "pdf" ? "application/pdf"
+          : artifactId === "monitoring_bundle" ? "application/json"
+            : "text/markdown",
+        previewUrl: api.deepReportArtifactUrl(report.report_id, artifactId, "preview"),
+        downloadUrl: api.deepReportArtifactUrl(report.report_id, artifactId, "download"),
+      };
+    });
+  return {
+    source: "deep_report",
+    reportId: report.report_id,
+    title: deepReportTitle(
+      report.security_name,
+      report.symbol,
+      report.profile,
+      report.quality_status,
+      report.etf_readiness,
+    ),
+    subtitle: `第 ${report.revision} 版 · 数据截至 ${formatDeepReportDataTime(report.data_as_of)}`,
+    initialArtifactId,
+    artifacts,
+  };
+}
+
+function runReportPreviewTarget(run: RunListItem): ReportArtifactPreviewTarget {
+  return {
+    source: "run",
+    reportId: run.run_id,
+    title: run.run_id,
+    subtitle: run.prompt || "历史回测 Markdown 报告",
+    initialArtifactId: "markdown",
+    artifacts: [{
+      artifactId: "markdown",
+      label: "Markdown",
+      filename: `${run.run_id}.md`,
+      mediaType: "text/markdown",
+      previewUrl: api.runReportArtifactUrl(run.run_id, "preview"),
+      downloadUrl: api.runReportArtifactUrl(run.run_id, "download"),
+    }],
+  };
+}
+
+function ReportRow({
+  run,
+  onPreview,
+}: {
+  run: RunListItem;
+  onPreview: (target: ReportArtifactPreviewTarget) => void;
+}) {
   const { t } = useTranslation();
   return (
     <article className="rounded-md border p-4 transition hover:border-primary/40 hover:bg-muted/30">
@@ -419,6 +602,13 @@ function ReportRow({ run }: { run: RunListItem }) {
             <MetricPill label={t("reports.sharpe")} value={formatOptionalMetric("sharpe", run.sharpe)} />
           </div>
           <div className="flex flex-wrap gap-2 lg:justify-end">
+            <button
+              type="button"
+              onClick={() => onPreview(runReportPreviewTarget(run))}
+              className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition hover:bg-muted"
+            >
+              <FileText className="h-3.5 w-3.5" /> Markdown
+            </button>
             <Link
               to={`/runs/${run.run_id}`}
               className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition hover:opacity-90"
@@ -450,7 +640,7 @@ function StatusBadge({ status }: { status: string }) {
       )}
     >
       {ok ? <CheckCircle2 className="h-3 w-3" /> : <XCircle className="h-3 w-3" />}
-      {status || "unknown"}
+      {legacyStatusLabel(status)}
     </span>
   );
 }
@@ -475,6 +665,76 @@ function compareRuns(left: RunListItem, right: RunListItem, mode: SortMode): num
   return dateMs(right.created_at) - dateMs(left.created_at);
 }
 
+interface LegacyDeepReportGroup {
+  subjectKey: string;
+  symbol: string;
+  securityName: string;
+  latestCreatedAt: string;
+  reports: DeepReportRecord[];
+}
+
+function groupDeepReports(reports: DeepReportRecord[]): LegacyDeepReportGroup[] {
+  const grouped = new Map<string, DeepReportRecord[]>();
+  for (const report of reports) {
+    const subjectKey = report.symbol?.trim().toUpperCase() || report.security_name?.trim() || "未标注标的";
+    const current = grouped.get(subjectKey);
+    if (current) current.push(report);
+    else grouped.set(subjectKey, [report]);
+  }
+
+  return Array.from(grouped.entries())
+    .map(([subjectKey, subjectReports]) => {
+      const sortedReports = [...subjectReports].sort((left, right) => dateMs(right.created_at) - dateMs(left.created_at));
+      const latest = sortedReports[0];
+      return {
+        subjectKey,
+        symbol: latest.symbol || subjectKey,
+        securityName: latest.security_name || latest.symbol || "未标注标的",
+        latestCreatedAt: latest.created_at,
+        reports: sortedReports,
+      };
+    })
+    .sort((left, right) => dateMs(right.latestCreatedAt) - dateMs(left.latestCreatedAt));
+}
+
+interface LegacyRunGroup {
+  subjectKey: string;
+  subjectName: string;
+  subjectLabel?: string;
+  latestCreatedAt: string;
+  reports: RunListItem[];
+}
+
+function groupLegacyRuns(runs: RunListItem[]): LegacyRunGroup[] {
+  const grouped = new Map<string, RunListItem[]>();
+  for (const run of runs) {
+    const codes = normalizedRunCodes(run);
+    const subjectKey = codes.length > 0 ? codes.join("+") : "__unlabeled__";
+    const current = grouped.get(subjectKey);
+    if (current) current.push(run);
+    else grouped.set(subjectKey, [run]);
+  }
+
+  return Array.from(grouped.entries()).map(([subjectKey, reports]) => {
+    const codes = normalizedRunCodes(reports[0]);
+    let latestCreatedAt = reports[0]?.created_at || "";
+    for (const report of reports) {
+      if (dateMs(report.created_at) > dateMs(latestCreatedAt)) latestCreatedAt = report.created_at;
+    }
+    return {
+      subjectKey,
+      subjectName: codes.length === 0 ? "未标注标的" : codes.length === 1 ? codes[0] : `多标的组合（${codes.length}）`,
+      subjectLabel: codes.length > 1 ? codes.join(" / ") : undefined,
+      latestCreatedAt,
+      reports,
+    };
+  });
+}
+
+function normalizedRunCodes(run: RunListItem): string[] {
+  return Array.from(new Set((run.codes || []).map((code) => code.trim().toUpperCase()).filter(Boolean))).sort();
+}
+
 function metric(value: number | undefined): number {
   return Number.isFinite(value) ? Number(value) : Number.NEGATIVE_INFINITY;
 }
@@ -490,11 +750,26 @@ function dateMs(value: string): number {
 
 function formatRunDate(value: string): string {
   const parsed = new Date(value);
-  if (!Number.isFinite(parsed.getTime())) return value || "unknown";
+  if (!Number.isFinite(parsed.getTime())) return value || "时间未记录";
   return new Intl.DateTimeFormat(undefined, {
     month: "short",
     day: "numeric",
     hour: "2-digit",
     minute: "2-digit",
   }).format(parsed);
+}
+
+function legacyStatusLabel(value?: string | null): string {
+  const normalized = String(value || "unknown").toLowerCase();
+  return ({
+    success: "成功",
+    done: "已完成",
+    completed: "已完成",
+    complete: "已完成",
+    failed: "失败",
+    error: "错误",
+    running: "运行中",
+    pending: "等待中",
+    unknown: "状态未记录",
+  } as Record<string, string>)[normalized] || value || "状态未记录";
 }
