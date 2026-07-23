@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "result": "halted_by_client_soft_budget",
+  "provider": "openai-codex",
+  "model": "gpt-5.6-terra",
+  "server_side_max_output_tokens_sent": false,
+  "authorization": {
+    "etf_symbol": "588870.SH",
+    "component_symbols": ["688256.SH", "688041.SH", "688981.SH"],
+    "new_generation_calls_authorized": 3,
+    "max_input_tokens_per_component": 6000,
+    "soft_output_tokens_per_component": 1000,
+    "max_input_tokens_per_batch": 18000,
+    "soft_output_tokens_per_batch": 3000,
+    "max_auto_repairs": 0,
+    "over_limit_publish_allowed": false
+  },
+  "backup": {
+    "path": "C:\\Users\\23479\\.vibe-trading\\cache\\backups\\research_cache.pre-p4b2.20260718T162848Z.sqlite3",
+    "size_bytes": 24182784,
+    "sha256": "d77fb895bfa15ee53505da0f5d5d6510b49f3aab47f9aee739a9d423e582d6ae"
+  },
+  "preflight": {
+    "preflight_id": "p4b2preflight_40620b350327ad35f6387b60",
+    "passed": true,
+    "planned_calls": 3,
+    "estimated_input_tokens": 17207,
+    "estimated_output_tokens": 3000
+  },
+  "plan": {
+    "plan_id": "p4b2plan_cce84f5968e47a27c6265c92",
+    "analysis_as_of": "2026-07-18T16:05:13.736852+00:00",
+    "dry_run": false,
+    "authorized": true
+  },
+  "jobs": [
+    {
+      "component_symbol": "688256.SH",
+      "job_id": "p4b2job_f268bde2a6252c30cae92428",
+      "status": "failed",
+      "model_calls": 1,
+      "actual_input_tokens": 1893,
+      "actual_output_tokens": 1119,
+      "failure": "actual component output token budget exceeded"
+    },
+    {
+      "component_symbol": "688041.SH",
+      "job_id": "p4b2job_44414ae5217174e7e2117be4",
+      "status": "failed",
+      "model_calls": 1,
+      "actual_input_tokens": 1867,
+      "actual_output_tokens": 1323,
+      "failure": "actual component output token budget exceeded"
+    },
+    {
+      "component_symbol": "688981.SH",
+      "job_id": "p4b2job_8400dcba3ea83a30ac355eb4",
+      "status": "cancelled",
+      "model_calls": 0,
+      "actual_input_tokens": 0,
+      "actual_output_tokens": 0,
+      "failure": "daily_output_token_budget_exceeded_before_provider_call"
+    }
+  ],
+  "batch_actual": {
+    "generation_calls": 2,
+    "input_tokens": 3760,
+    "output_tokens": 2442,
+    "publish_results": 0,
+    "component_research_reports": 0
+  },
+  "p4b1": {
+    "task_resolution_id": "componentresolution_29c86a5d3a7c3c878fb7a68e",
+    "resolution_symbols": ["688256.SH", "688041.SH", "688981.SH"],
+    "statuses": ["missing", "missing", "missing"]
+  },
+  "safety": {
+    "automatic_retry_count": 0,
+    "generated_content_published": false,
+    "database_integrity_check": "ok",
+    "persistent_generation_gate": false,
+    "persistent_live_run_gate": false
+  },
+  "verification": {"tests_passed": 44, "tests_failed": 0}
+}

@@ -1,0 +1,142 @@
+{
+  "result_version": "p4b2-evidence-ingest-result-v1",
+  "executed_at": "2026-07-18T15:49:43.834920+00:00",
+  "mode": "production_evidence_ingest_zero_model",
+  "etf_symbol": "588870.SH",
+  "component_scope": [
+    "688256.SH",
+    "688041.SH",
+    "688981.SH"
+  ],
+  "backup": {
+    "path": "C:\\Users\\23479\\.vibe-trading\\cache\\backups\\research_cache.p4b2g-pre-ingest-20260718T154530Z.sqlite3",
+    "size_bytes": 23146496,
+    "sha256": "a9214d60c4083de8d8ebb9122ce02fea6664fe042bc09ca1406f1f9c7a6168f2",
+    "integrity_check": "ok"
+  },
+  "knowledge_ingest": {
+    "source_documents_added": 6,
+    "evidence_added": 15,
+    "facts_added": 9,
+    "new_unresolved_conflicts": 0,
+    "source_class": "regulatory_filing",
+    "publisher": "上海证券交易所",
+    "cached_status": "verified_local_pdf"
+  },
+  "documents": [
+    {
+      "symbol": "688256.SH",
+      "annual_document_ref": "doc_6201cfb935ffc52b126a8125",
+      "quarterly_document_ref": "doc_99fba4143b0024e36124a9db"
+    },
+    {
+      "symbol": "688041.SH",
+      "annual_document_ref": "doc_9b9c538708500f59dd30672b",
+      "quarterly_document_ref": "doc_5a375844ce6e91a7a3514702"
+    },
+    {
+      "symbol": "688981.SH",
+      "annual_document_ref": "doc_c22523203051035e036c69de",
+      "quarterly_document_ref": "doc_32bacc963aaf1e511e0aacfe"
+    }
+  ],
+  "components": [
+    {
+      "symbol": "688256.SH",
+      "evidence_pack_id": "p4b2evidencepack_6454f31e27b42bafa8230611",
+      "evidence_ids": [
+        "ev_16ede1eadc03d7de41cd9b56",
+        "ev_1c6d9d144e31f80cae637b51",
+        "ev_a52c9b994149872d184ff541",
+        "ev_ba7dba986be2b4731c6b2202",
+        "ev_da20c916f468b2dfc0e7cb45"
+      ],
+      "fact_ids": [
+        "fact_3ca4583ff149e76d9b6fbb41",
+        "fact_552d9c51078b85b0b5d04d89",
+        "fact_75a0061177d8d5b94ca9a2b3"
+      ],
+      "pack_quality": "complete",
+      "required_field_coverage": 1.0,
+      "missing_dimensions": ["valuation"],
+      "estimated_input_tokens": 5752,
+      "estimated_output_tokens": 600,
+      "actual_model_calls": 0
+    },
+    {
+      "symbol": "688041.SH",
+      "evidence_pack_id": "p4b2evidencepack_706ed09a0300b45a5ef42ceb",
+      "evidence_ids": [
+        "ev_0400aa043819b0caaba213b2",
+        "ev_0ab48b02aac2ff733e6b34f3",
+        "ev_5c3688392cac2cee83ec3635",
+        "ev_8ae0397af2dc928bba255283",
+        "ev_b5493e4d638af9ed8fcec771"
+      ],
+      "fact_ids": [
+        "fact_32620f37f1b8892f4b46d782",
+        "fact_8efd7a3b0350beec02c5857c",
+        "fact_b0e55d7212d1e2bcd6aa86c0"
+      ],
+      "pack_quality": "complete",
+      "required_field_coverage": 1.0,
+      "missing_dimensions": ["valuation"],
+      "estimated_input_tokens": 5748,
+      "estimated_output_tokens": 600,
+      "actual_model_calls": 0
+    },
+    {
+      "symbol": "688981.SH",
+      "evidence_pack_id": "p4b2evidencepack_9a5f42b1e4e21dc4836d9dbb",
+      "evidence_ids": [
+        "ev_0354437d9f0bbc015b2fd763",
+        "ev_4ac5b6bd746620347bd7d908",
+        "ev_94c628b5ecea93dd8fa5d347",
+        "ev_d91d688ee5413659f42c68ec",
+        "ev_fba7028b55ec52207242c439"
+      ],
+      "fact_ids": [
+        "fact_28f2a8e5afebc079c3c2534e",
+        "fact_52dbe05c02da3b7ee81fffc1",
+        "fact_edebab9a09e0a4d485c66f38"
+      ],
+      "pack_quality": "complete",
+      "required_field_coverage": 1.0,
+      "missing_dimensions": ["valuation"],
+      "estimated_input_tokens": 5707,
+      "estimated_output_tokens": 600,
+      "actual_model_calls": 0
+    }
+  ],
+  "dry_run_plan": {
+    "plan_id": "p4b2plan_478711f7012eb0b07eecd1ea",
+    "selection_id": "p4aselection_c348ad8767d6e0c4e571a89b",
+    "base_resolution_id": "componentresolution_5c78ed200494f91c4b7981ff",
+    "analysis_as_of": "2026-07-18T15:49:43.834920+00:00",
+    "dry_run": true,
+    "authorized": false,
+    "candidate_count": 3,
+    "planned_count": 3,
+    "blocked_count": 0,
+    "estimated_model_calls": 3,
+    "estimated_input_tokens": 17207,
+    "estimated_output_tokens": 1800
+  },
+  "execution_boundary": {
+    "actual_model_calls": 0,
+    "actual_input_tokens": 0,
+    "actual_output_tokens": 0,
+    "budget_ledger_rows": 0,
+    "publish_results": 0,
+    "component_research_reports": 0,
+    "automatic_repairs": 0,
+    "expanded_targets": []
+  },
+  "verification": {
+    "production_database_integrity_check": "ok",
+    "stored_object_hashes_match_database": true,
+    "stored_objects_contain_pdf_hash_provenance": true,
+    "persistent_generation_feature_enabled": false,
+    "persistent_live_run_feature_enabled": false
+  }
+}

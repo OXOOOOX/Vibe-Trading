@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "task": "P4B2-F expanded-output live pilot attempt",
+  "recorded_at": "2026-07-19",
+  "result": "halted_after_provider_rejection",
+  "authorization": {
+    "etf_symbol": "588870.SH",
+    "component_symbols": ["688256.SH", "688041.SH", "688981.SH"],
+    "max_model_calls": 3,
+    "max_input_tokens_per_component": 6000,
+    "max_output_tokens_per_component": 1000,
+    "max_input_tokens_per_batch": 18000,
+    "max_output_tokens_per_batch": 3000,
+    "max_auto_repairs": 0
+  },
+  "preflight": {
+    "passed": true,
+    "estimated_model_calls": 3,
+    "estimated_input_tokens": 17207,
+    "estimated_output_tokens": 3000,
+    "jobs": [
+      {"component_symbol": "688256.SH", "estimated_input_tokens": 5752, "estimated_output_tokens": 1000},
+      {"component_symbol": "688041.SH", "estimated_input_tokens": 5748, "estimated_output_tokens": 1000},
+      {"component_symbol": "688981.SH", "estimated_input_tokens": 5707, "estimated_output_tokens": 1000}
+    ]
+  },
+  "backup": {
+    "path": "C:\\Users\\23479\\.vibe-trading\\cache\\backups\\research_cache.pre-p4b2.20260718T160339Z.sqlite3",
+    "size_bytes": 24182784,
+    "sha256": "49d6c6a5d767016553833cf73278da1ca8988cf421edbf5bf4eb03b4068234d2",
+    "integrity_check": "ok"
+  },
+  "plan": {
+    "plan_id": "p4b2plan_71d5eddbdeaf767a9e93e702",
+    "analysis_as_of": "2026-07-18T16:05:13.736852+00:00",
+    "dry_run": false,
+    "authorized": true,
+    "status": "planned"
+  },
+  "jobs": [
+    {
+      "component_symbol": "688256.SH",
+      "job_id": "p4b2job_bf8d2ea3881ef18adee031f2",
+      "evidence_pack_id": "p4b2evidencepack_b9322cde82fc73c134a0fa80",
+      "status": "failed",
+      "model_calls": 1,
+      "actual_input_tokens": 0,
+      "actual_output_tokens": 0,
+      "failure": "OpenAI Codex HTTP 400: {\"detail\":\"Unsupported parameter: max_output_tokens\"}"
+    },
+    {
+      "component_symbol": "688041.SH",
+      "job_id": "p4b2job_74d57253732feb60321e4851",
+      "evidence_pack_id": "p4b2evidencepack_3b8379e0098f769e32678c0e",
+      "status": "cancelled",
+      "model_calls": 0,
+      "actual_input_tokens": 0,
+      "actual_output_tokens": 0
+    },
+    {
+      "component_symbol": "688981.SH",
+      "job_id": "p4b2job_2531b147354ce82bdf62930b",
+      "evidence_pack_id": "p4b2evidencepack_e54f98321df283d314b1d5b0",
+      "status": "cancelled",
+      "model_calls": 0,
+      "actual_input_tokens": 0,
+      "actual_output_tokens": 0
+    }
+  ],
+  "budget_ledger": {
+    "ledger_id": "p4b2budget_8a17e3f3ae91f35a6eb8d0af",
+    "budget_date": "2026-07-19",
+    "state": "settled",
+    "component_count": 1,
+    "model_calls": 1,
+    "input_tokens": 0,
+    "output_tokens": 0
+  },
+  "publication": {"publish_results": 0, "component_research_reports": 0},
+  "scope_audit": {
+    "model_target_symbols": ["688256.SH"],
+    "model_target_expanded": false,
+    "p4b1_resolution_id": "componentresolution_34f7237a6eb3903043ea93a2",
+    "p4b1_resolution_symbols": ["688256.SH", "688008.SH", "688012.SH", "688041.SH", "688981.SH"],
+    "caveat": "Plan execution reconstructed the full five-binding P4A selection before the provider request. This wrote deterministic missing P4B1 bookkeeping for 688008.SH and 688012.SH, but made no model call and published no generated knowledge for them. Future execution is now filtered to the Plan authorization scope."
+  },
+  "provider_boundary": {
+    "provider": "openai-codex",
+    "model": "gpt-5.6-terra",
+    "server_side_output_cap_supported": false,
+    "detail": "The internal ChatGPT Codex endpoint rejected the public Responses API max_output_tokens field before generation. The adapter no longer sends that unsupported field; therefore a future Codex attempt can only apply prompt-side and post-response usage validation, not a strict server-side output cap."
+  },
+  "safety": {
+    "automatic_retry_performed": false,
+    "provider_switched": false,
+    "persistent_generation_gate": false,
+    "persistent_live_run_gate": false,
+    "database_integrity_check": "ok"
+  },
+  "verification": {"tests_passed": 43, "tests_failed": 0, "git_diff_check": "passed"}
+}

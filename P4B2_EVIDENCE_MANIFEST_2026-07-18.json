@@ -1,0 +1,371 @@
+{
+  "manifest_version": "p4b2-evidence-source-manifest-v1",
+  "generated_at": "2026-07-18T15:25:55.7440945Z",
+  "mode": "read_only_source_audit",
+  "analysis_cutoff": "2026-07-18T15:04:18.056241+00:00",
+  "etf_symbol": "588870.SH",
+  "component_scope": [
+    "688256.SH",
+    "688041.SH",
+    "688981.SH"
+  ],
+  "source_policy": {
+    "allowed_publishers": [
+      "上海证券交易所",
+      "上市公司法定信息披露"
+    ],
+    "exact_symbol_required": true,
+    "future_information_allowed": false,
+    "name_matching_allowed": false,
+    "production_ingest_authorized": false,
+    "model_calls_authorized_in_this_phase": false,
+    "max_evidence_summary_chars": 120,
+    "valuation_included": false
+  },
+  "components": [
+    {
+      "symbol": "688256.SH",
+      "security_name": "寒武纪",
+      "documents": [
+        {
+          "candidate_document_ref": "candidate:sse:688256:2025-annual",
+          "document_type": "annual_report",
+          "title": "中科寒武纪科技股份有限公司2025年年度报告",
+          "report_period_end": "2025-12-31",
+          "disclosed_at": "2026-03-12T20:29:21+08:00",
+          "canonical_url": "https://star.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-03-13/688256_20260313_GWH3.pdf",
+          "publisher": "上海证券交易所",
+          "page_count": 219,
+          "file_size_bytes": 1531788,
+          "sha256": "e9360bfb6ad2d66ce7b65da15f8fa2fcdda9fde526e2a76dba3964327507f4ab"
+        },
+        {
+          "candidate_document_ref": "candidate:sse:688256:2026-q1",
+          "document_type": "quarterly_report",
+          "title": "中科寒武纪科技股份有限公司2026年第一季度报告",
+          "report_period_end": "2026-03-31",
+          "disclosed_at": "2026-04-29T19:59:43+08:00",
+          "canonical_url": "https://star.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-04-30/688256_20260430_I4ZK.pdf",
+          "publisher": "上海证券交易所",
+          "financial_statements_audited": false,
+          "page_count": 12,
+          "file_size_bytes": 189239,
+          "sha256": "6aed917a6930c4ffc79d880ac0841c92e62aabc6684f4862129f48a91fed18d0"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "candidate_evidence_id": "candidate:evidence:688256:business",
+          "domain": "business_position",
+          "document_ref": "candidate:sse:688256:2025-annual",
+          "pages": [12, 13],
+          "purpose": "主营业务、产品线和业务模式"
+        },
+        {
+          "candidate_evidence_id": "candidate:evidence:688256:risk",
+          "domain": "risks",
+          "document_ref": "candidate:sse:688256:2025-annual",
+          "pages": [24, 25],
+          "purpose": "核心竞争力、研发迭代和行业竞争风险"
+        },
+        {
+          "candidate_evidence_id": "candidate:evidence:688256:governance",
+          "domain": "company_actions",
+          "document_ref": "candidate:sse:688256:2025-annual",
+          "pages": [39],
+          "purpose": "公司治理、董事会和信息披露"
+        },
+        {
+          "candidate_evidence_id": "candidate:evidence:688256:financial",
+          "domain": "financial_statements",
+          "document_ref": "candidate:sse:688256:2026-q1",
+          "pages": [1, 2],
+          "purpose": "2026年第一季度财务数据"
+        },
+        {
+          "candidate_evidence_id": "candidate:evidence:688256:catalyst",
+          "domain": "catalysts",
+          "document_ref": "candidate:sse:688256:2026-q1",
+          "pages": [3],
+          "purpose": "收入增长原因和人工智能算力需求驱动"
+        }
+      ],
+      "candidate_facts": [
+        {
+          "metric": "revenue",
+          "value": "2884696746.86",
+          "unit": "CNY",
+          "period": "2026Q1",
+          "page": 1,
+          "evidence_ref": "candidate:evidence:688256:financial"
+        },
+        {
+          "metric": "net_profit_attributable",
+          "value": "1013213581.94",
+          "unit": "CNY",
+          "period": "2026Q1",
+          "page": 1,
+          "evidence_ref": "candidate:evidence:688256:financial"
+        },
+        {
+          "metric": "operating_cashflow",
+          "value": "833967832.10",
+          "unit": "CNY",
+          "period": "2026Q1",
+          "page": 2,
+          "evidence_ref": "candidate:evidence:688256:financial"
+        }
+      ],
+      "expected_pack_quality_after_reviewed_ingest": "complete",
+      "expected_missing_dimensions": ["valuation"],
+      "conservative_input_upper_bound": 5301
+    },
+    {
+      "symbol": "688041.SH",
+      "security_name": "海光信息",
+      "documents": [
+        {
+          "candidate_document_ref": "candidate:sse:688041:2025-annual",
+          "document_type": "annual_report",
+          "title": "海光信息技术股份有限公司2025年年度报告",
+          "report_period_end": "2025-12-31",
+          "disclosed_at": "2026-04-07T19:34:38+08:00",
+          "canonical_url": "https://star.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-04-08/688041_20260408_L1O8.pdf",
+          "publisher": "上海证券交易所",
+          "page_count": 231,
+          "file_size_bytes": 1953281,
+          "sha256": "abe3c5f80e80e2b6a56d243cfd502cccec715df783b7b9dcf95d3a84b1106c02"
+        },
+        {
+          "candidate_document_ref": "candidate:sse:688041:2026-q1",
+          "document_type": "quarterly_report",
+          "title": "海光信息技术股份有限公司2026年第一季度报告",
+          "report_period_end": "2026-03-31",
+          "disclosed_at": "2026-04-07T19:34:39+08:00",
+          "canonical_url": "https://star.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-04-08/688041_20260408_8IRS.pdf",
+          "publisher": "上海证券交易所",
+          "financial_statements_audited": false,
+          "page_count": 12,
+          "file_size_bytes": 197142,
+          "sha256": "10689264d9f135008e6ed6409ba36ed9d476c8bbaebfc6f82ccde74153b616be"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "candidate_evidence_id": "candidate:evidence:688041:business",
+          "domain": "business_position",
+          "document_ref": "candidate:sse:688041:2025-annual",
+          "pages": [12, 13],
+          "purpose": "主营业务、CPU/DCU产品和应用领域"
+        },
+        {
+          "candidate_evidence_id": "candidate:evidence:688041:risk",
+          "domain": "risks",
+          "document_ref": "candidate:sse:688041:2025-annual",
+          "pages": [29, 30],
+          "purpose": "研发、知识产权、客户和供应商集中风险"
+        },
+        {
+          "candidate_evidence_id": "candidate:evidence:688041:governance",
+          "domain": "company_actions",
+          "document_ref": "candidate:sse:688041:2025-annual",
+          "pages": [22],
+          "purpose": "生态协同、知识产权管理和治理机制"
+        },
+        {
+          "candidate_evidence_id": "candidate:evidence:688041:financial",
+          "domain": "financial_statements",
+          "document_ref": "candidate:sse:688041:2026-q1",
+          "pages": [1, 2],
+          "purpose": "2026年第一季度财务数据"
+        },
+        {
+          "candidate_evidence_id": "candidate:evidence:688041:catalyst",
+          "domain": "catalysts",
+          "document_ref": "candidate:sse:688041:2026-q1",
+          "pages": [3],
+          "purpose": "AI算力需求、产品迭代和研发投入驱动"
+        }
+      ],
+      "candidate_facts": [
+        {
+          "metric": "revenue",
+          "value": "4033592186.34",
+          "unit": "CNY",
+          "period": "2026Q1",
+          "page": 1,
+          "evidence_ref": "candidate:evidence:688041:financial"
+        },
+        {
+          "metric": "net_profit_attributable",
+          "value": "687094336.71",
+          "unit": "CNY",
+          "period": "2026Q1",
+          "page": 1,
+          "evidence_ref": "candidate:evidence:688041:financial"
+        },
+        {
+          "metric": "operating_cashflow",
+          "value": "67617712.14",
+          "unit": "CNY",
+          "period": "2026Q1",
+          "page": 2,
+          "evidence_ref": "candidate:evidence:688041:financial"
+        }
+      ],
+      "expected_pack_quality_after_reviewed_ingest": "complete",
+      "expected_missing_dimensions": ["valuation"],
+      "conservative_input_upper_bound": 5307
+    },
+    {
+      "symbol": "688981.SH",
+      "security_name": "中芯国际",
+      "documents": [
+        {
+          "candidate_document_ref": "candidate:sse:688981:2025-annual",
+          "document_type": "annual_report",
+          "title": "中芯国际集成电路制造有限公司2025年年度报告",
+          "report_period_end": "2025-12-31",
+          "disclosed_at": "2026-03-26T19:49:18+08:00",
+          "canonical_url": "https://star.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-03-27/688981_20260327_AQDC.pdf",
+          "publisher": "上海证券交易所",
+          "page_count": 232,
+          "file_size_bytes": 1697396,
+          "sha256": "c022cf9323967f66a239ce4f60b30507bc341db6e660a53db9c2966a9ef35531"
+        },
+        {
+          "candidate_document_ref": "candidate:sse:688981:2026-q1",
+          "document_type": "quarterly_report",
+          "title": "中芯国际集成电路制造有限公司2026年第一季度报告",
+          "report_period_end": "2026-03-31",
+          "disclosed_at": "2026-05-14T18:13:04+08:00",
+          "canonical_url": "https://star.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-05-15/688981_20260515_4MY8.pdf",
+          "publisher": "上海证券交易所",
+          "financial_statements_audited": false,
+          "page_count": 15,
+          "file_size_bytes": 205165,
+          "sha256": "86d567a9b31cc4b0dfcf19c610a797500cc764afd73b465b50dc60f651366cd5"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "candidate_evidence_id": "candidate:evidence:688981:business",
+          "domain": "business_position",
+          "document_ref": "candidate:sse:688981:2025-annual",
+          "pages": [13, 14],
+          "purpose": "晶圆代工主营业务、服务和经营模式"
+        },
+        {
+          "candidate_evidence_id": "candidate:evidence:688981:risk",
+          "domain": "risks",
+          "document_ref": "candidate:sse:688981:2025-annual",
+          "pages": [19, 20],
+          "purpose": "研发迭代、行业周期、供应链和竞争风险"
+        },
+        {
+          "candidate_evidence_id": "candidate:evidence:688981:governance",
+          "domain": "company_actions",
+          "document_ref": "candidate:sse:688981:2025-annual",
+          "pages": [36],
+          "purpose": "董事会、股息政策和公司治理"
+        },
+        {
+          "candidate_evidence_id": "candidate:evidence:688981:financial",
+          "domain": "financial_statements",
+          "document_ref": "candidate:sse:688981:2026-q1",
+          "pages": [3, 4],
+          "purpose": "2026年第一季度财务和经营数据"
+        },
+        {
+          "candidate_evidence_id": "candidate:evidence:688981:catalyst",
+          "domain": "catalysts",
+          "document_ref": "candidate:sse:688981:2026-q1",
+          "pages": [2],
+          "purpose": "第二季度收入及毛利率指引和订单判断，标记为前瞻性陈述"
+        }
+      ],
+      "candidate_facts": [
+        {
+          "metric": "revenue",
+          "value": "17617218",
+          "unit": "CNY_thousand",
+          "period": "2026Q1",
+          "page": 3,
+          "evidence_ref": "candidate:evidence:688981:financial"
+        },
+        {
+          "metric": "net_profit_attributable",
+          "value": "1361209",
+          "unit": "CNY_thousand",
+          "period": "2026Q1",
+          "page": 3,
+          "evidence_ref": "candidate:evidence:688981:financial"
+        },
+        {
+          "metric": "operating_cashflow",
+          "value": "5131729",
+          "unit": "CNY_thousand",
+          "period": "2026Q1",
+          "page": 3,
+          "evidence_ref": "candidate:evidence:688981:financial"
+        }
+      ],
+      "expected_pack_quality_after_reviewed_ingest": "complete",
+      "expected_missing_dimensions": ["valuation"],
+      "conservative_input_upper_bound": 5307
+    }
+  ],
+  "batch_budget_preview": {
+    "planned_components": 3,
+    "maximum_model_calls": 3,
+    "conservative_input_upper_bound": 15915,
+    "authorized_input_limit": 18000,
+    "maximum_output_tokens": 1800,
+    "authorized_output_limit": 1800,
+    "token_expansion_needed": false,
+    "automatic_repairs": 0
+  },
+  "temporary_ingest_simulation": {
+    "database_path": "tmp/pdfs/p4b2-evidence/simulation-i2rdc9hp/research_cache.simulation.sqlite3",
+    "production_database_used_for_writes": false,
+    "components": [
+      {
+        "symbol": "688256.SH",
+        "pack_quality": "complete",
+        "required_field_coverage": 1.0,
+        "evidence_count": 5,
+        "fact_count": 3,
+        "conflict_count": 0,
+        "actual_simulated_input_upper_bound": 4975
+      },
+      {
+        "symbol": "688041.SH",
+        "pack_quality": "complete",
+        "required_field_coverage": 1.0,
+        "evidence_count": 5,
+        "fact_count": 3,
+        "conflict_count": 0,
+        "actual_simulated_input_upper_bound": 4970
+      },
+      {
+        "symbol": "688981.SH",
+        "pack_quality": "complete",
+        "required_field_coverage": 1.0,
+        "evidence_count": 5,
+        "fact_count": 3,
+        "conflict_count": 0,
+        "actual_simulated_input_upper_bound": 4992
+      }
+    ],
+    "batch_input_upper_bound": 14937,
+    "expected_missing_dimensions": ["valuation"]
+  },
+  "execution_boundary": {
+    "downloaded_to_temporary_workspace": true,
+    "production_source_documents_written": 0,
+    "production_evidence_written": 0,
+    "production_facts_written": 0,
+    "model_calls": 0,
+    "next_required_authorization": "reviewed production evidence ingest and new P4B2 plan"
+  }
+}
